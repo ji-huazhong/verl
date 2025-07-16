@@ -276,6 +276,8 @@ class AsyncRayPPOTrainer(RayPPOTrainer):
         self.actor_rollout_wg = self.actor_wg  # to be compatible with the functions that not be modified
         weights_info = self.actor_wg.get_actor_weights_info()[0]
         self.rollout_wg.set_actor_weights_info(weights_info)
+        
+        # TODO: create param sync group with torch native api
         from ray.util.collective import collective
 
         actor_rollout_workers = self.actor_wg.workers + self.rollout_wg.workers
