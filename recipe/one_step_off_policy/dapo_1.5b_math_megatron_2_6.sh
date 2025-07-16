@@ -116,7 +116,7 @@ python3 -m recipe.one_step_off_policy.async_main_ppo \
     actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
-    actor_rollout_ref.rollout.n_gpus=4 \
+    actor_rollout_ref.rollout.n_gpus=2 \
     actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${train_pp} \
     actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${train_tp} \
     actor_rollout_ref.ref.megatron.param_offload=${ref_offload} \

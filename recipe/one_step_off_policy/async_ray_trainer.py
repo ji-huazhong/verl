@@ -278,16 +278,17 @@ class AsyncRayPPOTrainer(RayPPOTrainer):
         self.rollout_wg.set_actor_weights_info(weights_info)
         
         # TODO: create param sync group with torch native api
-        from ray.util.collective import collective
+        # from ray.util.collective import collective
 
-        actor_rollout_workers = self.actor_wg.workers + self.rollout_wg.workers
-        collective.create_collective_group(
-            actor_rollout_workers,
-            len(actor_rollout_workers),
-            list(range(0, len(actor_rollout_workers))),
-            backend="nccl",
-            group_name="actor_rollout",
-        )
+        # actor_rollout_workers = self.actor_wg.workers + self.rollout_wg.workers
+        # collective.create_collective_group(
+        #     actor_rollout_workers,
+        #     len(actor_rollout_workers),
+        #     list(range(0, len(actor_rollout_workers))),
+        #     backend="nccl",
+        #     group_name="actor_rollout",
+        # )
+        self.create_weight_sync_group()
         self.sync_rollout_weights()
 
         # create async rollout manager and request scheduler
@@ -300,6 +301,29 @@ class AsyncRayPPOTrainer(RayPPOTrainer):
                 config=self.config,
                 worker_group=self.rollout_wg,
             )
+
+    def create_weight_sync_group(self):
+        if not self.hybrid_engine:
+            # master_address = self.actor_wg.master_address
+            master_address = ray.get(self.actor_wg.workers[0]._get_node_ip())
+            master_port = ray.get(self.actor_wg.workers[0]._get_free_port())
+            world_size = len(self.actor_wg.workers + self.rollout_wg.workers)
+            self.actor_wg.create_weight_sync_group(
+                master_address,
+                master_port,
+                world_size,
+                rank_offset=0,
+                backend="nccl",
+                group_name="actor_rollout",
+            )
+            ray.get(self.rollout_wg.create_weight_sync_group(
+                master_address,
+                master_port,
+                world_size,
+                rank_offset=len(self.actor_wg.workers),
+                group_name="actor_rollout",
+            ))
+
 
     def sync_rollout_weights(self):
         if not self.hybrid_engine:

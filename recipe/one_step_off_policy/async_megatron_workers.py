@@ -30,6 +30,8 @@ from verl.utils.vllm_utils import patch_vllm_moe_model_weight_loader
 from verl.workers.megatron_workers import ActorRolloutRefWorker as ARRWorker
 from verl.workers.megatron_workers import CriticWorker, RewardModelWorker
 
+from .distributed_util import init_process_group
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -44,6 +46,19 @@ class ActorRolloutRefWorker(ARRWorker):
         if role == "actor":
             self._is_rollout = False
         self.role = role
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def create_weight_sync_group(
+        self, master_address, master_port, world_size, rank_offset, backend="nccl", group_name="actor_rollout"
+    ):
+        rank = self.rank + rank_offset
+        self._weight_sync_group = init_process_group(
+            backend=backend,
+            init_method=f"tcp://{master_address}:{master_port}",
+            world_size=world_size,
+            rank=rank,
+            group_name=group_name
+        )
 
     def _get_actor_params_generator(self):
         assert self._is_actor
@@ -85,9 +100,10 @@ class ActorRolloutRefWorker(ARRWorker):
             tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
             if self._is_actor and torch.distributed.get_rank() == 0:
                 tensor.copy_(weight)
-            from ray.util.collective import collective
+            # from ray.util.collective import collective
 
-            collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
+            # collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
+            torch.distributed.broadcast(tensor, 0, group=self._weight_sync_group)
             if self._is_rollout:
                 inference_model.load_weights([(key, tensor)])
 
