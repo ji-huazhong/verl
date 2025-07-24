@@ -69,10 +69,19 @@ from verl.utils.fsdp_utils import (
 )
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import compute_position_id_with_mask
-from verl.utils.profiler import DistProfiler, DistProfilerExtension, log_gpu_memory_usage, simple_timer
+from verl.utils.profiler import (
+    DistProfiler,
+    DistProfilerExtension,
+    log_gpu_memory_usage,
+    simple_timer,
+)
 from verl.utils.profiler.performance import reduce_timing
 from verl.utils.py_functional import convert_to_regular_types
-from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig
+from verl.workers.config import (
+    FSDPCriticConfig,
+    FSDPEngineConfig,
+    FSDPRewardModelConfig,
+)
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
 logger = logging.getLogger(__file__)
@@ -223,9 +232,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     ):
         from torch import optim
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
-        from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
+        from transformers import (
+            AutoConfig,
+            AutoModelForCausalLM,
+            AutoModelForVision2Seq,
+        )
 
-        from verl.utils.model import get_generation_config, print_model_size, update_model_config
+        from verl.utils.model import (
+            get_generation_config,
+            print_model_size,
+            update_model_config,
+        )
         from verl.utils.torch_dtypes import PrecisionType
 
         assert role in ["actor", "ref"]
@@ -292,7 +309,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
-                from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
+                from liger_kernel.transformers.monkey_patch import (
+                    _apply_liger_kernel_to_instance,
+                )
 
                 _apply_liger_kernel_to_instance(model=actor_module)
 
@@ -414,7 +433,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # TODO: add more optimizer args into config
         if role == "actor" and optim_config is not None:
-            from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+            from verl.utils.torch_functional import (
+                get_constant_schedule_with_warmup,
+                get_cosine_schedule_with_warmup,
+            )
 
             actor_optimizer = optim.AdamW(
                 actor_module_fsdp.parameters(),
@@ -528,7 +550,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             # For this reason, sharding_manager.__init__ should not import FSDPSGLangShardingManager and
             # we import it here use the abs path.
             # check: https://github.com/sgl-project/sglang/blob/00f42707eaddfc2c0528e5b1e0094025c640b7a0/python/sglang/srt/layers/quantization/fp8_utils.py#L76
-            from verl.workers.sharding_manager.fsdp_sglang import FSDPSGLangShardingManager
+            from verl.workers.sharding_manager.fsdp_sglang import (
+                FSDPSGLangShardingManager,
+            )
 
             local_path = copy_to_local(self.config.model.path)
             log_gpu_memory_usage(f"Before building {rollout_name} rollout", logger=logger)
@@ -1150,7 +1174,10 @@ class CriticWorker(Worker, DistProfilerExtension):
         if self.rank == 0:
             print(f"Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}")
 
-        from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+        from verl.utils.torch_functional import (
+            get_constant_schedule_with_warmup,
+            get_cosine_schedule_with_warmup,
+        )
 
         if warmup_style == "constant":
             critic_lr_scheduler = get_constant_schedule_with_warmup(
@@ -1303,7 +1330,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
     Note that we only implement the reward model that is subclass of AutoModelForTokenClassification.
     """
 
-    def __init__(self, config):
+    def __init__(self, config: FSDPRewardModelConfig):
         Worker.__init__(self)
         DistProfilerExtension.__init__(
             self, DistProfiler(rank=self.rank, config=omega_conf_to_dataclass(config.get("profiler")))
@@ -1315,7 +1342,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             torch.distributed.init_process_group(
                 backend=get_nccl_backend(), init_method=os.environ.get("DIST_INIT_METHOD", None)
             )
-        self.config = config
+        self.config: FSDPRewardModelConfig = config
 
         # build device mesh for Ulysses Sequence Parallel
         world_size = torch.distributed.get_world_size()
@@ -1429,7 +1456,12 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
     def _forward_micro_batch(self, micro_batch):
         if is_cuda_available:
-            from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+            from flash_attn.bert_padding import (
+                index_first_axis,
+                pad_input,
+                rearrange,
+                unpad_input,
+            )
         elif is_npu_available:
             from transformers.integrations.npu_flash_attention import (
                 index_first_axis,
@@ -1438,7 +1470,10 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 unpad_input,
             )
 
-        from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
+        from verl.utils.ulysses import (
+            gather_outputs_and_unpad,
+            ulysses_pad_and_slice_inputs,
+        )
 
         with torch.no_grad(), torch.autocast(device_type=device_name, dtype=torch.bfloat16):
             input_ids = micro_batch["input_ids"]

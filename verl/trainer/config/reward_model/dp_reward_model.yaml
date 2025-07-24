@@ -13,9 +13,15 @@ defaults:
   # load the reference default config, then apply the fields in the current yaml
   - _self_
 
+# Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+_target_: verl.workers.config.FSDPRewardModelConfig
+
 strategy: fsdp
 
 model:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.FSDPRewardModelCfg
 
   # Whether to use shared memory for loading the model
   use_shm: False

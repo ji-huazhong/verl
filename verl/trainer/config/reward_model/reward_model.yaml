@@ -1,4 +1,5 @@
 # configs for the reward model
+_target_: verl.workers.config.RewardModelConfig
 
 # Whether to enable reward model. If False, we compute the reward only with the user-defined reward functions.
 # In GSM8K and Math examples, we disable reward model.

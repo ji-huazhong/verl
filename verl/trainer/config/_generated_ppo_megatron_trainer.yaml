@@ -363,6 +363,7 @@ critic:
   load_weight: true
   data_loader_seed: ${oc.select:actor_rollout_ref.actor.data_loader_seed,null}
 reward_model:
+  _target_: verl.workers.config.RewardModelConfig
   enable: false
   strategy: megatron
   model:
