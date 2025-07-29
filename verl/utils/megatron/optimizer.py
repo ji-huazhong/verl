@@ -15,7 +15,9 @@
 
 import torch
 from megatron.core.optimizer import OptimizerConfig
-from megatron.core.optimizer import get_megatron_optimizer as get_megatron_optimizer_native
+from megatron.core.optimizer import (
+    get_megatron_optimizer as get_megatron_optimizer_native,
+)
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 
 from verl.utils.logger import print_rank_0
