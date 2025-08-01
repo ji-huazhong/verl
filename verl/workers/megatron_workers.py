@@ -36,11 +36,20 @@ from megatron.core import parallel_state as mpu
 
 from verl import DataProto
 from verl.single_controller.base import Worker
-from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
+from verl.single_controller.base.decorator import (
+    Dispatch,
+    make_nd_compute_dataproto_dispatch_fn,
+    register,
+)
 from verl.utils import hf_tokenizer
 from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpointManager
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_device_id, get_device_name, get_nccl_backend, get_torch_device
+from verl.utils.device import (
+    get_device_id,
+    get_device_name,
+    get_nccl_backend,
+    get_torch_device,
+)
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
 from verl.utils.megatron_utils import (
@@ -50,7 +59,11 @@ from verl.utils.megatron_utils import (
     offload_megatron_optimizer,
 )
 from verl.utils.memory_utils import aggressive_empty_cache
-from verl.utils.model import get_hf_model_path, load_mcore_dist_weights, load_megatron_gptmodel_weights
+from verl.utils.model import (
+    get_hf_model_path,
+    load_mcore_dist_weights,
+    load_megatron_gptmodel_weights,
+)
 from verl.utils.profiler import (
     DistProfiler,
     DistProfilerExtension,
@@ -249,8 +262,15 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     def _build_model_optimizer(
         self, model_path, optim_config, override_model_config, override_transformer_config, override_ddp_config=None
     ):
-        from verl.utils.megatron.optimizer import get_megatron_optimizer, get_megatron_optimizer_param_scheduler
-        from verl.utils.megatron_utils import McoreModuleWrapperConfig, init_megatron_optim_config, make_megatron_module
+        from verl.utils.megatron.optimizer import (
+            get_megatron_optimizer,
+            get_megatron_optimizer_param_scheduler,
+        )
+        from verl.utils.megatron_utils import (
+            McoreModuleWrapperConfig,
+            init_megatron_optim_config,
+            make_megatron_module,
+        )
         from verl.utils.model import get_generation_config, print_model_size
 
         self._init_hf_config_and_tf_config(
@@ -356,7 +376,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             from torch.distributed.device_mesh import init_device_mesh
 
             from verl.workers.rollout.vllm_rollout import vLLMRollout
-            from verl.workers.sharding_manager.megatron_vllm import MegatronVLLMShardingManager
+            from verl.workers.sharding_manager.megatron_vllm import (
+                MegatronVLLMShardingManager,
+            )
 
             # NOTE(sgm): If the QKV and gate_up projection layer are concate together in actor,
             # we will reorganize their weight format when resharding from actor to rollout.
@@ -391,6 +413,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             weight_converter = get_mcore_weight_converter(self.actor_model_config, self.dtype)
             sharding_manager = MegatronVLLMShardingManager(
                 inference_engine=rollout.inference_engine,
+                rollout=rollout,
                 model_config=self.actor_model_config,
                 transformer_config=self.tf_config,
                 rollout_config=self.config.rollout,
@@ -413,7 +436,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             # For this reason, sharding_manager.__init__ should not import FSDPSGLangShardingManager and we import it
             # here use the abs path.
             # check: https://github.com/sgl-project/sglang/blob/00f42707eaddfc2c0528e5b1e0094025c640b7a0/python/sglang/srt/layers/quantization/fp8_utils.py#L76
-            from verl.workers.sharding_manager.megatron_sglang import MegatronSGLangShardingManager
+            from verl.workers.sharding_manager.megatron_sglang import (
+                MegatronSGLangShardingManager,
+            )
 
             infer_tp = self.config.rollout.tensor_model_parallel_size
             dp = self.world_size // infer_tp
@@ -606,7 +631,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         output = output.to("cpu")
 
         if self._is_offload_param:
-            offload_megatron_model_to_cpu(self.actor_module)
+            offload_megatron_model_to_cpu(self.actor_module, False)
             log_gpu_memory_usage("After offload actor params and grad during update_actor", logger=logger)
         if self._is_offload_optimizer:
             offload_megatron_optimizer(self.actor_optimizer)
@@ -634,8 +659,12 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             offload_megatron_optimizer(self.actor_optimizer)
 
         timing_generate = {}
+        # TODO(hz): Is it necessary to explicitly call
+        # load_megatron_model_to_gpu(self.actor_module, load_grad=False)？
         with self.sharding_manager:
             log_gpu_memory_usage("After entering sharding manager", logger=logger)
+            if self.config.rollout.name == "vllm":
+                self.rollout.init_cache_engine()
             prompts = self.sharding_manager.preprocess_data(prompts)
             with simple_timer("generate_sequences", timing_generate):
                 output = self.rollout.generate_sequences(prompts=prompts)
@@ -849,8 +878,15 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
     def _build_critic_model_optimizer(
         self, model_path, optim_config, override_model_config, override_transformer_config, override_ddp_config
     ):
-        from verl.utils.megatron.optimizer import get_megatron_optimizer, get_megatron_optimizer_param_scheduler
-        from verl.utils.megatron_utils import McoreModuleWrapperConfig, init_megatron_optim_config, make_megatron_module
+        from verl.utils.megatron.optimizer import (
+            get_megatron_optimizer,
+            get_megatron_optimizer_param_scheduler,
+        )
+        from verl.utils.megatron_utils import (
+            McoreModuleWrapperConfig,
+            init_megatron_optim_config,
+            make_megatron_module,
+        )
         from verl.utils.model import print_model_size
 
         self._init_hf_config_and_tf_config(
@@ -1105,7 +1141,10 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
             self.config.micro_batch_size_per_gpu = self.config.micro_batch_size
 
     def _build_rm_model(self, model_path, tokenizer, override_model_config, override_transformer_config):
-        from verl.utils.megatron_utils import McoreModuleWrapperConfig, make_megatron_module
+        from verl.utils.megatron_utils import (
+            McoreModuleWrapperConfig,
+            make_megatron_module,
+        )
 
         self._init_hf_config_and_tf_config(
             model_path,

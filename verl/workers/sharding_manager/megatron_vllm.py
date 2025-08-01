@@ -15,7 +15,6 @@
 This file contains a Megatron style Hybrid Engine that shares the weights of the actor with the inference engine.
 """
 
-import inspect
 import logging
 import os
 
@@ -31,7 +30,10 @@ from verl.protocol import all_gather_data_proto
 from verl.third_party.vllm import LLM
 from verl.third_party.vllm import parallel_state as vllm_ps
 from verl.utils.device import get_torch_device
-from verl.utils.megatron_utils import load_megatron_model_to_gpu, offload_megatron_model_to_cpu, per_tensor_generator
+from verl.utils.megatron_utils import (
+    offload_megatron_model_to_cpu,
+    per_tensor_generator,
+)
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.profiler import GPUMemoryLogger, log_gpu_memory_usage
 from verl.utils.profiler.performance import simple_timer
@@ -83,6 +85,7 @@ class MegatronVLLMShardingManager(BaseShardingManager):
     def __init__(
         self,
         actor_module: nn.ModuleList,
+        rollout,
         inference_engine: LLM,
         model_config: DictConfig,
         transformer_config,
@@ -94,6 +97,7 @@ class MegatronVLLMShardingManager(BaseShardingManager):
         bridge=None,
     ):
         self.actor_module = actor_module
+        self.rollout = rollout
         self.inference_engine = inference_engine
         self.offload_param = offload_param
 
@@ -146,14 +150,17 @@ class MegatronVLLMShardingManager(BaseShardingManager):
             aggressive_empty_cache(force_sync=True)
 
             log_gpu_memory_usage("Before state_dict() in sharding manager memory", logger=logger)
-            if self.offload_param:
-                load_megatron_model_to_gpu(self.actor_module, load_grad=False)
+            # NOTE(hz): [perf] 不需要加载param，update_actor后不会卸载param
+            # if self.offload_param:
+            #     load_megatron_model_to_gpu(self.actor_module, load_grad=False)
 
-            if self.rollout_config.free_cache_engine:
-                if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
-                    self.inference_engine.wake_up(tags=["weights"])
-                else:
-                    self.inference_engine.wake_up()
+            self.rollout.onload_model_weights()
+            # if self.rollout_config.free_cache_engine:
+            # if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+            #     self.inference_engine.wake_up(tags=["weights"])
+            # else:
+            #     self.inference_engine.wake_up()
+
             if self.bridge is not None:
                 per_tensor_param = self.bridge.export_weights(self.actor_module)
             else:
@@ -176,11 +183,11 @@ class MegatronVLLMShardingManager(BaseShardingManager):
                 offload_megatron_model_to_cpu(self.actor_module)
             aggressive_empty_cache(force_sync=True)
 
-            if (
-                self.rollout_config.free_cache_engine
-                and "tags" in inspect.signature(self.inference_engine.wake_up).parameters
-            ):
-                self.inference_engine.wake_up(tags=["kv_cache"])
+            # if (
+            #     self.rollout_config.free_cache_engine
+            #     and "tags" in inspect.signature(self.inference_engine.wake_up).parameters
+            # ):
+            #     self.inference_engine.wake_up(tags=["kv_cache"])
 
             # important: need to manually set the random states of each tp to be identical.
             if self.device_mesh is not None:
@@ -189,8 +196,12 @@ class MegatronVLLMShardingManager(BaseShardingManager):
 
     @GPUMemoryLogger(role="megatron vllm sharding_manager", logger=logger)
     def __exit__(self, exc_type, exc_value, traceback):
-        if self.rollout_config.free_cache_engine:
-            self.inference_engine.sleep(level=1)
+        # if self.rollout_config.free_cache_engine:
+        #     self.inference_engine.sleep(level=1)
+        self.rollout.free_cache_engine()
+        log_gpu_memory_usage("After free vllm cache", logger=logger)
+        self.rollout.offload_model_weights()
+        log_gpu_memory_usage("After offload vllm model", logger=logger)
         for model in self.actor_module:
             model.train()
 

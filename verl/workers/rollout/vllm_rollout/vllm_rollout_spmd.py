@@ -26,6 +26,7 @@ When working with Megatron:
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
 
+import gc
 import getpass
 import logging
 import os
@@ -52,6 +53,7 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.worker.worker_base import WorkerWrapperBase
 
 from verl import DataProto
+from verl.utils.device import get_device_name, get_torch_device
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
@@ -184,10 +186,16 @@ class vLLMRollout(BaseRollout):
             **lora_kwargs,
             **engine_kwargs,
         )
+        self.model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.get_model()
+        self.model_buffers_cpu = {}
+        self.model_buffers = {}
+        for name, param in self.model.named_parameters():
+            self.model_buffers_cpu[name] = torch.empty_like(param, device="cpu")
 
         # Offload vllm model to reduce peak memory usage
-        if config.free_cache_engine:
-            self.inference_engine.sleep(level=1)
+        # if config.free_cache_engine:
+        #     self.inference_engine.sleep(level=1)
+        self.free_cache_engine()
 
         kwargs = dict(
             n=1,
@@ -206,6 +214,70 @@ class vLLMRollout(BaseRollout):
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
+
+    def onload_model_weights(self):
+        # 1. 利用与分配的GPU缓冲区，避免cpu到gpu的数据传输
+        # 2. 避免使用 .cuda()/.to("cuda") 引入的嵌套子模块递归调用
+        self.model_buffers = {}
+        for name, param in self.model.named_parameters():
+            self.model_buffers[name] = torch.empty_like(param, device=get_device_name())
+            param.data = self.model_buffers[name]
+
+    def offload_model_weights(self):
+        for name, params in self.model.named_parameters():
+            params.data = self.model_buffers_cpu[name]
+
+        self.model_buffers = None
+        gc.collect()
+        get_torch_device().empty_cache()
+
+    def init_cache_engine(self):
+        worker = self.inference_engine.llm_engine.model_executor.driver_worker.worker
+        if not worker.model_runner.kv_caches:
+            # v1 使用显式初始化方法
+            self.inference_engine.llm_engine.engine_core.engine_core.model_executor.initialize_from_config(
+                self.inference_engine.llm_engine.engine_core.engine_core.kv_cache_configs
+            )
+            self.inference_engine.llm_engine.reset_prefix_cache()
+
+    def free_cache_engine(self):
+        worker = self.inference_engine.llm_engine.model_executor.driver_worker.worker
+        ctx = worker.model_runner.vllm_config.compilation_config.static_forward_context
+        from vllm.attention import AttentionType
+
+        layer_need_kv_cache = []
+        for layer_name in ctx:
+            if hasattr(ctx[layer_name], "attn_type") and ctx[layer_name].attn_type in (
+                AttentionType.DECODER,
+                AttentionType.ENCODER_DECODER,
+            ):
+                layer_need_kv_cache.append(layer_name)
+
+        pipeline_parallel_size = self.inference_engine.llm_engine.vllm_config.parallel_config.pipeline_parallel_size
+        for layer_name in layer_need_kv_cache:
+            kv_cache = []
+            for _ in range(pipeline_parallel_size):
+                kv_cache.append(torch.tensor([]))
+            ctx[layer_name].kv_cache = kv_cache
+
+        # clear kv caches
+        worker.model_runner.kv_caches = []
+
+        if hasattr(self.model, "model") and hasattr(self.model.model.layers[0].self_attn, "attn"):
+            for i in range(self.model.model.start_layer, self.model.model.end_layer):
+                attn_impl = self.model.model.layers[i].self_attn.attn.impl
+                if hasattr(attn_impl, "key_cache"):
+                    attn_impl.key_cache = None
+                    attn_impl.value_cache = None
+        # 多模态kv cache
+        elif hasattr(self.model, "language_model") and hasattr(
+            self.model.language_model.model.layers[0].self_attn, "attn"
+        ):
+            for i in range(self.model.language_model.model.start_layer, self.model.language_model.model.end_layer):
+                attn_impl = self.model.language_model.model.layers[i].self_attn.attn.impl
+                if hasattr(attn_impl, "key_cache"):
+                    attn_impl.key_cache = None
+                    attn_impl.value_cache = None
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
