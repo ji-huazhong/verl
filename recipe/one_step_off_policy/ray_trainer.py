@@ -271,17 +271,22 @@ class OneStepOffRayTrainer(RayPPOTrainer):
         self.actor_rollout_wg = self.actor_wg  # to be compatible with the functions that not be modified
         weights_info = self.actor_wg.get_actor_weights_info()[0]
         self.rollout_wg.set_actor_weights_info(weights_info)
-        from ray.util.collective import collective
 
-        actor_rollout_workers = self.actor_wg.workers + self.rollout_wg.workers
-        collective.create_collective_group(
-            actor_rollout_workers,
-            len(actor_rollout_workers),
-            list(range(0, len(actor_rollout_workers))),
-            backend="nccl",
-            group_name="actor_rollout",
-        )
-        self.sync_rollout_weights()
+        use_ray = False  # for debug
+        self.create_weight_sync_group(use_ray)
+        self.sync_rollout_weights(use_ray)
+        
+        # from ray.util.collective import collective
+
+        # actor_rollout_workers = self.actor_wg.workers + self.rollout_wg.workers
+        # collective.create_collective_group(
+        #     actor_rollout_workers,
+        #     len(actor_rollout_workers),
+        #     list(range(0, len(actor_rollout_workers))),
+        #     backend="nccl",
+        #     group_name="actor_rollout",
+        # )
+        # self.sync_rollout_weights()
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
@@ -293,11 +298,44 @@ class OneStepOffRayTrainer(RayPPOTrainer):
                 config=self.config,
                 worker_group=self.rollout_wg,
             )
+    
+    def create_weight_sync_group(self, use_ray=True):
+        if use_ray:
+            from ray.util.collective import collective
 
-    def sync_rollout_weights(self):
+            actor_rollout_workers = self.actor_wg.workers + self.rollout_wg.workers
+            collective.create_collective_group(
+                actor_rollout_workers,
+                len(actor_rollout_workers),
+                list(range(0, len(actor_rollout_workers))),
+                backend="nccl",
+                group_name="actor_rollout",
+            )
+        else:
+            master_address = ray.get(self.actor_wg.workers[0]._get_node_ip.remote())
+            master_port = ray.get(self.actor_wg.workers[0]._get_free_port.remote())
+            world_size = len(self.actor_wg.workers + self.rollout_wg.workers)
+            
+            self.actor_wg.create_weight_sync_group(
+                master_address,
+                master_port,
+                0,
+                world_size,
+            )
+
+            ray.get(
+                self.rollout_wg.create_weight_sync_group(
+                    master_address,
+                    master_port,
+                    len(self.actor_wg.workers),
+                    world_size,
+                )
+            )
+
+    def sync_rollout_weights(self, use_ray=True):
         if not self.hybrid_engine:
-            self.actor_wg.sync_rollout_weights()
-            ray.get(self.rollout_wg.sync_rollout_weights())
+            self.actor_wg.sync_rollout_weights(use_ray)
+            ray.get(self.rollout_wg.sync_rollout_weights(use_ray))
 
     def _create_continuous_iterator(self):
         """

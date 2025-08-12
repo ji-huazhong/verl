@@ -29,6 +29,8 @@ from verl.utils.fs import copy_to_local
 from verl.workers.megatron_workers import ActorRolloutRefWorker as ARRWorker
 from verl.workers.megatron_workers import CriticWorker, RewardModelWorker
 
+from .distributed_utils import init_process_group
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -184,6 +186,17 @@ class RolloutWorker(ActorRolloutRefWorker):
 
         self.rollout, self.sharding_manager = rollout, sharding_manager
         self.rollout.sharding_manager = sharding_manager
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    def create_weight_sync_group(self, master_address, master_port, rank_offset, world_size):
+        rank = torch.distributed.get_rank() + rank_offset
+        self._weight_update_group = init_process_group(
+            backend="nccl",
+            init_method=f"tcp://{master_address}:{master_port}",
+            world_size=world_size,
+            rank=rank,
+            group_name="rollout_actor",
+        )
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
     def async_generate_sequences(self, *args, **kwargs):
