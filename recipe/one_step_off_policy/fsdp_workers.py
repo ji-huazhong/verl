@@ -32,6 +32,7 @@ from verl.utils.device import (
     get_nccl_backend,
     get_torch_device,
 )
+from verl.utils.distributed_util import stateless_init_process_group
 from verl.utils.fs import copy_to_local
 from verl.utils.fsdp_utils import (
     fsdp_version,
@@ -40,8 +41,6 @@ from verl.utils.import_utils import import_external_libs
 from verl.utils.model import get_generation_config, update_model_config
 from verl.workers.fsdp_workers import ActorRolloutRefWorker as ARRWorker
 from verl.workers.fsdp_workers import CriticWorker
-
-from .distributed_util import stateless_init_process_group
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))

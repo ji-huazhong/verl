@@ -16,9 +16,6 @@
 from verl.utils.device import is_npu_available
 
 
-# Copy from pytorch and OpenRLHF to allow creating a process group
-# without considering the global process group in torch.distributed.
-# https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/utils/distributed_util.py
 def stateless_init_process_group(master_address, master_port, rank, world_size, device):
     """
     vLLM provides `StatelessProcessGroup` to create a process group

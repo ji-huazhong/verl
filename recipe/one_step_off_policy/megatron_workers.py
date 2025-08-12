@@ -25,11 +25,10 @@ from verl.utils.debug import (
     log_gpu_memory_usage,
 )
 from verl.utils.device import get_device_name, get_torch_device
+from verl.utils.distributed_util import stateless_init_process_group
 from verl.utils.fs import copy_to_local
 from verl.workers.megatron_workers import ActorRolloutRefWorker as ARRWorker
 from verl.workers.megatron_workers import CriticWorker, RewardModelWorker
-
-from .distributed_util import stateless_init_process_group
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -128,6 +127,13 @@ class RolloutWorker(ActorRolloutRefWorker):
     def __init__(self, config: DictConfig, role: str):
         assert role == "rollout"
         ARRWorker.__init__(self, config, role)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def create_weight_sync_group(self, master_address, master_port, rank_offset, world_size):
+        return self.rollout.inference_engine.collective_rpc(
+            "create_weight_sync_group",
+            args=(master_address, master_port, rank_offset, world_size),
+        )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
