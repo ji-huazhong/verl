@@ -17,7 +17,7 @@ import logging
 import os
 
 import torch
-import torch.distributed
+import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
 
 from verl.single_controller.base.decorator import Dispatch, register
@@ -67,7 +67,7 @@ class ActorRolloutRefWorker(ARRWorker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def create_weight_sync_group(self, master_address, master_port, rank_offset, world_size):
-        rank = torch.distributed.get_rank() + rank_offset
+        rank = dist.get_rank() + rank_offset
         self._weight_update_group = init_process_group(
             backend="nccl",
             init_method=f"tcp://{master_address}:{master_port}",
@@ -77,7 +77,7 @@ class ActorRolloutRefWorker(ARRWorker):
         )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    def sync_rollout_weights(self):
+    def sync_rollout_weights(self, use_ray=True):
         assert (self._is_actor or self._is_rollout) and not self.config.hybrid_engine
         assert hasattr(self, "_weights_info") and self._weights_info is not None
 
@@ -99,9 +99,14 @@ class ActorRolloutRefWorker(ARRWorker):
             tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
             if self._is_actor and torch.distributed.get_rank() == 0:
                 tensor.copy_(weight)
-            from ray.util.collective import collective
 
-            collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
+            if use_ray:
+                from ray.util.collective import collective
+
+                collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
+            else:
+                dist.broadcast(tensor, 0, group=self._weight_update_group)
+
             if self._is_rollout:
                 inference_model.load_weights([(key, tensor)])
 
