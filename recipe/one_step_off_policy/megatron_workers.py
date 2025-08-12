@@ -65,7 +65,7 @@ class ActorRolloutRefWorker(ARRWorker):
         )
         return generator
 
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=False)
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def create_weight_sync_group(self, master_address, master_port, rank_offset, world_size):
         rank = torch.distributed.get_rank() + rank_offset
         self._weight_update_group = init_process_group(
