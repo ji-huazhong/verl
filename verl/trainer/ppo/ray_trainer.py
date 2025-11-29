@@ -313,7 +313,6 @@ class RayPPOTrainer:
         self.val_reward_fn = val_reward_fn
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
-        assert self.hybrid_engine, "Currently, only support hybrid engine"
 
         if self.hybrid_engine:
             assert Role.ActorRollout in role_worker_mapping or Role.ActorRolloutRef in role_worker_mapping, (
@@ -691,7 +690,20 @@ class RayPPOTrainer:
             )
             self.resource_pool_to_cls[resource_pool][str(actor_role)] = actor_rollout_cls
         else:
-            raise NotImplementedError
+            # rollout engine and hybrid engine colocated in same ray placement group but in separate processes.
+            resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
+            actor_cls = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[actor_role],
+                config=self.config.actor_rollout_ref,
+                role=str(Role.Actor),
+            )
+            self.resource_pool_to_cls[resource_pool][str(Role.Actor)] = actor_cls
+            rollout_cls = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[actor_role],
+                config=self.config.actor_rollout_ref,
+                role=str(Role.Rollout),
+            )
+            self.resource_pool_to_cls[resource_pool][str(Role.Rollout)] = rollout_cls
 
         # create critic
         if self.use_critic:
@@ -769,8 +781,22 @@ class RayPPOTrainer:
             self.rm_wg.init_model()
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
-        self.actor_rollout_wg = all_wg[str(actor_role)]
-        self.actor_rollout_wg.init_model()
+        if self.hybrid_engine:
+            self.actor_rollout_wg = all_wg[str(actor_role)]
+            self.actor_rollout_wg.init_model()
+            self.actor_wg = None
+            self.rollout_wg = None
+        else:
+            # Colocate mode: actor and rollout are separate worker groups
+            self.actor_wg = all_wg[str(Role.Actor)]
+            self.rollout_wg = all_wg[str(Role.Rollout)]
+            # Initialize actor first
+            self.actor_wg.init_model()
+            # Initialize rollout after actor (for better memory estimation)
+            self.rollout_wg.init_model()
+            # For backward compatibility, set actor_rollout_wg to rollout_wg for generation
+            # Note: For training operations (update_actor, compute_log_prob, etc.), we'll use actor_wg directly
+            self.actor_rollout_wg = self.rollout_wg
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
@@ -819,7 +845,9 @@ class RayPPOTrainer:
             self.config.trainer.get("max_critic_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
         )
 
-        self.actor_rollout_wg.save_checkpoint(
+        # In colocate mode, use actor_wg for checkpoint operations
+        actor_wg_for_ckpt = self.actor_wg if not self.hybrid_engine else self.actor_rollout_wg
+        actor_wg_for_ckpt.save_checkpoint(
             actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
         )
 
@@ -888,7 +916,9 @@ class RayPPOTrainer:
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, str(Role.Critic))
         # load actor
-        self.actor_rollout_wg.load_checkpoint(
+        # In colocate mode, use actor_wg for checkpoint operations
+        actor_wg_for_ckpt = self.actor_wg if not self.hybrid_engine else self.actor_rollout_wg
+        actor_wg_for_ckpt.load_checkpoint(
             actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
         )
         # load critic
@@ -909,7 +939,12 @@ class RayPPOTrainer:
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
         if do_profile:
-            self.actor_rollout_wg.start_profile(role="e2e", profile_step=self.global_steps)
+            # In colocate mode, profile both actor and rollout
+            if not self.hybrid_engine:
+                self.actor_wg.start_profile(role="actor", profile_step=self.global_steps)
+                self.rollout_wg.start_profile(role="rollout", profile_step=self.global_steps)
+            else:
+                self.actor_rollout_wg.start_profile(role="e2e", profile_step=self.global_steps)
             if self.use_reference_policy:
                 self.ref_policy_wg.start_profile(profile_step=self.global_steps)
             if self.use_critic:
@@ -920,7 +955,12 @@ class RayPPOTrainer:
     def _stop_profiling(self, do_profile: bool) -> None:
         """Stop profiling for all worker groups if profiling is enabled."""
         if do_profile:
-            self.actor_rollout_wg.stop_profile()
+            # In colocate mode, stop profiling for both actor and rollout
+            if not self.hybrid_engine:
+                self.actor_wg.stop_profile()
+                self.rollout_wg.stop_profile()
+            else:
+                self.actor_rollout_wg.stop_profile()
             if self.use_reference_policy:
                 self.ref_policy_wg.stop_profile()
             if self.use_critic:
@@ -934,7 +974,8 @@ class RayPPOTrainer:
         batch_size = attention_mask.shape[0]
         global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)  # (train_batch_size,)
         workload_lst = calculate_workload(global_seqlen_lst)
-        world_size = self.actor_rollout_wg.world_size
+        # In colocate mode, actor and rollout share the same world_size
+        world_size = (self.actor_wg if not self.hybrid_engine else self.actor_rollout_wg).world_size
         if keep_minibatch:
             # Decouple the DP balancing and mini-batching.
             minibatch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size")
@@ -1052,6 +1093,10 @@ class RayPPOTrainer:
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
+                            # In colocate mode, rollout_wg is used for generation
+                            # Note: In colocate mode, weights need to be synced from actor to rollout
+                            # before generation if needed. This can be done by implementing
+                            # a sync_rollout_weights method similar to recipe/one_step_off_policy
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
@@ -1132,7 +1177,9 @@ class RayPPOTrainer:
                         )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                            # In colocate mode, use actor_wg for compute_log_prob
+                            actor_wg_for_compute = self.actor_wg if not self.hybrid_engine else self.actor_rollout_wg
+                            old_log_prob = actor_wg_for_compute.compute_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
@@ -1157,7 +1204,9 @@ class RayPPOTrainer:
                             if not self.ref_in_actor:
                                 ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             else:
-                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                                # In colocate mode, ref is in actor_wg if ref_in_actor is True
+                                actor_wg_for_ref = self.actor_wg if not self.hybrid_engine else self.actor_rollout_wg
+                                ref_log_prob = actor_wg_for_ref.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
                     # compute values
@@ -1230,7 +1279,9 @@ class RayPPOTrainer:
                             batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
                             # TODO: Make "temperature" single source of truth from generation.
                             batch.meta_info["temperature"] = rollout_config.temperature
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                            # In colocate mode, use actor_wg for update_actor
+                            actor_wg_for_update = self.actor_wg if not self.hybrid_engine else self.actor_rollout_wg
+                            actor_output = actor_wg_for_update.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
