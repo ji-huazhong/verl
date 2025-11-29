@@ -593,7 +593,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         assert self.world_size % infer_world_size == 0, (
             f"rollout world_size: {self.world_size} is not divisible by infer_world_size: {infer_world_size}"
         )
-        rollout_device_mesh = init_device_mesh(
+        self.rollout_device_mesh = init_device_mesh(
             device_name, mesh_shape=(dp, infer_tp, infer_pp), mesh_dim_names=["dp", "infer_tp", "infer_pp"]
         )
         rollout_name = self.config.rollout.name
@@ -602,16 +602,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self._register_dispatch_collect_info("rollout", dp_rank=self.rank, is_collect=True)
         else:
             is_collect = (
-                rollout_device_mesh["infer_tp"].get_local_rank() == 0
-                and rollout_device_mesh["infer_pp"].get_local_rank() == 0
+                self.rollout_device_mesh["infer_tp"].get_local_rank() == 0
+                and self.rollout_device_mesh["infer_pp"].get_local_rank() == 0
             )
             self._register_dispatch_collect_info(
-                "rollout", dp_rank=rollout_device_mesh["dp"].get_local_rank(), is_collect=is_collect
+                "rollout", dp_rank=self.rollout_device_mesh["dp"].get_local_rank(), is_collect=is_collect
             )
 
         # 3. init trainer and rollout random states
         self.torch_random_states = get_torch_device().get_rng_state()
-        gen_dp_rank = rollout_device_mesh["dp"].get_local_rank()
+        gen_dp_rank = self.rollout_device_mesh["dp"].get_local_rank()
         get_torch_device().manual_seed(gen_dp_rank + 1000)  # make sure all tp ranks have the same random states
         self.gen_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.torch_random_states)
@@ -619,7 +619,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # 4. build rollout model
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
         self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
-            config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
+            config=rollout_config, model_config=model_config, device_mesh=self.rollout_device_mesh
         )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
@@ -1030,6 +1030,121 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.ref_policy.actor_module.reshard()
 
         return output
+
+    # ============================ Weight Sync for Colocate Mode ============================
+
+    def _get_actor_params(self):
+        """Get actor parameters for weight synchronization in colocate mode."""
+        assert self._is_actor
+        params = self.actor_module_fsdp.state_dict()
+        from verl.utils.model import convert_weight_keys
+
+        params = convert_weight_keys(
+            params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+        )
+        return params
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_actor_weights_info(self):
+        """Get actor weights info for weight synchronization in colocate mode."""
+        assert self._is_actor
+        if hasattr(self, "_weights_info"):
+            return self._weights_info
+        if fsdp_version(self.actor_module_fsdp) == 1:
+            FSDP.set_state_dict_type(
+                self.actor_module_fsdp,
+                state_dict_type=StateDictType.SHARDED_STATE_DICT,
+                state_dict_config=ShardedStateDictConfig(),
+            )
+        params = self._get_actor_params()
+        ret = []
+        for key, tensor in params.items():
+            ret.append((key, tensor.size(), tensor.dtype))
+        self._weights_info = ret
+        return ret
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_actor_weights_info(self, weights_info):
+        """Set actor weights info for rollout worker in colocate mode."""
+        assert self._is_rollout
+        self._weights_info = weights_info
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def create_weight_sync_group(self, master_address, master_port, rank_offset, world_size):
+        """Create weight synchronization group for colocate mode."""
+        from verl.utils.device import is_npu_available
+
+        # Use StatelessProcessGroup for weight sync between actor and rollout
+        if is_npu_available:
+            from vllm_ascend.distributed.device_communicators.pyhccl import (
+                PyHcclCommunicator as PyNcclCommunicator,
+            )
+        else:
+            from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        from vllm.distributed.utils import StatelessProcessGroup
+
+        rank = torch.distributed.get_rank() + rank_offset
+        pg = StatelessProcessGroup.create(host=master_address, port=master_port, rank=rank, world_size=world_size)
+        pynccl = PyNcclCommunicator(pg, device=get_torch_device().current_device())
+        self._weight_sync_group = pynccl
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def sync_rollout_weights(self):
+        """Sync weights from actor to rollout in colocate mode."""
+        assert (self._is_actor or self._is_rollout) and not self.config.hybrid_engine
+        assert hasattr(self, "_weights_info") and self._weights_info is not None
+
+        if self._is_actor and self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        params = self._get_actor_params() if self._is_actor else None
+        rollout_name = self.config.rollout.name
+        if self._is_rollout:
+            if rollout_name == "vllm":
+                inference_model = (
+                    self.rollout.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+                )
+                from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+
+                patch_vllm_moe_model_weight_loader(inference_model)
+            elif rollout_name == "sglang":
+                inference_model = self.rollout._engine
+            else:
+                raise NotImplementedError(f"Unknown rollout name: {rollout_name}")
+        from asyncio import get_event_loop
+
+        loop = get_event_loop()
+        for key, shape, dtype in self._weights_info:
+            tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
+            if self._is_actor:
+                assert key in params
+                origin_data = params[key]
+                if hasattr(origin_data, "full_tensor"):
+                    origin_data = origin_data.full_tensor()
+                if torch.distributed.get_rank() == 0:
+                    tensor.copy_(origin_data)
+
+            self._weight_sync_group.broadcast(tensor, src=0, stream=get_torch_device().current_stream())
+            if self._is_rollout:
+                if rollout_name == "vllm":
+                    inference_model.load_weights([(key, tensor)])
+                elif rollout_name == "sglang":
+                    loop.run_until_complete(self._update_sglang_weights(inference_model, [(key, tensor)]))
+        if self._is_actor and self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+
+    async def _update_sglang_weights(self, inference_engine, params):
+        """Update weights for SGLang inference engine."""
+        from sglang.srt.weight_sync.utils import update_weights as sgl_update_weights
+
+        await sgl_update_weights(
+            engine=inference_engine,
+            params_batch=params,
+            device_mesh_key="infer_tp",
+            device_mesh=self.rollout_device_mesh,
+        )
+
+        if self.rollout_device_mesh["infer_tp"].get_local_rank() == 0:
+            await inference_engine.flush_cache()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):

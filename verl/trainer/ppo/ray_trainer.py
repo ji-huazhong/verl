@@ -586,10 +586,13 @@ class RayPPOTrainer:
                 else self.config.actor_rollout_ref.rollout.agent.num_workers
             )
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
-            if not self.async_rollout_mode:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-            else:
-                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+                if not self.async_rollout_mode:
+                    # In colocate mode, sync weights from actor to rollout before generation
+                    if not self.hybrid_engine:
+                        self._sync_rollout_weights()
+                    test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+                else:
+                    test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
@@ -797,6 +800,17 @@ class RayPPOTrainer:
             # For backward compatibility, set actor_rollout_wg to rollout_wg for generation
             # Note: For training operations (update_actor, compute_log_prob, etc.), we'll use actor_wg directly
             self.actor_rollout_wg = self.rollout_wg
+            
+            # Initialize weight synchronization for colocate mode
+            # Get weights info from actor and set it to rollout
+            weights_info = self.actor_wg.get_actor_weights_info()[0]
+            self.rollout_wg.set_actor_weights_info(weights_info)
+            
+            # Create weight sync group
+            self._create_weight_sync_group()
+            
+            # Initial weight sync
+            self._sync_rollout_weights()
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
@@ -968,6 +982,38 @@ class RayPPOTrainer:
             if self.use_rm:
                 self.rm_wg.stop_profile()
 
+    def _create_weight_sync_group(self):
+        """Create weight synchronization group for colocate mode."""
+        if self.hybrid_engine:
+            return
+        
+        master_address = ray.get(self.actor_wg.workers[0]._get_node_ip.remote())
+        master_port = ray.get(self.actor_wg.workers[0]._get_free_port.remote())
+        world_size = len(self.actor_wg.workers + self.rollout_wg.workers)
+        
+        self.actor_wg.create_weight_sync_group(
+            master_address,
+            master_port,
+            0,
+            world_size,
+        )
+        ray.get(
+            self.rollout_wg.create_weight_sync_group(
+                master_address,
+                master_port,
+                len(self.actor_wg.workers),
+                world_size,
+            )
+        )
+
+    def _sync_rollout_weights(self):
+        """Sync weights from actor to rollout in colocate mode."""
+        if self.hybrid_engine:
+            return
+        
+        self.actor_wg.sync_rollout_weights()
+        ray.get(self.rollout_wg.sync_rollout_weights())
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch["attention_mask"]
@@ -1093,10 +1139,9 @@ class RayPPOTrainer:
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
-                            # In colocate mode, rollout_wg is used for generation
-                            # Note: In colocate mode, weights need to be synced from actor to rollout
-                            # before generation if needed. This can be done by implementing
-                            # a sync_rollout_weights method similar to recipe/one_step_off_policy
+                            # In colocate mode, sync weights from actor to rollout before generation
+                            if not self.hybrid_engine:
+                                self._sync_rollout_weights()
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
@@ -1112,6 +1157,9 @@ class RayPPOTrainer:
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
                             if not self.async_rollout_mode:
+                                # In colocate mode, sync weights from actor to rollout before generation
+                                if not self.hybrid_engine:
+                                    self._sync_rollout_weights()
                                 gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
                             else:
                                 gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
