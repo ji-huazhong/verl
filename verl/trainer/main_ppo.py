@@ -15,12 +15,15 @@
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other mpain.
 """
 
+import logging
 import os
 import socket
 
 import hydra
 import ray
 from omegaconf import OmegaConf
+
+logger = logging.getLogger(__name__)
 
 from verl.experimental.dataset.sampler import AbstractSampler
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
@@ -205,11 +208,38 @@ class TaskRunner:
 
     def init_resource_pool_mgr(self, config):
         """Initialize resource pool manager."""
+        
+        # Check if debug_rollout_only mode is enabled
+        debug_rollout_only = config.trainer.get("debug_rollout_only", False)
+        if isinstance(debug_rollout_only, str):
+            debug_rollout_only = debug_rollout_only.lower() in ("true", "1", "yes")
 
         global_pool_id = "global_pool"
-        resource_pool_spec = {
-            global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
-        }
+        
+        # In debug_rollout_only mode, only allocate GPUs for rollout
+        if debug_rollout_only:
+            # Calculate rollout GPUs needed
+            rollout_tp = config.actor_rollout_ref.rollout.tensor_model_parallel_size
+            rollout_dp = config.actor_rollout_ref.rollout.data_parallel_size
+            rollout_pp = config.actor_rollout_ref.rollout.pipeline_model_parallel_size
+            rollout_world_size = rollout_tp * rollout_dp * rollout_pp
+            
+            # Calculate GPUs per node for rollout
+            rollout_gpus_per_node = min(config.trainer.n_gpus_per_node, rollout_world_size)
+            rollout_nnodes = (rollout_world_size + rollout_gpus_per_node - 1) // rollout_gpus_per_node
+            
+            logger.info(
+                f"debug_rollout_only mode: allocating {rollout_gpus_per_node} GPUs per node "
+                f"for {rollout_nnodes} nodes (total {rollout_world_size} GPUs for rollout)"
+            )
+            
+            resource_pool_spec = {
+                global_pool_id: [rollout_gpus_per_node] * rollout_nnodes,
+            }
+        else:
+            resource_pool_spec = {
+                global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+            }
         # TODO Here you can use the new registration method to support dynamic registration of roles
         if config.reward_model.enable_resource_pool:
             if config.reward_model.n_gpus_per_node <= 0:

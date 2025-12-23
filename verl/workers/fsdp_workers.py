@@ -756,6 +756,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def init_model(self):
         from verl.workers.actor import DataParallelPPOActor
 
+        # Check if debug_rollout_only mode is enabled
+        # Try to get from config.trainer.debug_rollout_only first, then from config.debug_rollout_only
+        debug_rollout_only = False
+        if hasattr(self.config, "trainer") and hasattr(self.config.trainer, "debug_rollout_only"):
+            debug_rollout_only = self.config.trainer.debug_rollout_only
+        elif hasattr(self.config, "debug_rollout_only"):
+            debug_rollout_only = self.config.debug_rollout_only
+        
+        if isinstance(debug_rollout_only, str):
+            debug_rollout_only = debug_rollout_only.lower() in ("true", "1", "yes")
+
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
 
@@ -767,7 +778,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_actor or self._is_rollout:
             # we need the model for actor and rollout
             if self._is_actor:
-                optim_config = self.config.actor.optim
+                # In debug_rollout_only mode, skip optimizer initialization but still load model
+                if debug_rollout_only:
+                    logger.info("debug_rollout_only mode enabled: loading FSDP2 model but skipping optimizer initialization")
+                    optim_config = None  # Skip optimizer
+                else:
+                    optim_config = self.config.actor.optim
                 fsdp_config = omega_conf_to_dataclass(self.config.actor.fsdp_config)
             else:
                 optim_config = None
@@ -801,12 +817,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 offload_fsdp_model_to_cpu(self.actor_module_fsdp)
                 log_gpu_memory_usage("After offload actor model during init", logger=logger)
 
-            if self._is_offload_optimizer:
+            if self._is_offload_optimizer and self.actor_optimizer is not None:
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
                 log_gpu_memory_usage("After offload actor optimizer during init", logger=logger)
 
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
+            # In debug_rollout_only mode, optimizer is None, but DataParallelPPOActor can handle it
             self.actor = DataParallelPPOActor(
                 config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
             )
@@ -842,10 +859,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
+            # In debug_rollout_only mode, optimizer and lr_scheduler are None
             self.checkpoint_manager = FSDPCheckpointManager(
                 model=self.actor_module_fsdp,
-                optimizer=self.actor.actor_optimizer,
-                lr_scheduler=self.actor_lr_scheduler,
+                optimizer=self.actor_optimizer,  # May be None in debug_rollout_only mode
+                lr_scheduler=self.actor_lr_scheduler,  # May be None in debug_rollout_only mode
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_config=self.config.actor.checkpoint,
             )
@@ -867,9 +885,25 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
         assert self._is_actor
+        
+        # Check if debug_rollout_only mode is enabled
+        debug_rollout_only = False
+        if hasattr(self.config, "trainer") and hasattr(self.config.trainer, "debug_rollout_only"):
+            debug_rollout_only = self.config.trainer.debug_rollout_only
+        elif hasattr(self.config, "debug_rollout_only"):
+            debug_rollout_only = self.config.debug_rollout_only
+        
+        if isinstance(debug_rollout_only, str):
+            debug_rollout_only = debug_rollout_only.lower() in ("true", "1", "yes")
+        
+        # In debug_rollout_only mode, skip training
+        if debug_rollout_only:
+            logger.info("debug_rollout_only mode: skipping actor update")
+            # Return empty metrics
+            return DataProto(meta_info={"metrics": {}})
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
-        if self._is_offload_optimizer:
+        if self._is_offload_optimizer and self.actor_optimizer is not None:
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
 
         with self.ulysses_sharding_manager:
@@ -900,7 +934,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during update_actor", logger=logger)
-        if self._is_offload_optimizer:
+        if self._is_offload_optimizer and self.actor_optimizer is not None:
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
             log_gpu_memory_usage("After offload actor optimizer during update_actor", logger=logger)
 
@@ -962,6 +996,32 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
         assert self._is_actor
+        
+        # Check if debug_rollout_only mode is enabled
+        debug_rollout_only = False
+        if hasattr(self.config, "trainer") and hasattr(self.config.trainer, "debug_rollout_only"):
+            debug_rollout_only = self.config.trainer.debug_rollout_only
+        elif hasattr(self.config, "debug_rollout_only"):
+            debug_rollout_only = self.config.debug_rollout_only
+        
+        if isinstance(debug_rollout_only, str):
+            debug_rollout_only = debug_rollout_only.lower() in ("true", "1", "yes")
+        
+        # In debug_rollout_only mode, skip log_prob computation
+        if debug_rollout_only:
+            logger.info("debug_rollout_only mode: skipping compute_log_prob")
+            # Return dummy output with correct shape
+            batch_size = data.batch.batch_size[0] if hasattr(data.batch, "batch_size") else 1
+            response_length = data.batch.get("response_length", [0])[0] if hasattr(data.batch, "get") else 0
+            if response_length == 0 and "responses" in data.batch:
+                response_length = data.batch["responses"].shape[1] if len(data.batch["responses"].shape) > 1 else 0
+            dummy_log_probs = torch.zeros(batch_size, response_length, device="cpu")
+            dummy_entropys = torch.zeros(batch_size, device="cpu")
+            return DataProto.from_dict(
+                tensors={"old_log_probs": dummy_log_probs, "entropys": dummy_entropys},
+                meta_info={"temperature": self.config.rollout.temperature},
+            )
+        
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
@@ -1000,6 +1060,27 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
+        # Check if debug_rollout_only mode is enabled
+        debug_rollout_only = False
+        if hasattr(self.config, "trainer") and hasattr(self.config.trainer, "debug_rollout_only"):
+            debug_rollout_only = self.config.trainer.debug_rollout_only
+        elif hasattr(self.config, "debug_rollout_only"):
+            debug_rollout_only = self.config.debug_rollout_only
+        
+        if isinstance(debug_rollout_only, str):
+            debug_rollout_only = debug_rollout_only.lower() in ("true", "1", "yes")
+        
+        # In debug_rollout_only mode, skip ref_log_prob computation
+        if debug_rollout_only:
+            logger.info("debug_rollout_only mode: skipping compute_ref_log_prob")
+            # Return dummy output with correct shape
+            batch_size = data.batch.batch_size[0] if hasattr(data.batch, "batch_size") else 1
+            response_length = data.batch.get("response_length", [0])[0] if hasattr(data.batch, "get") else 0
+            if response_length == 0 and "responses" in data.batch:
+                response_length = data.batch["responses"].shape[1] if len(data.batch["responses"].shape) > 1 else 0
+            dummy_ref_log_prob = torch.zeros(batch_size, response_length, device="cpu")
+            return DataProto.from_dict(tensors={"ref_log_prob": dummy_ref_log_prob})
+        
         if self._is_lora:
             # if _is_lora, actor without lora applied is the ref
             data.meta_info["is_lora"] = True
@@ -1039,6 +1120,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # only support save and load ckpt for actor
         assert self._is_actor
+        
+        # Check if debug_rollout_only mode is enabled
+        debug_rollout_only = False
+        if hasattr(self.config, "trainer") and hasattr(self.config.trainer, "debug_rollout_only"):
+            debug_rollout_only = self.config.trainer.debug_rollout_only
+        elif hasattr(self.config, "debug_rollout_only"):
+            debug_rollout_only = self.config.debug_rollout_only
+        
+        if isinstance(debug_rollout_only, str):
+            debug_rollout_only = debug_rollout_only.lower() in ("true", "1", "yes")
+        
+        # In debug_rollout_only mode, skip checkpoint saving
+        if debug_rollout_only:
+            logger.info("debug_rollout_only mode: skipping checkpoint save")
+            return
 
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)

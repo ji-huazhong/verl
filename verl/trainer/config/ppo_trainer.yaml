@@ -122,6 +122,11 @@ algorithm:
 # config for the trainer
 trainer:
 
+  # Whether to only run the rollout generation without training.
+  # This is useful for debugging the rollout generation function.
+  # When enabled, FSDP2 model will not be loaded, only vLLM rollout engine will be initialized.
+  debug_rollout_only: False
+
   # Whether to balance batch sizes across distributed workers
   balance_batch: True
 
