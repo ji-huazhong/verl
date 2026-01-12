@@ -18,9 +18,6 @@ _target_: verl.workers.config.VeOmniCriticConfig
 
 strategy: veomni
 
-# seconds, default is 10 minutes for torch
-nccl_timeout: 600
-
 # model config for the critic
 model:
 
