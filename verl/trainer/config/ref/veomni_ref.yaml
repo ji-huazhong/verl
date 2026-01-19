@@ -2,9 +2,6 @@
 defaults:
   - ref
 
-  # veomni optimizer config
-  - ../optim@optim: veomni
-
   # veomni engine config
   - ../engine@veomni: veomni
 
