@@ -499,6 +499,19 @@ def postprocess_thd_no_padding(
     return output_new_tensor
 
 
+def _build_npu_attn_mask(origin_attn_mask: torch.Tensor) -> torch.Tensor:
+    """Build attn_mask for torch_npu.npu_fusion_attention ([B, 1, Sq, Skv])"""
+
+    _, s = origin_attn_mask.shape
+    device = origin_attn_mask.device
+    valid_q = origin_attn_mask.unsqueeze(-1) # [B, S, 1]
+    valid_k = origin_attn_mask.unsqueeze(-2) # [B, 1, S]
+    causal = torch.tril(torch.ones((s, s), dtype=torch.bool, device=device))
+    npu_attn_mask = valid_q & valid_k & causal
+    # [B, 1, S, S] bool where True means masked out
+    return (~npu_attn_mask).unsqueeze(1).contiguous()
+
+
 def preprocess_bshd_no_padding(
     input_ids: torch.Tensor, pre_process: bool = True, need_roll: bool = False, use_fp8_padding: bool = False
 ):
@@ -538,6 +551,10 @@ def preprocess_bshd_no_padding(
     if need_roll:
         input_ids_bshd = torch.roll(input_ids_bshd, shifts=-1, dims=1)
 
+    # Ascend npu_fusion_attention's attn_mask must be B1SS/BNSS/11SS/SS; [B, S] is invalid.
+    if is_torch_npu_available():
+        attention_mask = _build_npu_attn_mask(attention_mask)
+
     return input_ids_bshd, attention_mask, position_ids
 
 
@@ -551,6 +568,10 @@ def postprocess_bshd_no_padding(
     """
     if not post_process:
         return output
+
+    if is_torch_npu_available():
+        # B1SS: True = masked -> valid token iff ~diag(i, i)
+        attention_mask = ~torch.diagonal(attention_mask[:, 0], dim1=-2, dim2=-1)
 
     batch_size = output.shape[0]
     output_new = []
