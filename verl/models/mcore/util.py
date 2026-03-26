@@ -22,6 +22,7 @@ import torch
 from megatron.core import parallel_state as mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 
+from verl.utils.device import is_npu_available
 from verl.utils.model import CausalLMOutputForPPO
 
 logger = logging.getLogger(__file__)
@@ -499,6 +500,15 @@ def postprocess_thd_no_padding(
     return output_new_tensor
 
 
+def _build_npu_attn_mask(original_attention_mask: torch.Tensor) -> torch.Tensor:
+    """Build attn_mask for torch_npu.npu_fusion_attention (B1SS / [B, 1, Sq, Skv])"""
+    _, seq_len = original_attention_mask
+    causal_mask = torch.tril(torch.ones(seq_len, seq_len), dtype=torch.bool, device=original_attention_mask.device)
+    attn_mask = original_attention_mask.unsqueeze(-1) & original_attention_mask.unsqueeze(-2)
+    attn_mask = attn_mask & causal
+    return (~attn_mask).unsqueeze(1).contiguous()
+
+
 def preprocess_bshd_no_padding(
     input_ids: torch.Tensor, pre_process: bool = True, need_roll: bool = False, use_fp8_padding: bool = False
 ):
@@ -537,6 +547,10 @@ def preprocess_bshd_no_padding(
     position_ids = position_ids.unsqueeze(0).expand_as(input_ids_bshd)
     if need_roll:
         input_ids_bshd = torch.roll(input_ids_bshd, shifts=-1, dims=1)
+
+    if is_npu_available:
+        # Ascend npu_fusion_attention's attn_mask must be BNSS / B1SS / 11SS / SS; [B, S] is invalid.
+        attention_mask = _build_npu_attn_mask(attention_mask)
 
     return input_ids_bshd, attention_mask, position_ids
 
