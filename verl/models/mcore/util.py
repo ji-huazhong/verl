@@ -503,7 +503,7 @@ def postprocess_thd_no_padding(
 def _build_npu_attn_mask(original_attention_mask: torch.Tensor) -> torch.Tensor:
     """Build attn_mask for torch_npu.npu_fusion_attention (B1SS / [B, 1, Sq, Skv])"""
     _, seq_len = original_attention_mask.shape
-    causal_mask = torch.tril(torch.ones(seq_len, seq_len), dtype=torch.bool, device=original_attention_mask.device)
+    causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=original_attention_mask.device)).to(torch.bool)
     attn_mask = original_attention_mask.unsqueeze(-1) & original_attention_mask.unsqueeze(-2)
     attn_mask = attn_mask & causal_mask
     return (~attn_mask).unsqueeze(1).contiguous()
@@ -518,7 +518,7 @@ def preprocess_bshd_no_padding(
     """
     cp_size = mpu.get_context_parallel_world_size()
     # TODO: support context parallel size > 1
-    assert cp_size == 1, "Context parallel size without bshd is not supported yet"
+    assert cp_size == 1, "Context parallel size with bshd is not supported yet"
 
     batch_size = input_ids.shape[0]
     seqlens_in_batch = input_ids.offsets().diff()
@@ -565,6 +565,10 @@ def postprocess_bshd_no_padding(
     """
     if not post_process:
         return output
+
+    if is_npu_available:
+        attention_mask = attention_mask.diagonal(dim1=-2, dim2=-1).squeeze(1)
+        attention_mask = ~attention_mask.bool()
 
     batch_size = output.shape[0]
     output_new = []
