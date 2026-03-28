@@ -189,12 +189,9 @@ elif [ "${ACTOR_STRATEGY}" == "megatron" ]; then
     train_pp=2
     ref_offload=True
     actor_offload=True
-    if [ -n "$device_name" ] && [ "$device_name" == "npu" ]; then
-        common_params+=(
-            # Todo The checkpoint_engine.backend should be unified to nccl
-            # actor_rollout_ref.rollout.checkpoint_engine.backend='hccl'
-            actor_rollout_ref.rollout.gpu_memory_utilization=0.60
-        )
+    common_params+=(
+        actor_rollout_ref.rollout.gpu_memory_utilization=0.60
+    )
     fi
 
     python3 -m verl.experimental.fully_async_policy.fully_async_main \
