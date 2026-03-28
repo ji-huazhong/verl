@@ -185,13 +185,13 @@ elif [ "${ACTOR_STRATEGY}" == "megatron" ]; then
     echo "Running fully async training with Megatron strategy..."
     # Megatron specific parameters
     gen_tp=2
-    train_tp=4
-    train_pp=1
+    train_tp=2
+    train_pp=2
     ref_offload=True
     actor_offload=True
-    # common_params+=(
-    #     actor_rollout_ref.rollout.gpu_memory_utilization=0.70
-    # )
+    if [ -n "$device_name" ] && [ "$device_name" == "npu" ]; then
+        export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+    fi
 
     python3 -m verl.experimental.fully_async_policy.fully_async_main \
         --config-path=config \
