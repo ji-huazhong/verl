@@ -192,7 +192,6 @@ elif [ "${ACTOR_STRATEGY}" == "megatron" ]; then
     common_params+=(
         actor_rollout_ref.rollout.gpu_memory_utilization=0.60
     )
-    fi
 
     python3 -m verl.experimental.fully_async_policy.fully_async_main \
         --config-path=config \
