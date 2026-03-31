@@ -149,6 +149,12 @@ class McoreEngineConfig(EngineConfig):
         param_offload (bool): Whether to offload parameters to CPU.
         grad_offload (bool): Whether to offload gradients to CPU.
         optimizer_offload (bool): Whether to offload optimizer states to CPU.
+        nccl_offload (bool): Whether to destroy and rebuild NCCL process groups between
+            training steps.  When True, all Megatron parallelism groups (TP/PP/DP/EP/…)
+            are destroyed after each training/eval context and rebuilt on re-entry.
+            This frees NCCL ring-buffer memory so colocated rollout workers have full
+            GPU access during inference.  Can be combined with param_offload for
+            maximum memory savings, or used independently.
         tensor_model_parallel_size (int): Tensor model parallel size.
         expert_model_parallel_size (int): Expert model parallel size for MoE models.
         expert_tensor_parallel_size (Optional[int]): Expert tensor parallel size for MoE models.
@@ -192,6 +198,8 @@ class McoreEngineConfig(EngineConfig):
     vanilla_mbridge: bool = True
     strategy: str = "megatron"
     qat: QATEngineConfig = field(default_factory=QATEngineConfig)
+    # Whether to destroy/rebuild NCCL process groups between train steps
+    nccl_offload: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()

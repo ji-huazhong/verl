@@ -36,6 +36,12 @@ from verl.utils.device import get_device_name, is_npu_available, set_expandable_
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.memory_utils import aggressive_empty_cache
+from verl.utils.reloadable_process_group import (
+    destroy_process_groups,
+    is_nccl_offload_enabled,
+    monkey_patch_torch_dist,
+    reload_process_groups,
+)
 from verl.utils.metric.utils import Metric
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
 from verl.utils.py_functional import append_to_dict
@@ -339,19 +345,15 @@ class TrainingWorker(Worker, DistProfilerExtension):
             Timer(name="train_batch", logger=None) as timer,
         ):
             output = self.engine.train_batch(data, loss_function=self.loss_fn)
-            # containing loss, model_output and metrics
-            # for training, we only care about loss and metrics
         delta_time = timer.last
 
         update_lr_scheduler = tu.get(data, key="update_lr_scheduler", default=False)
-        # update lr scheduler
         if update_lr_scheduler:
             lr = self.engine.lr_scheduler_step()
         else:
             lr = None
 
         if self.engine.is_mp_src_rank_with_outputs():
-            # we don't need model_output in training. Maybe we change out mind later
             output.pop("model_output")
             if lr is not None:
                 output["metrics"]["lr"] = lr
@@ -483,6 +485,34 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def init_model(self):
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
 
+        # Pre-apply the NCCL monkey patch before ANY TrainingWorker is created.
+        #
+        # All engines in this process share the same Megatron process groups:
+        # _init_device_mesh() has a `if mpu.is_initialized(): return` guard, so
+        # mpu.initialize_model_parallel() is called ONLY ONCE—by whichever engine
+        # initializes first (ref, in the default init order below).
+        #
+        # If only actor has nccl_offload=True, applying the patch inside
+        # MegatronEngine.__init__ is already too late: by the time actor runs,
+        # mpu is already initialized and no groups are created, leaving
+        # ReloadableProcessGroup.GROUPS[pid] empty and making every
+        # destroy/reload call a silent no-op.
+        #
+        # Applying the patch here—before any engine is created—ensures that
+        # dist.new_group is intercepted when ref (or whoever is first) actually
+        # calls mpu.initialize_model_parallel().
+        _needs_nccl_patch = False
+        if "actor" in self.role:
+            _needs_nccl_patch = _needs_nccl_patch or bool(
+                self.config.actor.get("megatron", {}).get("nccl_offload", False)
+            )
+        if "ref" in self.role:
+            _needs_nccl_patch = _needs_nccl_patch or bool(
+                self.config.ref.get("megatron", {}).get("nccl_offload", False)
+            )
+        if _needs_nccl_patch:
+            monkey_patch_torch_dist()
+
         # 1. build reference model
         if "ref" in self.role:
             # TODO: align ref config with actor config
@@ -608,6 +638,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 backend, is_master=(torch.distributed.get_rank() == 0), bucket_size=bucket_size, **engine_kwargs
             )
 
+        # After all engines (ref, actor, rollout) are fully initialized, destroy
+        # NCCL process groups to free ring-buffer memory for colocated workers.
+        if is_nccl_offload_enabled():
+            destroy_process_groups()
+
         # Free cached GPU memory so colocated vLLM processes can see it via cudaMemGetInfo
         aggressive_empty_cache(force_sync=True)
 
@@ -615,6 +650,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     @_with_routing_replay_flag(enabled=False)
     def compute_ref_log_prob(self, data: TensorDict) -> TensorDict:
+        if is_nccl_offload_enabled():
+            reload_process_groups()
         output = self.ref.infer_batch(data=data)
         return output.cpu() if output is not None else None
 
@@ -622,14 +659,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     @_with_routing_replay_flag(enabled=True)
     def compute_log_prob(self, data: TensorDict) -> TensorDict:
+        if is_nccl_offload_enabled():
+            reload_process_groups()
         output = self.actor.infer_batch(data)
-
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
+        if is_nccl_offload_enabled():
+            reload_process_groups()
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 
@@ -657,10 +697,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         peft_config=None, so the rollout receives a standard weight update.
         """
 
+        # Check whether nccl_offload is active in this process.
+        # get_per_tensor_param() performs TP allgather and therefore requires NCCL
+        # to be alive for the duration of the weight export.
+        # We use the process-level flag because actor and ref share Megatron
+        # process groups and the decision must be uniform across all engines.
+        _nccl_offload = is_nccl_offload_enabled()
+
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if self.config.rollout.checkpoint_engine.backend != "naive":
+            if _nccl_offload:
+                reload_process_groups()
             per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
             await self.checkpoint_engine.send_weights(per_tensor_param)
+            if _nccl_offload:
+                destroy_process_groups()
             return
 
         set_expandable_segments(False)
@@ -671,7 +722,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             await self.rollout.resume(tags=["weights"])
         log_gpu_memory_usage("After resume weights", logger=logger)
 
-        # 2. get per tensor params from engine, this will load model to gpu
+        # 2. get per tensor params from engine, this will load model to gpu.
+        # NCCL groups must be alive for TP allgather inside get_per_tensor_param().
+        if _nccl_offload:
+            reload_process_groups()
+
         per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
             layered_summon=self.layered_summon, base_sync_done=True
         )
@@ -702,6 +757,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # 3. offload model to cpu
         if self.actor.engine.is_param_offload_enabled:
             self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
+        # Destroy NCCL groups after weight export is fully complete so freed
+        # communicator memory is available to colocated rollout workers.
+        if _nccl_offload:
+            destroy_process_groups()
         aggressive_empty_cache(force_sync=True)
 
         # 4. resume kv_cache

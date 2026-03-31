@@ -10,6 +10,13 @@ grad_offload: False
 # Whether to offload optimizer state to CPU
 optimizer_offload: False
 
+# Whether to destroy and rebuild NCCL process groups between training steps.
+# When True, all Megatron parallelism NCCL groups (TP/PP/DP/EP/…) are destroyed
+# after each train/eval context and rebuilt on re-entry.  This frees NCCL
+# ring-buffer memory so colocated rollout workers have full GPU access during
+# inference.  Can be combined with param_offload for maximum memory savings.
+nccl_offload: False
+
 # tensor model parallel size
 tensor_model_parallel_size: 1
 

@@ -58,6 +58,13 @@ from verl.utils.model import extract_multi_modal_inputs, load_mcore_dist_weights
 from verl.utils.seqlen_balancing import restore_dynamic_batch
 from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
 
+from verl.utils.reloadable_process_group import (
+    destroy_process_groups,
+    is_nccl_offload_enabled,
+    monkey_patch_torch_dist,
+    reload_process_groups,
+)
+
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
 from ..utils import postprocess_batch_func, prepare_micro_batches
 from .utils import set_random_seed
@@ -81,6 +88,13 @@ class MegatronEngine(BaseEngine):
         self.optimizer_config = optimizer_config
         self.checkpoint_config = checkpoint_config
         assert self.engine_config.use_mbridge, "use_mbridge must be True"
+
+        self._is_offload_nccl = self.engine_config.nccl_offload
+        if self._is_offload_nccl:
+            # Must be applied before _init_device_mesh() so every NCCL group
+            # created by mpu.initialize_model_parallel() is wrapped.
+            monkey_patch_torch_dist()
+
         self._init_device_mesh()
 
         set_random_seed(seed=self.engine_config.seed)
@@ -523,10 +537,14 @@ class MegatronEngine(BaseEngine):
         origin_module_device = get_megatron_module_device(self.module)
         if self._is_offload_param or origin_module_device == "cpu":
             load_megatron_model_to_gpu(self.module, load_grad=True)
+        if is_nccl_offload_enabled():
+            reload_process_groups()
         self.checkpoint_mananager.save_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
         )
         torch.distributed.barrier()
+        if is_nccl_offload_enabled():
+            destroy_process_groups()
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.module)
 
@@ -708,7 +726,6 @@ class EngineEvalModeCtx(BaseEngineCtx):
     def __enter__(self):
         assert isinstance(self.engine, MegatronEngine)
         super().__enter__()
-        # mcore module is a list of model chunk in each vpp stage
         for module in self.engine.module:
             module.eval()
 
@@ -724,7 +741,6 @@ class EngineTrainModeCtx(BaseEngineCtx):
     def __enter__(self):
         assert isinstance(self.engine, MegatronEngine)
         super().__enter__()
-        # mcore module is a list of model chunk in each vpp stage
         for module in self.engine.module:
             module.train()
 
