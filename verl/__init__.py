@@ -20,6 +20,11 @@ from importlib.metadata import version as get_version
 
 from packaging.version import parse as parse_version
 
+try:
+    from mindspeed.megatron_adaptor import repatch
+except ImportError:
+    repatch = None
+
 from .protocol import DataProto
 from .utils.device import is_npu_available
 from .utils.import_utils import import_external_libs

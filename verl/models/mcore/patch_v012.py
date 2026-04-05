@@ -16,6 +16,41 @@
 # there is some bug in mcore 0.12, so we need to patch it
 # 1. `get_query_key_value_tensors` in `multi_latent_attention.py` works wrong when packed_seq_params is not None
 
+def patch_for_hdp():
+    from verl.utils.megatron.hybrid_data_parallel_utils import set_batch_hdp_group, get_batch_hdp_group
+    
+    def patch_apply_rotary_pos_emb_thd(
+        t,
+        cu_seqlens,
+        freqs,
+        rotary_interleaved=False,
+        multi_latent_attention=False,
+        mscale=1.0,
+    ):
+        cp_size = parallel_state.get_context_parallel_world_size()
+        cp_rank = parallel_state.get_context_parallel_rank()
+        cu_seqlens = cu_seqlens // cp_size
+        seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        batch_hdp_group = get_batch_hdp_group()
+        if batch_hdp_group is not None:
+            hdp_group = next(group for group in batch_hdp_group if cp_rank in group)
+            cp_size = len(hdp_group)
+            cp_rank = hdp_group.index(cp_rank)
+
+        return torch.cat(
+            [
+                _apply_rotary_pos_emb_bshd(
+                    x.unsqueeze(1),
+                    _get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs),
+                    rotary_interleaved=rotary_interleaved,
+                    multi_latent_attention=multi_latent_attention,
+                    mscale=mscale,
+                )
+                for x in torch.split(t, seqlens)
+            ]
+        ).squeeze(1)
+
+
 
 def apply_patch():
     import torch

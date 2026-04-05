@@ -91,5 +91,6 @@ def set_expandable_segments(enable: bool) -> None:
     Args:
         enable (bool): Whether to enable expandable segments. Used to avoid OOM.
     """
-    if is_cuda_available:
-        torch.cuda.memory._set_allocator_settings(f"expandable_segments:{enable}")
+    pass
+    # if is_cuda_available:
+    #     torch.cuda.memory._set_allocator_settings(f"expandable_segments:{enable}")
