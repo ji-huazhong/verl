@@ -1213,6 +1213,19 @@ class AttentionWithCp(torch.autograd.Function):
 
 def ringattn_context_parallel(q, k, v, n, cp_para, softmax_scale=None, attn_mask=None, dropout_p=0.,
                               packed_seq_params=None, shapes=None):
+    from verl.utils.megatron.hybrid_data_parallel_utils import get_batch_hdp_group
+
+    batch_hdp_group = get_batch_hdp_group()
+    hdp_group = next(group for group in batch_hdp_group if cp_para['rank'] in group) if batch_hdp_group else None
+    if hdp_group is not None:
+        rank = cp_para['rank']
+        cp_global_ranks = cp_para['cp_global_ranks']
+        cp_para['rank'] = hdp_group.index(rank)
+        cp_para['cp_size'] = len(hdp_group)
+        cp_para['cp_global_ranks'] = [cp_global_ranks[i] for i in hdp_group]
+        cp_para['cp_outer_ranks'] = cp_para['cp_global_ranks']
+        cp_para['cp_dkv_outer_ranks'] = cp_para['cp_global_ranks']
+
     AttentionWithCp.block_size = q.shape[0]
     AttentionWithCp.batch_size = q.shape[1]
     out = AttentionWithCp.apply(

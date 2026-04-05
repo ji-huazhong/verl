@@ -1,10 +1,11 @@
 HOME=$(pwd)
-CONFIG_DIR=${CONFIG_DIR:-"/home/lynn/verl-hdp/verl/trainer/config"}
+CONFIG_DIR=${CONFIG_DIR:-"/home/lynn/hdp/verl/verl/trainer/config"}
 MODEL_PATH=${MODEL_PATH:-"/home/lynn/model/Qwen3-8B"}
 TRAIN_FILE=${TRAIN_FILE:-"/home/data/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"/home/data/aime-2024.parquets"}
 
 export USE_HDP="1"
+export PYTHONPATH=/home/lynn/hdp/Megatron-LM:$PYTHONPATH
 
 # configs
 NODES=1
@@ -37,8 +38,6 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     data.shuffle=False \
-    custom_reward_function.path=deepscaler.py \
-    custom_reward_function.name=compute_score \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
@@ -103,3 +102,5 @@ python3 -m verl.trainer.main_ppo --config-path="${CONFIG_DIR}" \
     +actor_rollout_ref.actor.megatron.override_transformer_config.cp_window_size=1 $@
 
 # recompute-num-layers [int]值得是每个pp stage的层数，[int]取值小于num-layers/pp_size
+    # custom_reward_function.path=deepscaler.py \
+    # custom_reward_function.name=compute_score \

@@ -142,3 +142,15 @@ max_fraction_threshold：绝对不允许小数部分超过此比例（默认 0.5
 
 # 总结
 HDP 是一种针对变长序列的上下文并行优化策略。它根据每个序列的长度动态分配 CP 进程子集，避免短序列触发不必要的跨进程通信。通过贪心分配、阈值控制和负载均衡检查，在保证效率的同时维持了较好的负载均衡。该实现与 Megatron 的 packed sequence 机制紧密集成，并保留了回退到标准 CP 的能力。
+
+
+---
+
+总结：
+原方案中先allreduce.max了num_microbatch，先确定了num_microbatch。
+于是只能按照固定的microbatch数量来分配, 使得分配时首要顾及了
+num_microbatch，难以考虑消除序列堆叠和舍入。使得hdp装箱逻辑复杂。
+
+优化方案，优先考虑microbatch分配和hdp装箱的逻辑一致性，后依靠拆
+分少量batch来，对齐dp间的num_microbatch。从而消除了hdp中的“bad
+case”

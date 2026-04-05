@@ -7,7 +7,7 @@ from megatron.core import parallel_state as mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 from mindspeed.utils import set_actual_seq_len, get_actual_seq_len
 
-from verl.models.mcore.util import preprcoess_packed_seqs, postprocess_packed_seqs
+from verl.models.mcore.util import preprocess_packed_seqs, postprocess_packed_seqs
 
 from .hybrid_data_parallel_utils import get_batch_hdp_group, set_batch_hdp_group
 
@@ -142,9 +142,9 @@ def pack_frac(pairs, start_rank, batch_hdp_group):
     """
     cp_size = mpu.get_context_parallel_world_size()
     if start_rank >= cp_size:
-            return _pack_into_existing_groups(pairs, start_rank, batch_hdp_group)
-        else:
-            return _pack_into_new_ranks(pairs, start_rank, batch_hdp_group)
+        return _pack_into_existing_groups(pairs, start_rank, batch_hdp_group)
+    else:
+        return _pack_into_new_ranks(pairs, start_rank, batch_hdp_group)
 
 
 def _pack_into_existing_groups(pairs, start_rank, batch_hdp_group):
