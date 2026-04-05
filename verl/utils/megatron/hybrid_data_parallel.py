@@ -64,14 +64,14 @@ def generate_hdp_group_from_batch(
     cp_size = mpu.get_context_parallel_world_size()
     seq_len_effective = attention_mask.sum(dim=-1)
     max_token_len = seq_len_effective.sum()
-    ranks_per_seq = (seq_len_effetive / (max_token_len / cp_size)).tolist()
+    ranks_per_seq = (seq_len_effective / (max_token_len / cp_size)).tolist()
 
     start_rank = 0
     # Initialize HDP groups for each sequence in the batch
     batch_hdp_group = [[] for _ in ranks_per_seq]
     # store sequences with fractional rank requirements for later packing
     pairs = []
-    for i, ranks in enuerate(ranks_per_seq):
+    for i, ranks in enumerate(ranks_per_seq):
         # 提取小数部分, 2.3%1 -> 0.3
         frac = ranks % 1
         if ranks >= 1:

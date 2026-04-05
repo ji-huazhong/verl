@@ -1,8 +1,8 @@
 HOME=$(pwd)
 CONFIG_DIR=${CONFIG_DIR:-"/home/lynn/hdp/verl/verl/trainer/config"}
 MODEL_PATH=${MODEL_PATH:-"/home/lynn/model/Qwen3-8B"}
-TRAIN_FILE=${TRAIN_FILE:-"/home/data/dapo-math-17k.parquet"}
-TEST_FILE=${TEST_FILE:-"/home/data/aime-2024.parquets"}
+TRAIN_FILE=${TRAIN_FILE:-"/home/lynn/data/dapo-math-17k.parquet"}
+TEST_FILE=${TEST_FILE:-"/home/lynn/data/aime-2024.parquet"}
 
 export USE_HDP="1"
 export PYTHONPATH=/home/lynn/hdp/Megatron-LM:$PYTHONPATH
@@ -11,7 +11,8 @@ export PYTHONPATH=/home/lynn/hdp/Megatron-LM:$PYTHONPATH
 NODES=1
 GPU_MEMORY_UTILIZATION=0.8
 MAX_PROMPT_LENGTH=2048
-MAX_RESPONSE_LENGTH=32768
+# 32768 16384
+MAX_RESPONSE_LENGTH=16
 MAX_NUM_SEQS=128
 CUDAGRAPH_SIZES='[16,32,64,128]'
 
