@@ -5,6 +5,7 @@ TRAIN_FILE=${TRAIN_FILE:-"/home/lynn/data/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"/home/lynn/data/aime-2024.parquet"}
 
 export USE_HDP="1"
+export VLLM_ASCEND_ENABLE_NZ=0
 export PYTHONPATH=/home/lynn/hdp/Megatron-LM:$PYTHONPATH
 
 # configs

@@ -58,37 +58,6 @@ if os.getenv("VERL_USE_MODELSCOPE", "False").lower() == "true":
 
 if is_npu_available:
     from .models.transformers import npu_patch as npu_patch
-    # from .models.mcore.patch_v012 import patch_for_hdp
-
-    # patch_for_hdp()
-    # patch mindspeed
-    # import mindspeed
-
-    # def patch_ringattn_context_parallel(
-    #     q, k, v, n, cp_para, softmax_scale=None, attn_mask=None, dropout_p=0.,
-    #     packed_seq_params=None, shapes=None,
-    # ):
-    #     from verl.utils.megatron.hybrid_data_parallel_utils import get_batch_hdp_group
-
-    #     batch_hdp_group = get_batch_hdp_group()
-    #     hdp_group = next(group for group in batch_hdp_group if cp_para['rank'] in group) if batch_hdp_group else None
-    #     if hdp_group is not None:
-    #         rank = cp_para['rank']
-    #         cp_global_ranks = cp_para['cp_global_ranks']
-    #         cp_para['rank'] = hdp_group.index(rank)
-    #         cp_para['cp_size'] = len(hdp_group)
-    #         cp_para['cp_global_ranks'] = [cp_global_ranks[i] for i in hdp_group]
-    #         cp_para['cp_outer_ranks'] = cp_para['cp_global_ranks']
-    #         cp_para['cp_dkv_outer_ranks'] = cp_para['cp_global_ranks']
-
-    #     AttentionWithCp.block_size = q.shape[0]
-    #     AttentionWithCp.batch_size = q.shape[1]
-    #     out = AttentionWithCp.apply(
-    #         q, k, v, n, cp_para, softmax_scale, attn_mask, dropout_p,
-    #         packed_seq_params, shapes
-    #     )
-    #     return out
-    # mindspeed.core.context_parallel.ring_context_parallel.ring_context_parallel.ringattn_context_parallel = patch_ringattn_context_parallel
 
     package_name = "transformers"
     required_version_spec = "4.52.4"
