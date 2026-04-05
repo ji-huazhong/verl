@@ -137,6 +137,10 @@ class RingP2P:
 
         self.send_recv_ops = []
 
+        ring_rank_prev = ring_global_ranks.index(self.prev)
+        if self.ring_rank % 2 == 0 and ring_rank_prev % 2 == 0:
+            self.group_for_send_recv_overlap = group
+
     def async_send_recv(self, send_tensor, recv_tensor, shapes=None):
         if self.ring_rank % 2 == 0:
             if shapes is not None:

@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 from verl.utils.megatron_utils import unwrap_model
 
 from .util import (
@@ -41,6 +43,20 @@ def gptmodel_forward(
     """Default forward pass for GPT models with optional sequence packing."""
     pre_process = unwrap_model(model).pre_process
     post_process = unwrap_model(model).post_process
+    
+    global preprocess_packed_seqs
+    global postprocess_packed_seqs
+
+    if os.environ.get("USE_HDP") == "1":
+        from verl.utils.megatron.hybrid_data_parallel import (
+            preprocess_packed_seqs_hdp, 
+            postprocess_packed_seqs_hdp,
+            generate_hdp_group_from_batch,
+        )
+        generate_hdp_group_from_batch(attention_mask)
+        preprocess_packed_seqs = preprocess_packed_seqs_hdp
+        postprocess_packed_seqs = postprocess_packed_seqs_hdp
+
     if pack_seqs:
         batch_size, seq_len = attention_mask.shape[:2]
         input_ids_rmpad, packed_seq_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=pre_process)
