@@ -58,9 +58,9 @@ if os.getenv("VERL_USE_MODELSCOPE", "False").lower() == "true":
 
 if is_npu_available:
     from .models.transformers import npu_patch as npu_patch
-    from .models.mcore.patch_v012 import patch_for_hdp
+    # from .models.mcore.patch_v012 import patch_for_hdp
 
-    patch_for_hdp()
+    # patch_for_hdp()
     # patch mindspeed
     # import mindspeed
 
