@@ -1,3 +1,6 @@
+import os
+import json
+import math
 from functools import wraps
 
 import torch
@@ -10,6 +13,54 @@ from mindspeed.utils import set_actual_seq_len, get_actual_seq_len
 from verl.models.mcore.util import preprocess_packed_seqs, postprocess_packed_seqs
 
 from .hybrid_data_parallel_utils import get_batch_hdp_group, set_batch_hdp_group
+
+
+def _is_primary_hdp_logger():
+    return (
+        getattr(mpu, "get_data_parallel_rank", lambda: 0)() == 0
+        and getattr(mpu, "get_context_parallel_rank", lambda: 0)() == 0
+        and getattr(mpu, "get_tensor_model_parallel_rank", lambda: 0)() == 0
+        and getattr(mpu, "get_pipeline_model_parallel_rank", lambda: 0)() == 0
+    )
+
+
+def _maybe_dump_hdp_groups(seq_len_effective, batch_hdp_group, cp_size):
+    out_dir = os.environ.get("VERL_HDP_GROUP_DIR")
+    if not out_dir or not _is_primary_hdp_logger():
+        return
+
+    if not hasattr(generate_hdp_group_from_batch, "hdp_log_step"):
+        generate_hdp_group_from_batch.hdp_log_step = 0
+    generate_hdp_group_from_batch.hdp_log_step += 1
+    step = generate_hdp_group_from_batch.hdp_log_step
+
+    if isinstance(seq_len_effective, torch.Tensor):
+        seq_len_list = seq_len_effective.detach().cpu().tolist()
+    else:
+        seq_len_list = list(seq_len_effective)
+
+    if batch_hdp_group is None:
+        groups = [list(range(cp_size)) for _ in seq_len_list]
+    else:
+        groups = batch_hdp_group
+
+    os.makedirs(out_dir, exist_ok=True)
+    filename = os.path.join(out_dir, "hdp_group.jsonl")
+
+    lines = []
+    for idx, seqlen in enumerate(seq_len_list):
+        group = groups[idx]
+        entry = {
+        "step": int(step),
+            "seq_idx": int(idx),
+            "seq_len": int(seqlen),
+            "hdp_size": int(len(group)),
+        "group": [int(x) for x in group],
+        }
+    lines.append(json.dumps(entry, ensure_ascii=True))
+
+    with open(filename, "a") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def generate_hdp_group_from_batch(
@@ -97,12 +148,15 @@ def generate_hdp_group_from_batch(
     if len(batch_hdp_group[0]) == cp_size:
         # All rank in one group, use cp instead
         set_batch_hdp_group(None)
+        _maybe_dump_hdp_groups(seq_len_effective, None, cp_size)
         return
     if not check_load_balance(batch_hdp_group, ranks_per_seq):
         # Load imbalance detected, using context parallel instead
         set_batch_hdp_group(None)
+        _maybe_dump_hdp_groups(seq_len_effective, None, cp_size)
         return
     set_batch_hdp_group(batch_hdp_group)
+    _maybe_dump_hdp_groups(seq_len_effective, batch_hdp_group, cp_size)
     return
 
 
