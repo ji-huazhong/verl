@@ -13,77 +13,75 @@ from .hybrid_data_parallel_utils import get_batch_hdp_group, set_batch_hdp_group
 
 
 def generate_hdp_group_from_batch(
-    attention_mask: torch.Tensor,
-    per_rank_overload_threshold=0.1,
+    atten_mask: torch.Tensor, 
+    per_rank_overload_threshold=0.1, 
     fractional_roundup_threshold=0.9,
-    max_fraction_threshold=0.5,
+    max_fraction_threshold=0.5
 ):
     """
-    Generate HDP groups fro micro_batch to optimizer Ring Attention communication in CP.
-
+    Generate HDP groups for micro-batch to optimize Ring Attention communication in CP.
+    
     Args:
-        attention_mask: Attention mask tensor of shape [micro_batch_size, sequence_length]
+        atten_mask: Attention mask tensor of shape [micro_batch_size, sequence_length]
         per_rank_overload_threshold: Maximum allowed overload per rank. For sequences already assigned 
- 	                                 to N ranks, if the fractional part is less than N * this threshold, 
- 	                                 the fractional tokens can be absorbed without adding a new rank.
- 	                                 Example: sequence needs 2.1 ranks with threshold=0.1 → assigned to 2 ranks.
+                                to N ranks, if the fractional part is less than N * this threshold, 
+                                the fractional tokens can be absorbed without adding a new rank.
+                                Example: sequence needs 2.1 ranks with threshold=0.1 → assigned to 2 ranks.
         fractional_roundup_threshold: Threshold for rounding up fractional rank requirements. When the 
- 	                                 fractional part exceeds this value, round up to the next integer.
- 	                                 Example: sequence needs 1.9 ranks with threshold=0.9 → assigned to 2 ranks.
+                                fractional part exceeds this value, round up to the next integer.
+                                Example: sequence needs 1.9 ranks with threshold=0.9 → assigned to 2 ranks.
         max_fraction_threshold: Maximum fractional overload allowed regardless of per-rank threshold.
- 	                                 Prevents excessive overload when sequences are assigned many ranks.
+                                Prevents excessive overload when sequences are assigned many ranks.
     
     Returns:
-        List of lists containing rank indices assigned to each sequence.
-        Example: [[0, 1], [2], [3]] means sequence 0 uses 2 ranks, sequences 1&2 use 1 rank each.
+        List of lists containing rank indices assigned to each sequence
+        Example: [[0,1], [2], [3]] means sequence 0 uses 2 ranks, sequences 1&2 use 1 rank each
     
     Example:
-        For sequencees [1024, 512, 512] with 4 ranks:
-        - seq0 (1024/2048)*4 = 2.0 ranks -> assigned to ranks [0, 1]
-        - seq1 (512/2048)*4 = 1.0 ranks -> assigned to ranks [2]
-        - seq2 (512/2048)* = 1.0 ranks -> assigned to ranks [3]
-        Results: [[0, 1], [2], [3]]
-
+        For sequences [1024, 512, 512] with 4 ranks:
+        - seq0: (1024/2048)*4 = 2.0 ranks → assigned to ranks [0,1]
+        - seq1: (512/2048)*4 = 1.0 rank → assigned to rank [2]
+        - seq2: (512/2048)*4 = 1.0 rank → assigned to rank [3]
+        Result: [[0,1], [2], [3]]
+    
     Benefits:
         - seq0: communicates between ranks 0 and 1 only (internal Ring Attention)
         - seq1, seq2: no cross-rank communication needed (completely local to rank 2 and rank 3 respectively)
         - Total: significantly reduces cross-rank communication compared to traditional CP
-    
+
     Note:
         This grouping strategy significantly reduces communication overhead in Ring Attention by
         minimizing unnecessary cross-rank communication, especially for sequences that can be
         processed completely within a single rank.
     """
-    if not hasattr(generate_hdp_group_from_batch, "has_run"):
-        # First run hdp, use cp instead, for initializing th cp group.
-        generate_hdp_group_from_batch.has_run = True
+
+    if not hasattr(generate_hdp_group_from_batch, 'has_run'):
+        # First run hdp, use cp instead, for initializing the cp group.
         generate_hdp_group_from_batch.has_run = True
         set_batch_hdp_group(None)
         return
-    
     cp_size = mpu.get_context_parallel_world_size()
-    seq_len_effective = attention_mask.sum(dim=-1)
+    seq_len_effective = atten_mask.sum(dim=1)
     max_token_len = seq_len_effective.sum()
     ranks_per_seq = (seq_len_effective / (max_token_len / cp_size)).tolist()
 
     start_rank = 0
     # Initialize HDP groups for each sequence in the batch
     batch_hdp_group = [[] for _ in ranks_per_seq]
-    # store sequences with fractional rank requirements for later packing
+    # Store sequences with fractional rank requirements for later packing
     pairs = []
     for i, ranks in enumerate(ranks_per_seq):
-        # 提取小数部分, 2.3%1 -> 0.3
         frac = ranks % 1
         if ranks >= 1:
             batch_hdp_group[i] = list(range(start_rank, start_rank + int(ranks)))
             start_rank += int(ranks)
-            if frac <= min(per_rank_overload_threshold * int(ranks), max_fraction_threshold):
+            if frac < min(per_rank_overload_threshold * int(ranks), max_fraction_threshold): 
                 continue
-            if frac > fractional_roundupu_threshold:
+            if frac > fractional_roundup_threshold:
                 batch_hdp_group[i].append(start_rank)
                 start_rank += 1
                 continue
-        pairs.append((i, rank % 1))
+        pairs.append((i, ranks % 1))
     if pairs:
         batch_hdp_group, start_rank = pack_frac(pairs, start_rank, batch_hdp_group)
     while start_rank < cp_size:
@@ -95,13 +93,13 @@ def generate_hdp_group_from_batch(
         start_rank += 1
     if start_rank != cp_size:
         raise RuntimeError(f"HDP group generation failed: allocated {start_rank} ranks, expected {cp_size}. "
- 	                       f"Batch sequence lengths: {seq_len_effective.tolist()}")
-    if len(batch_hdp_gorup[0]) == cp_size:
-        # All rank in one group, fallback to cp
+                      f"Batch sequence lengths: {seq_len_effective.tolist()}")
+    if len(batch_hdp_group[0]) == cp_size:
+        # All rank in one group, use cp instead
         set_batch_hdp_group(None)
         return
     if not check_load_balance(batch_hdp_group, ranks_per_seq):
-        # Load imbalance detected, fallback to context parallel
+        # Load imbalance detected, using context parallel instead
         set_batch_hdp_group(None)
         return
     set_batch_hdp_group(batch_hdp_group)
@@ -110,37 +108,36 @@ def generate_hdp_group_from_batch(
 
 def check_load_balance(batch_hdp_group, ranks_per_seq, max_load_imbalance_threshold=1.3):
     """
-    Check load balance across ranks in HDP grouping.
-
+    Check load balance across ranks in HDP grouping
+    
     Args:
-        batch_hdp_group: HDP batch grouping information, indicating which ranks process each sequence.
+        batch_hdp_group: HDP batch grouping information, indicating which ranks process each sequence
         ranks_per_seq: number of ranks per sequence, representing computational load
         cp_size: total number of ranks in model parallelism
-        max_load_imbalance_threshold: maximum load imbalance threashold, default 1.3
+        max_load_imbalance_threshold: maximum load imbalance threshold, default 1.3
     
     Returns:
-        bool: True if all ranks loads are within threshold, False otherwise
+        bool: True if all rank loads are within threshold, False otherwise
     """
-
     cp_size = mpu.get_context_parallel_world_size()
     rank_load = [0] * cp_size
     for seq_idx, ranks in enumerate(ranks_per_seq):
         for rank in batch_hdp_group[seq_idx]:
             rank_load[rank] += ranks / len(batch_hdp_group[seq_idx])
-    
-    if any(load > max_load_imbalance_threashold for load in rank_load):
-        return False
 
+    if any(load > max_load_imbalance_threshold for load in rank_load):
+        return False
     return True
 
 
 def pack_frac(pairs, start_rank, batch_hdp_group):
     """
-    Pack sequences with fractional rank requirements into HDP group.
+    Pack sequences with fractional rank requirements into HDP groups.
 
     Routes to appropriate packing strategy based on available ranks.
     """
     cp_size = mpu.get_context_parallel_world_size()
+    
     if start_rank >= cp_size:
         return _pack_into_existing_groups(pairs, start_rank, batch_hdp_group)
     else:
@@ -203,7 +200,7 @@ def _pack_into_new_ranks(pairs, start_rank, batch_hdp_group):
 def pack_sequences_into_buckets(seqlen_list: list[int], max_bucket_length: int, num_buckets: int) -> list[list[int]]:
     """
     Pack sequences into buckets using greedy algorithm for subsequent HDP grouping.
-    
+     
     Args:
         seqlen_list: List of sequence lengths to be packed
         max_bucket_length: Maximum allowed total sequence length per bucket
@@ -256,6 +253,7 @@ def preprocess_packed_seqs_hdp(
     attention_mask: torch.Tensor,
     pre_process: bool = True
 ) -> tuple[torch.Tensor, PackedSeqParams]:
+    
     batch_hdp_group = get_batch_hdp_group()  
     if batch_hdp_group is None:
         return preprocess_packed_seqs(input_ids, attention_mask, pre_process)
@@ -351,6 +349,7 @@ def postprocess_packed_seqs_hdp(
     """
     if not post_process:
         return output
+
     # -------------------------------------------------------------------------
     # Move the lengths and offsets needed for subsequent Python-level indexing to the CPU in advance,
     # to avoid a large number of .item() calls in the loop
@@ -363,7 +362,7 @@ def postprocess_packed_seqs_hdp(
     batch_hdp_group = get_batch_hdp_group()
     if batch_hdp_group is None:
         return postprocess_packed_seqs(output, packed_seq_params, attention_mask, batch_size, seq_len, 
-                                    post_process=post_process)
+                                       post_process=post_process)
     cp_size = mpu.get_context_parallel_world_size()
     if cp_size > 1:
         # gather output shape
@@ -431,3 +430,4 @@ def postprocess_packed_seqs_hdp(
         seq_index[hdp_group[0]] += 1
 
     return output_new
+
