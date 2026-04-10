@@ -23,7 +23,7 @@ from torch import distributed as dist
 from verl.protocol import DataProto
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_name
-from verl.utils.megatron.hybrid_data_parallel import pack_sequences_into_buckets
+from verl.utils.megatron.hybrid_data_parallel import pack_sequences_into_buckets, set_hdp_max_token_len
 
 
 def karmarkar_karp(seqlen_list: list[int], k_partitions: int, equal_size: bool):
@@ -258,6 +258,7 @@ def rearrange_micro_batches(
     same_micro_num_in_dp=True,
     min_num_micro_batch=None,
     use_dynamic_bsz_balance=True,
+    rank_overload_scale: float = 1.18,
 ):
     """
     Split a batch into micro-batches by total token count, with optional DP sync and padding.
@@ -270,6 +271,7 @@ def rearrange_micro_batches(
         same_micro_num_in_dp (bool): if True and dp_group set, pad all ranks to the same count.
         min_num_micro_batch (int, optional): force at least this many splits (pads empty ones).
         use_dynamic_bsz_balance (bool, optional): balance the computational workload between micro-batches
+        rank_overload_scale(flaot, optional): Safety/margin multiplier applied to max_token_len (default: 1.18).
 
     Returns:
         List[TensorDict]: the micro-batches.
@@ -288,25 +290,44 @@ def rearrange_micro_batches(
         f"max_token_len must be greater than the sequence length. Got {max_token_len=} and {max_seq_len=}"
     )
     total_seqlen = seq_len_effective.sum().item()
-    # NOTE: num_microbatches <= batch_size, so take the min of this two.
-    num_micro_batches = min(len(seq_len_effective), ceildiv(total_seqlen, max_token_len))
-    if min_num_micro_batch is not None:
-        # used to support pp
-        num_micro_batches = max(min_num_micro_batch, num_micro_batches)
-    if dist.is_initialized() and same_micro_num_in_dp:
-        num_micro_batches = torch.tensor([num_micro_batches], device=get_device_name())
-        dist.all_reduce(num_micro_batches, op=dist.ReduceOp.MAX, group=dp_group)
-        num_micro_batches = num_micro_batches.cpu().item()
-    if num_batches_divided_by is not None:
-        num_micro_batches = roundup_divisible(num_micro_batches, num_batches_divided_by)
-
     seq_len_effective = seq_len_effective.tolist()
-    assert num_micro_batches <= len(seq_len_effective)
 
     if os.environ.get("USE_HDP") == "1":
-        max_token_len = ceildiv(total_seqlen, num_micro_batches)
-        micro_bsz_idx = pack_sequences_into_buckets(seq_len_effective, max_token_len, num_micro_batches)
+        set_hdp_max_token_len(max_token_len)
+        micro_bsz_idx = pack_sequences_into_buckets(seq_len_effective, max_token_len * rank_overload_scale)
+        target_num_micro_batches = len(micro_bsz_idx)
+        if dist.is_initialized() and same_micro_num_in_dp:
+            target_num_micro_batches = torch.tensor([target_num_micro_batches], device=get_device_name())
+            dist.all_reduce(target_num_micro_batches, op=dist.ReduceOp.MAX, group=dp_group)
+            target_num_micro_batches = target_num_micro_batches.cpu().item()
+        if min_num_micro_batch is not None:
+            target_num_micro_batches = max(min_num_micro_batch, target_num_micro_batches)
+        if num_batches_divided_by is not None:
+            target_num_micro_batches = roundup_divisible(target_num_micro_batches, num_batches_divided_by)
+        assert target_num_micro_batches <= len(seq_len_effective)
+
+        if target_num_micro_batches > len(micro_bsz_idx):
+            split_idx = len(micro_bsz_idx) - 1
+            while len(micro_bsz_idx) < target_num_micro_batches:
+                while split_idx >= 0 and len(micro_bsz_idx[split_idx]) <= 1:
+                    split_idx -= 1
+                assert split_idx >= 0, "Not enough sequences to split into more micro-batches."
+                seq_idx = micro_bsz_idx[split_idx].pop()
+                micro_bsz_idx.append([seq_idx])
     else:
+        # NOTE: num_microbatches <= batch_size, so take the min of this two.
+        num_micro_batches = min(len(seq_len_effective), ceildiv(total_seqlen, max_token_len))
+        if min_num_micro_batch is not None:
+            # used to support pp
+            num_micro_batches = max(min_num_micro_batch, num_micro_batches)
+        if dist.is_initialized() and same_micro_num_in_dp:
+            num_micro_batches = torch.tensor([num_micro_batches], device=get_device_name())
+            dist.all_reduce(num_micro_batches, op=dist.ReduceOp.MAX, group=dp_group)
+            num_micro_batches = num_micro_batches.cpu().item()
+        if num_batches_divided_by is not None:
+            num_micro_batches = roundup_divisible(num_micro_batches, num_batches_divided_by)
+        
+        assert num_micro_batches <= len(seq_len_effective)
         micro_bsz_idx = get_seqlen_balanced_partitions(seq_len_effective, num_micro_batches, equal_size=False)
     
     if use_dynamic_bsz_balance:
