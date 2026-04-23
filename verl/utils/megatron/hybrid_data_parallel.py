@@ -30,6 +30,18 @@ def clean_hdp_group():
     _BATCH_HDP_GROUP = None
 
 
+_HDP_MAX_TOKEN_LEN = None
+
+
+def set_hdp_max_token_len(max_token_len):
+    global _HDP_MAX_TOKEN_LEN
+    _HDP_MAX_TOKEN_LEN = max_token_len
+
+
+def get_hdp_max_token_len():
+    return _HDP_MAX_TOKEN_LEN
+
+
 def _is_primary_hdp_logger():
     return (
         getattr(mpu, "get_data_parallel_rank", lambda: 0)() == 0
@@ -80,24 +92,15 @@ def _maybe_dump_hdp_groups(seq_len_effective, batch_hdp_group, cp_size):
 
 def generate_hdp_group_from_batch(
     atten_mask: torch.Tensor,
-    per_rank_overload_threshold=0.1,
-    fractional_roundup_threshold=0.9,
-    max_fraction_threshold=0.5,
+    max_token_len: float | None = None,
+    rank_overload_scale: float = 1.18,
 ):
     """
     Generate HDP groups for micro-batch to optimize Ring Attention communication in CP.
 
     Args:
         atten_mask: Attention mask tensor of shape [micro_batch_size, sequence_length]
-        per_rank_overload_threshold: Maximum allowed overload per rank. For sequences already assigned
-                                to N ranks, if the fractional part is less than N * this threshold,
-                                the fractional tokens can be absorbed without adding a new rank.
-                                Example: sequence needs 2.1 ranks with threshold=0.1 → assigned to 2 ranks.
-        fractional_roundup_threshold: Threshold for rounding up fractional rank requirements. When the
-                                fractional part exceeds this value, round up to the next integer.
-                                Example: sequence needs 1.9 ranks with threshold=0.9 → assigned to 2 ranks.
-        max_fraction_threshold: Maximum fractional overload allowed regardless of per-rank threshold.
-                                Prevents excessive overload when sequences are assigned many ranks.
+        max_token_len: Max token length budget used for micro-batch packing.
 
     Returns:
         List of lists containing rank indices assigned to each sequence
@@ -128,47 +131,39 @@ def generate_hdp_group_from_batch(
         return
     cp_size = mpu.get_context_parallel_world_size()
     seq_len_effective = atten_mask.sum(dim=1)
-    max_token_len = seq_len_effective.sum()
-    ranks_per_seq = (seq_len_effective / (max_token_len / cp_size)).tolist()
+    if max_token_len is None:
+        max_token_len = get_hdp_max_token_len()
+    if max_token_len is None:
+        max_token_len = float(seq_len_effective.sum().item())
+
+    max_token_len *= rank_overload_scale
+
+    per_rank_cap = max_token_len / cp_size
+    seq_len_list = seq_len_effective.tolist()
+    ranks_per_seq = [max(1, math.ceil(seqlen / per_rank_cap)) for seqlen in seq_len_list]
+    total_ranks = sum(ranks_per_seq)
+
+    if total_ranks > cp_size:
+        raise RuntimeError(
+            f"HDP group generation failed: total ranks {total_ranks} exceeds cp_size {cp_size}. "
+            f"Batch sequence lengths: {seq_len_list}"
+        )
+    if total_ranks < cp_size:
+        max_idx = max(range(len(seq_len_list)), key=lambda i: seq_len_list[i])
+        ranks_per_seq[max_idx] += cp_size - total_ranks
 
     start_rank = 0
-    # Initialize HDP groups for each sequence in the batch
-    batch_hdp_group = [[] for _ in ranks_per_seq]
-    # Store sequences with fractional rank requirements for later packing
-    pairs = []
-    for i, ranks in enumerate(ranks_per_seq):
-        frac = ranks % 1
-        if ranks >= 1:
-            batch_hdp_group[i] = list(range(start_rank, start_rank + int(ranks)))
-            start_rank += int(ranks)
-            if frac < min(per_rank_overload_threshold * int(ranks), max_fraction_threshold):
-                continue
-            if frac > fractional_roundup_threshold:
-                batch_hdp_group[i].append(start_rank)
-                start_rank += 1
-                continue
-        pairs.append((i, ranks % 1))
-    if pairs:
-        batch_hdp_group, start_rank = pack_frac(pairs, start_rank, batch_hdp_group)
-    while start_rank < cp_size:
-        min_len_idx = min(range(len(batch_hdp_group)), key=lambda i: len(batch_hdp_group[i]))
-        min_group = batch_hdp_group[min_len_idx]
-        same_groups = [i for i in range(len(batch_hdp_group)) if batch_hdp_group[i] is min_group]
-        for idx in same_groups:
-            batch_hdp_group[idx].append(start_rank)
-        start_rank += 1
+    batch_hdp_group = []
+    for ranks in ranks_per_seq:
+        batch_hdp_group.append(list(range(start_rank, start_rank + ranks)))
+        start_rank += ranks
     if start_rank != cp_size:
         raise RuntimeError(
             f"HDP group generation failed: allocated {start_rank} ranks, expected {cp_size}. "
-            f"Batch sequence lengths: {seq_len_effective.tolist()}"
+            f"Batch sequence lengths: {seq_len_list}"
         )
     if len(batch_hdp_group[0]) == cp_size:
         # All rank in one group, use cp instead
-        set_batch_hdp_group(None)
-        _maybe_dump_hdp_groups(seq_len_effective, None, cp_size)
-        return
-    if not check_load_balance(batch_hdp_group, ranks_per_seq):
-        # Load imbalance detected, using context parallel instead
         set_batch_hdp_group(None)
         _maybe_dump_hdp_groups(seq_len_effective, None, cp_size)
         return
@@ -264,39 +259,45 @@ def _pack_into_new_ranks(pairs, start_rank, batch_hdp_group):
     return batch_hdp_group, start_rank
 
 
-def pack_sequences_into_buckets(seqlen_list: list[int], max_bucket_length: int, num_buckets: int) -> list[list[int]]:
+def pack_sequences_into_buckets(seqlen_list: list[int], max_token_len: int) -> list[list[int]]:
+    """      
+    Pack sequences into buckets based on rank capacity (cp_size).
+
+    Each sequence consumes ceil(seqlen / (max_token_len / cp_size)) ranks, and each bucket
+    has a capacity of cp_size ranks. We greedily pack sequences without exceeding cp_size.
     """
-    Pack sequences into buckets using greedy algorithm for subsequent HDP grouping.
+    cp_size = mpu.get_context_parallel_world_size()
+    per_rank_cap = max_token_len / cp_size
+    ranks_per_seq = [max(1, math.ceil(seqlen / per_rank_cap)) for seqlen in seqlen_list]
 
-    Args:
-        seqlen_list: List of sequence lengths to be packed
-        max_bucket_length: Maximum allowed total sequence length per bucket
-        num_buckets: Number of available buckets for distribution
+    indexed = list(enumerate(ranks_per_seq))
+    indexed.sort(key=lambda x: (-x[1], -seqlen_list[x[0]]))
 
-    Returns:
-        List of buckets, where each bucket contains the original indices of sequences assigned to it
+    buckets = []
+    bucket_loads = []
 
-    """
-    # Sort by length in descending order, preserving original indices
-    indexed_seqlens = sorted(enumerate(seqlen_list), key=lambda x: -x[1])
-
-    buckets = [[] for _ in range(num_buckets)]
-    bucket_sums = [0] * num_buckets
-
-    # Assign each sequence to the first bucket that can accommodate it
-    for idx, length in indexed_seqlens:
-        placed = False
-        for b in range(num_buckets):
-            if bucket_sums[b] + length <= max_bucket_length:
-                buckets[b].append(idx)
-                bucket_sums[b] += length
-                placed = True
-                break
-        if not placed:
-            # If no bucket can accommodate, place in the bucket with the smallest current total length
-            min_bucket = min(range(num_buckets), key=lambda b: bucket_sums[b])
-            buckets[min_bucket].append(idx)
-            bucket_sums[min_bucket] += length
+    for idx, rank_need in indexed:
+        if rank_need > cp_size:
+            raise RuntimeError(
+                f"Sequence rank requirement {rank_need} exceeds cp_size {cp_size}. "
+                f"max_token_len={max_token_len}, seqlen={seqlen_list[idx]}"
+            )
+        best_bucket = None
+        best_remaining = None
+        for b, load in enumerate(bucket_loads):
+            if load + rank_need <= cp_size:
+                remaining = cp_size - (load + rank_need)
+                if best_remaining is None or remaining < best_remaining:
+                    best_bucket = b
+                    best_remaining = remaining
+                    if remaining == 0:
+                        break
+        if best_bucket is None:
+            buckets.append([idx])
+            bucket_loads.append(rank_need)
+        else:
+            buckets[best_bucket].append(idx)
+            bucket_loads[best_bucket] += rank_need
 
     return buckets
 

@@ -904,3 +904,186 @@ def ringattn_context_parallel(q, k, v, n, cp_para, ...):
 - ✅ 代码简洁，没有冗余逻辑
 这就是为什么现在可以跑了！恭喜你成功解决了 HDP 模式下的 Context Parallelism 问题！🎉
 ```
+
+# 问题九
+···
+[36m(WorkerDict pid=803698)[0m Using /home/lynn/verl/.cache/torch_extensions/py311_cpu as PyTorch extensions root...
+[36m(WorkerDict pid=803698)[0m Emitting ninja build file /home/lynn/verl/.cache/torch_extensions/py311_cpu/npu_rotary_position_embedding/build.ninja...
+[36m(WorkerDict pid=803698)[0m Building extension module npu_rotary_position_embedding...
+[36m(WorkerDict pid=803698)[0m Allowing ninja to set a default number of workers... (overridable by setting the environment variable MAX_JOBS=N)
+[36m(WorkerDict pid=803698)[0m Loading extension module npu_rotary_position_embedding...
+[36m(WorkerDict pid=803706)[0m Building extension module npu_ring_attention_update...
+[36m(WorkerDict pid=803706)[0m Loading extension module npu_ring_attention_update...
+[36m(TaskRunner pid=800676)[0m Unhandled error (suppress with 'RAY_IGNORE_UNHANDLED_ERRORS=1'): [36mray::WorkerDict.actor_rollout_compute_log_prob()[39m (pid=803698, ip=192.168.13.160, actor_id=7d8278d006f37f08070acd1d01000000, repr=<verl.single_controller.ray.base.WorkerDict object at 0x7f65b1a64910>)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/verl/single_controller/ray/base.py", line 700, in func
+[36m(TaskRunner pid=800676)[0m     return getattr(self.worker_dict[key], name)(*args, **kwargs)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/verl/single_controller/base/decorator.py", line 433, in inner
+[36m(TaskRunner pid=800676)[0m     return func(*args, **kwargs)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/verl/utils/profiler/performance.py", line 105, in f
+[36m(TaskRunner pid=800676)[0m     return self.log(decorated_function, *args, **kwargs)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/verl/utils/profiler/performance.py", line 118, in log
+[36m(TaskRunner pid=800676)[0m     output = func(*args, **kwargs)
+[36m(TaskRunner pid=800676)[0m              ^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/verl/utils/profiler/profile.py", line 256, in wrapper
+[36m(TaskRunner pid=800676)[0m     return func(self_instance, *args, **kwargs_inner)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/verl/workers/megatron_workers.py", line 751, in compute_log_prob
+[36m(TaskRunner pid=800676)[0m     output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+[36m(TaskRunner pid=800676)[0m                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/verl/utils/profiler/performance.py", line 105, in f
+[36m(TaskRunner pid=800676)[0m     return self.log(decorated_function, *args, **kwargs)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/verl/utils/profiler/performance.py", line 118, in log
+[36m(TaskRunner pid=800676)[0m     output = func(*args, **kwargs)
+[36m(TaskRunner pid=800676)[0m              ^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/verl/workers/actor/megatron_actor.py", line 217, in compute_log_prob
+[36m(TaskRunner pid=800676)[0m     output = self.forward_backward_batch(
+[36m(TaskRunner pid=800676)[0m              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/verl/workers/actor/megatron_actor.py", line 598, in forward_backward_batch
+[36m(TaskRunner pid=800676)[0m     losses_reduced = forward_backward_func(
+[36m(TaskRunner pid=800676)[0m                      ^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/3rdparty/Megatron-LM/megatron/core/pipeline_parallel/schedules.py", line 480, in forward_backward_no_pipelining
+[36m(TaskRunner pid=800676)[0m     output_tensor, num_tokens = forward_step(
+[36m(TaskRunner pid=800676)[0m                                 ^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/3rdparty/Megatron-LM/megatron/core/pipeline_parallel/schedules.py", line 277, in forward_step
+[36m(TaskRunner pid=800676)[0m     output_tensor, loss_func = forward_step_func(data_iterator, model)
+[36m(TaskRunner pid=800676)[0m                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/verl/workers/actor/megatron_actor.py", line 560, in forward_step
+[36m(TaskRunner pid=800676)[0m     output = forward_fn(
+[36m(TaskRunner pid=800676)[0m              ^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/verl/models/mcore/model_forward.py", line 64, in gptmodel_forward
+[36m(TaskRunner pid=800676)[0m     output_orig = model(
+[36m(TaskRunner pid=800676)[0m                   ^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/usr/local/python3.11.13/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+[36m(TaskRunner pid=800676)[0m     return self._call_impl(*args, **kwargs)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/usr/local/python3.11.13/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+[36m(TaskRunner pid=800676)[0m     return forward_call(*args, **kwargs)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/3rdparty/Megatron-LM/megatron/core/distributed/data_parallel_base.py", line 22, in forward
+[36m(TaskRunner pid=800676)[0m     return self.module(*inputs, **kwargs)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/usr/local/python3.11.13/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+[36m(TaskRunner pid=800676)[0m     return self._call_impl(*args, **kwargs)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/usr/local/python3.11.13/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+[36m(TaskRunner pid=800676)[0m     return forward_call(*args, **kwargs)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/3rdparty/Megatron-LM/megatron/core/transformer/module.py", line 178, in forward
+[36m(TaskRunner pid=800676)[0m     outputs = self.module(*inputs, **kwargs)
+[36m(TaskRunner pid=800676)[0m               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/usr/local/python3.11.13/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+[36m(TaskRunner pid=800676)[0m     return self._call_impl(*args, **kwargs)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/usr/local/python3.11.13/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+[36m(TaskRunner pid=800676)[0m     return forward_call(*args, **kwargs)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/3rdparty/Megatron-LM/megatron/core/models/gpt/gpt_model.py", line 334, in forward
+[36m(TaskRunner pid=800676)[0m     hidden_states = self.decoder(
+[36m(TaskRunner pid=800676)[0m                     ^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/usr/local/python3.11.13/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+[36m(TaskRunner pid=800676)[0m     return self._call_impl(*args, **kwargs)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/usr/local/python3.11.13/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+[36m(TaskRunner pid=800676)[0m     return forward_call(*args, **kwargs)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/3rdparty/Megatron-LM/megatron/core/transformer/transformer_block.py", line 512, in forward
+[36m(TaskRunner pid=800676)[0m     hidden_states = self._checkpointed_forward(
+[36m(TaskRunner pid=800676)[0m                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/3rdparty/Megatron-LM/megatron/core/transformer/transformer_block.py", line 378, in _checkpointed_forward
+[36m(TaskRunner pid=800676)[0m     hidden_states, context = checkpoint_handler(
+[36m(TaskRunner pid=800676)[0m                              ^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/3rdparty/Megatron-LM/megatron/core/transformer/transformer_block.py", line 362, in checkpoint_handler
+[36m(TaskRunner pid=800676)[0m     return tensor_parallel.checkpoint(
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/3rdparty/Megatron-LM/megatron/core/tensor_parallel/random.py", line 463, in checkpoint
+[36m(TaskRunner pid=800676)[0m     return CheckpointFunction.apply(function, distribute_saved_activations, *args)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/usr/local/python3.11.13/lib/python3.11/site-packages/torch/autograd/function.py", line 575, in apply
+[36m(TaskRunner pid=800676)[0m     return super().apply(*args, **kwargs)  # type: ignore[misc]
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/3rdparty/Megatron-LM/megatron/core/tensor_parallel/random.py", line 409, in forward
+[36m(TaskRunner pid=800676)[0m     outputs = run_function(*args)
+[36m(TaskRunner pid=800676)[0m               ^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/3rdparty/Megatron-LM/megatron/core/transformer/transformer_block.py", line 333, in custom_forward
+[36m(TaskRunner pid=800676)[0m     hidden_states, context = layer(
+[36m(TaskRunner pid=800676)[0m                              ^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/3rdparty/Megatron-LM/megatron/core/transformer/transformer_layer.py", line 786, in __call__
+[36m(TaskRunner pid=800676)[0m     return super(MegatronModule, self).__call__(*args, **kwargs)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/usr/local/python3.11.13/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+[36m(TaskRunner pid=800676)[0m     return self._call_impl(*args, **kwargs)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/usr/local/python3.11.13/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+[36m(TaskRunner pid=800676)[0m     return forward_call(*args, **kwargs)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/3rdparty/Megatron-LM/megatron/core/transformer/transformer_layer.py", line 389, in forward
+[36m(TaskRunner pid=800676)[0m     pre_mlp_layernorm_output, residual, context = self._forward_attention(*args, **kwargs)
+[36m(TaskRunner pid=800676)[0m                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/3rdparty/Megatron-LM/megatron/core/transformer/transformer_layer.py", line 449, in _forward_attention
+[36m(TaskRunner pid=800676)[0m     attention_output_with_bias = self.self_attention(
+[36m(TaskRunner pid=800676)[0m                                  ^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/usr/local/python3.11.13/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+[36m(TaskRunner pid=800676)[0m     return self._call_impl(*args, **kwargs)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/usr/local/python3.11.13/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+[36m(TaskRunner pid=800676)[0m     return forward_call(*args, **kwargs)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/3rdparty/Megatron-LM/megatron/core/transformer/attention.py", line 636, in forward
+[36m(TaskRunner pid=800676)[0m     core_attn_out = self.core_attention(
+[36m(TaskRunner pid=800676)[0m                     ^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/usr/local/python3.11.13/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1751, in _wrapped_call_impl
+[36m(TaskRunner pid=800676)[0m     return self._call_impl(*args, **kwargs)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/usr/local/python3.11.13/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1762, in _call_impl
+[36m(TaskRunner pid=800676)[0m     return forward_call(*args, **kwargs)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/3rdparty/MindSpeed/mindspeed/core/context_parallel/dot_product_attention.py", line 273, in forward
+[36m(TaskRunner pid=800676)[0m     output = ringattn_context_parallel(query, key, value, n_head, cp_para, scale, attention_mask,
+[36m(TaskRunner pid=800676)[0m              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/3rdparty/MindSpeed/mindspeed/core/context_parallel/ring_context_parallel/ring_context_parallel.py", line 1233, in ringattn_context_parallel
+[36m(TaskRunner pid=800676)[0m     out = AttentionWithCp.apply(
+[36m(TaskRunner pid=800676)[0m           ^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/usr/local/python3.11.13/lib/python3.11/site-packages/torch/autograd/function.py", line 575, in apply
+[36m(TaskRunner pid=800676)[0m     return super().apply(*args, **kwargs)  # type: ignore[misc]
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/3rdparty/MindSpeed/mindspeed/core/context_parallel/ring_context_parallel/ring_context_parallel.py", line 993, in forward
+[36m(TaskRunner pid=800676)[0m     outer_ring.async_send_recv(send_tensor=cur_kv, recv_tensor=next_round_kv, shapes=get_unaligned_cp_shapes(shapes, kv_block_id_outer, next_kv_block_id_outer))
+[36m(TaskRunner pid=800676)[0m   File "/home/lynn/verl/3rdparty/MindSpeed/mindspeed/core/context_parallel/utils.py", line 151, in async_send_recv
+[36m(TaskRunner pid=800676)[0m     recv_op = dist.irecv(recv_tensor, self.prev, self.group_for_send_recv_overlap)
+[36m(TaskRunner pid=800676)[0m               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m   File "/usr/local/python3.11.13/lib/python3.11/site-packages/torch/distributed/distributed_c10d.py", line 2404, in irecv
+[36m(TaskRunner pid=800676)[0m     return group.recv([tensor], group_src, tag)
+[36m(TaskRunner pid=800676)[0m            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[36m(TaskRunner pid=800676)[0m RuntimeError: create_config:torch_npu/csrc/distributed/HCCLUtils.cpp:149 HCCL function error: hcclCommInitRootInfoConfig(numRanks, &rootInfo, rank, config, &(comm->hcclComm_)), error code is 1
+[36m(TaskRunner pid=800676)[0m [ERROR] 2026-04-24-14:06:52 (PID:803698, Device:0, RankID:3) ERR02200 DIST call hccl api failed.
+···
+
+```
+class RingP2P:
+    def __init__(self, ring_global_ranks, group, group_for_send_recv_overlap=None, is_backward=False) -> None:
+        self.group = group
+        self.group_for_send_recv_overlap = group
+        if group_for_send_recv_overlap is not None:
+            self.group_for_send_recv_overlap = group_for_send_recv_overlap
+
+        global_rank = dist.get_rank()
+        ring_rank = ring_global_ranks.index(global_rank)
+        ring_size = len(ring_global_ranks)
+        self.next = ring_global_ranks[(ring_rank + 1) % ring_size]
+        self.prev = ring_global_ranks[(ring_rank + ring_size - 1) % ring_size]
+        self.ring_rank = ring_rank
+        if is_backward:
+            self.next, self.prev = self.prev, self.next
+
+        self.send_recv_ops = []
+
+        ring_rank_prev = ring_global_ranks.index(self.prev)
+        if self.ring_rank % 2 == 0 and ring_rank_prev % 2 == 0:
+            self.group_for_send_recv_overlap = group
+```
