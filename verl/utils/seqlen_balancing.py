@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import copy
 import heapq
 from itertools import chain
@@ -22,6 +23,7 @@ from torch import distributed as dist
 from verl.protocol import DataProto
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_name
+from verl.utils.megatron.hybrid_data_parallel import pack_sequences_into_buckets
 
 
 def karmarkar_karp(seqlen_list: list[int], k_partitions: int, equal_size: bool):
@@ -301,8 +303,12 @@ def rearrange_micro_batches(
     seq_len_effective = seq_len_effective.tolist()
     assert num_micro_batches <= len(seq_len_effective)
 
-    micro_bsz_idx = get_seqlen_balanced_partitions(seq_len_effective, num_micro_batches, equal_size=False)
-
+    if os.environ.get("USE_HDP") == "1":
+        max_token_len = ceildiv(total_seqlen, num_micro_batches)
+        micro_bsz_idx = pack_sequences_into_buckets(seq_len_effective, max_token_len, num_micro_batches)
+    else:
+        micro_bsz_idx = get_seqlen_balanced_partitions(seq_len_effective, num_micro_batches, equal_size=False)
+    
     if use_dynamic_bsz_balance:
         # Use the sum of squared sequence lengths to approximate attention computation workload
         micro_bsz_idx.sort(

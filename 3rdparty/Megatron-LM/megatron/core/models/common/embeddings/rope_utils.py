@@ -159,8 +159,17 @@ def _apply_rotary_pos_emb_thd(
 
     cp_size = parallel_state.get_context_parallel_world_size()
     cp_rank = parallel_state.get_context_parallel_rank()
+
+    from verl.utils.megatron.hybrid_data_parallel import get_batch_hdp_group
+
+    batch_hdp_group = get_batch_hdp_group()
+    if batch_hdp_group is not None:
+        hdp_group = next(group for group in batch_hdp_group if cp_rank in group)
+        cp_size = len(hdp_group)
+        cp_rank = hdp_group.index(cp_rank)
     cu_seqlens = cu_seqlens // cp_size
     seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+    print(f'>>>debug jhz cp_size={cp_size} cp_rank={cp_rank}', flush=True)
 
     return torch.cat(
         [

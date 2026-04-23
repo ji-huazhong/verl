@@ -58,6 +58,8 @@ def get_full_args():
         full_args = get_args()
         if full_args is None:
             full_args = get_mindspeed_args()
+    except AssertionError:
+        full_args = get_mindspeed_args()
     except ImportError:
         log_warning_once(LOG, 'Failed from megatron.training import get_args, use mindspeed arguments.')
         full_args = get_mindspeed_args()
