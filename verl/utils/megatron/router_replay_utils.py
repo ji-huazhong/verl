@@ -13,8 +13,10 @@
 # limitations under the License.
 
 """
-Router Replay Utilities
+Router Replay Utilities (R3 only)
+
 Utilities for handling router replay functionality in Megatron models.
+R3 mode: Rollout records routing decisions → Training replays them.
 """
 
 import inspect
@@ -47,7 +49,6 @@ from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAc
 device_name = get_device_name()
 
 
-# from megatron.core.transformer.transformer_block import get_num_layers_to_build
 def get_num_layers_to_build(
     config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ) -> int:
@@ -61,8 +62,6 @@ def get_num_layers_to_build(
     Returns:
         int: The number of layers to be built for the current pipeline stage.
     """
-    # If we have a custom PP layout, straightforwardly
-    # return the number of decoders in the layout array.
     if hasattr(config, "pipeline_model_parallel_layout") and config.pipeline_model_parallel_layout is not None:
         from megatron.core.transformer.enums import LayerType
 
@@ -70,7 +69,6 @@ def get_num_layers_to_build(
             layer_type=LayerType.decoder, vp_stage=vp_stage
         )
 
-    # Fallback for legacy tests.
     if pp_rank is None:
         pp_rank = mpu.get_pipeline_model_parallel_rank()
 
@@ -82,13 +80,9 @@ def get_num_layers_to_build(
             " \
         Does not support standalone embedding stage and standalone loss stage with uneven pp"
         )
-        # Number of layers to distribute over rest of pipeline stages
         layers_to_distribute = config.num_layers
-        # Number of pipeline stages left for distributing transformer layers
         pipeline_stages_left = config.pipeline_model_parallel_size
 
-        # If the uneven first (last) pipeline stage is enabled, remove the specified number
-        # of layers to calculate the number of layers on each middle pipeline stage.
         if config.num_layers_in_first_pipeline_stage is not None:
             layers_to_distribute -= config.num_layers_in_first_pipeline_stage
             pipeline_stages_left -= 1
@@ -97,8 +91,6 @@ def get_num_layers_to_build(
             layers_to_distribute -= config.num_layers_in_last_pipeline_stage
             pipeline_stages_left -= 1
 
-        # If pp_size <= 2, we do not have any intermediate pipeline stages, and we do not
-        # need to check if the left over layers are divisible by the left over stages.
         if pipeline_stages_left > 0:
             assert layers_to_distribute % pipeline_stages_left == 0, (
                 "With uneven pipelineing the left over layers must be divisible by left over stages"
@@ -107,17 +99,12 @@ def get_num_layers_to_build(
         else:
             num_layers_per_pipeline_rank = 0
 
-        # If the uneven first (last) pipeline stage is enabled, return the specified number
-        # of layers for all virtual pipeline parallel stages within the first (last) pipeline
-        # parallel stage.
-
         if is_first_pp_stage and config.num_layers_in_first_pipeline_stage is not None:
             num_layers_per_pipeline_rank = config.num_layers_in_first_pipeline_stage
 
         if is_last_pp_stage and config.num_layers_in_last_pipeline_stage is not None:
             num_layers_per_pipeline_rank = config.num_layers_in_last_pipeline_stage
     else:
-        # Include the embedding layer and loss layer into pipeline parallelism partition
         num_layers = config.num_layers
         if config.account_for_embedding_in_pipeline_split:
             num_layers += 1
@@ -132,18 +119,6 @@ def get_num_layers_to_build(
 
     vp_size = config.virtual_pipeline_model_parallel_size
     if vp_size is not None and config.pipeline_model_parallel_size > 1:
-        # Interleaved pipeline parallelism:
-        # Number of layers in each model chunk is the number of layers in the stage,
-        # divided by the number of model chunks in a stage.
-        # With 8 layers, 2 stages, and 4 model chunks, we want an assignment of
-        # layers to stages like (each list is a model chunk):
-        # Stage 0: [0]  [2]  [4]  [6]
-        # Stage 1: [1]  [3]  [5]  [7]
-        # With 8 layers, 2 stages, and 2 virtual stages, we want an assignment of
-        # layers to stages like (each list is a model chunk):
-        # Stage 0: [0, 1]  [4, 5]
-        # Stage 1: [2, 3]  [6, 7]
-
         assert num_layers_per_pipeline_rank % vp_size == 0, (
             f"num_layers_per_pipeline_rank {num_layers_per_pipeline_rank} \
             should be divisible by vp_size {vp_size}"
@@ -153,13 +128,8 @@ def get_num_layers_to_build(
         num_layers_to_build = num_layers_per_virtual_stage
 
     else:
-        # Non-interleaved pipeline parallelism:
-        # Each stage gets a contiguous set of layers.
         num_layers_to_build = num_layers_per_pipeline_rank
 
-    # The embedding (or loss) layer cannot function as a standalone transformer layer
-    # Reduce the number of layers to construct by 1 on the first (or last) stage if the
-    # embedding (or loss) layer is included in the pipeline parallelism partition and placement.
     if config.account_for_embedding_in_pipeline_split:
         if is_vp_first_stage(vp_stage, vp_size) and is_first_pp_stage:
             num_layers_to_build -= 1
@@ -188,13 +158,12 @@ def get_moe_num_layers_to_build(
     config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ) -> int:
     """Count the number of MoE layers assigned to the current rank.
-    When ``moe_layer_freq`` is 1 or unset, every transformer layer is an MoE
-    layer, so the count equals the total layer count. Otherwise only layers
-    whose global index satisfies the frequency predicate are counted.
+
     Args:
         config: Megatron TransformerConfig providing layer layout information.
         vp_stage: Virtual-pipeline stage index (None defaults to current).
         pp_rank: Pipeline-parallel rank (None defaults to current).
+
     Returns:
         Number of MoE layers on the specified rank/stage.
     """
@@ -208,67 +177,17 @@ def get_moe_num_layers_to_build(
     return num_moe_layers
 
 
-def merge_router_topk_indices(attention_mask, input_ids, mini_layer_topk_idx_list, tf_config, vp_rank=None):
-    """
-    Merge recorded router top-k indices across sequence-parallel ranks for all router instances,
-    then pack/unpack them to align with the original (batch, seq_len) layout and append the result.
-
-    Args:
-        attention_mask (torch.Tensor): Attention mask of shape [batch_size, seq_len]. Used to determine
-            the valid token positions during pack/unpack.
-        input_ids (torch.Tensor): Input token IDs of shape [batch_size, seq_len]. Used together with
-            attention_mask for sequence packing/unpacking.
-        mini_layer_topk_idx_list (list): A Python list to which the merged top-k indices tensor will be appended.
-        tf_config: Megatron/Transformer engine configuration object. Used to locate router instances for
-            the current micro-batch.
-        vp_rank (Optional[int]): Virtual pipeline stage rank override. If None, the current VP rank from
-            Megatron parallel state will be used.
-
-    Returns:
-        None: The function has side effects only; it appends a tensor of shape
-        [1, dynamic_bs_all, layer_num, topk] to mini_layer_topk_idx_list.
-    """
-    with torch.no_grad():
-        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
-        layers_topk_idx = []
-        for router in router_instances_list:
-            layers_topk_idx.append(router.recorded_topk_idx.to(torch.uint8))  # dynamic_bs, topk
-
-        # layer_num, dynamic_bs, topk  -> dynamic_bs, layer_num, topk
-        layers_topk_idx = torch.stack(layers_topk_idx).permute(1, 0, 2).to(device_name)
-        # dynamic_bs, layer_num, topk -> 1, dynamic_bs_all, layer_num, topk
-        layers_topk_idx = (
-            gather_from_sequence_parallel_region(layers_topk_idx, tensor_parallel_output_grad=False)
-            .unsqueeze(0)
-            .contiguous()
-        )
-
-        if input_ids.is_nested:
-            batch_size = input_ids.shape[0]
-            _, packed_seq_params = preprocess_thd_no_padding(input_ids, pre_process=True)
-            layers_topk_idx = postprocess_thd_no_padding(
-                layers_topk_idx, packed_seq_params, input_ids, batch_size, post_process=True
-            )
-        else:
-            batch_size, seq_len = attention_mask.shape[:2]
-            _, packed_seq_params = preprocess_packed_seqs(input_ids, attention_mask, pre_process=True)
-            layers_topk_idx = postprocess_packed_seqs(
-                layers_topk_idx, packed_seq_params, attention_mask, batch_size, seq_len, post_process=True
-            )
-        mini_layer_topk_idx_list.append(layers_topk_idx.cpu())
-
-
 def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=None):
     """
     Scatter the packed router top-k indices back to sequence-parallel ranks and update each local
     RouterReplay instance with target indices for replay mode.
 
-    This function prepares the per-layer, per-sample top-k routing decisions (recorded during an earlier
-    forward) so that subsequent replay passes can follow exactly the same routing.
+    This function prepares the per-layer, per-sample top-k routing decisions (recorded during rollout)
+    so that training passes can follow exactly the same routing.
 
     Args:
         layers_topk_idx (torch.Tensor): Router top-k indices with shape [bs, max_seq_len, layer_num, topk].
-            This should be the merged output produced by merge_router_topk_indices.
+            This should be the data recorded during rollout phase.
         attention_mask (torch.Tensor): Attention mask [batch_size, seq_len] used for pack/unpack alignment.
         tf_config: Megatron/Transformer engine configuration object.
         vp_rank (Optional[int]): Virtual pipeline stage rank override. If None, the current VP rank from
@@ -282,27 +201,19 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=N
             layers_topk_idx_rmpad, _, _ = preprocess_thd_no_padding(layers_topk_idx, pre_process=True)
         else:
             layers_topk_idx_rmpad, _ = preprocess_packed_seqs(layers_topk_idx, attention_mask, pre_process=True)
-        layers_topk_idx_rmpad = layers_topk_idx_rmpad.contiguous()  # 1, dynamic_bs_all, layer_num, topk
+        layers_topk_idx_rmpad = layers_topk_idx_rmpad.contiguous()
 
-        # 1, dynamic_bs_split, layer_num, topk
         layers_topk_idx_rmpad_split = scatter_to_sequence_parallel_region(
             layers_topk_idx_rmpad.to(device_name).squeeze(dim=0)
         ).unsqueeze(dim=0)
 
-        # dynamic_bs_split, layer_num, topk -> layer_num, dynamic_bs_split, topk
-        layers_topk_idx_reshape = layers_topk_idx_rmpad_split.permute(0, 2, 1, 3).squeeze(
-            dim=0
-        )  # layer_num, dynamic_bs_all, topk
+        layers_topk_idx_reshape = layers_topk_idx_rmpad_split.permute(0, 2, 1, 3).squeeze(dim=0)
         local_rank_info = get_current_rank_layer_info(tf_config, vp_rank)
         offset, end = local_rank_info["start"], local_rank_info["end"]
         router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
 
-        # When dim-0 covers all layers (e.g. R3, or R2 with all-MoE models),
-        # index by absolute layer_idx; otherwise (R2 with mixed dense/MoE),
-        # dim-0 only contains MoE layers, index by MoE-layer ordinal.
         index_by_layer = len(layers_topk_idx_reshape) == tf_config.num_layers
 
-        # For R2: count MoE layers before `offset` as the starting position.
         moe_idx = sum(1 for i in range(offset) if is_moe_layer(tf_config, i))
 
         router_offset = 0
@@ -325,12 +236,6 @@ def reorder_and_merge_vpp_layers(
     """
     Reorder and merge per-VPP layer blocks into a contiguous layer dimension.
 
-    Given a tensor shaped as [bs*vpp_size, max_token_len, layer_num_per_vpp, topk], this function:
-    1) Builds the schedule table for virtual microbatches and reorders the first dimension so that entries
-       belonging to the same model chunk (VPP stage) become contiguous.
-    2) Reshapes and merges the (vpp_size, layer_num_per_vpp) into a single layer dimension, producing
-       [bs, max_token_len, layer_num, topk].
-
     Args:
         micro_batch_tensor_list : the list of Input tensor.
         num_microbatches (int): Number of microbatches per pipeline stage (bs).
@@ -339,15 +244,9 @@ def reorder_and_merge_vpp_layers(
 
     Returns:
         torch.Tensor: Output tensor of shape [bs, max_token_len, layer_num, topk].
-
-    Raises:
-        ValueError: If input tensor dimensionality or expected sizes do not match.
-        RuntimeError: If the computed output shape is unexpected or the schedule length mismatches.
     """
-    # 1) Build schedule table: map each virtual_microbatch_id -> (microbatch_id, model_chunk_id)
     schedule_table = get_schedule_table(num_microbatches, vpp_size, microbatch_group_size_per_vp_stage)
 
-    # 2) Group by model_chunk_id to build reorder indices so entries of the same chunk become contiguous along dim 0
     tensor_by_chunk = [[] for _ in range(vpp_size)]
     mini_tensor_list = []
 
@@ -368,8 +267,7 @@ def reorder_and_merge_vpp_layers(
 
 
 def get_current_rank_layer_info(tf_config, vp_rank=None):
-    # When vp_rank is None, default to the current VP rank (or 0 if VP is disabled).
-    """Return the local layer range/count for the current process and the full assignment table.
+    """Return the local layer range/count for the current process.
 
     Args:
         tf_config: Configuration object used by compute_pipeline_layer_assignment.
@@ -377,8 +275,7 @@ def get_current_rank_layer_info(tf_config, vp_rank=None):
             mpu.get_virtual_pipeline_model_parallel_rank() when VP is enabled; otherwise 0.
 
     Returns:
-        Tuple[dict, dict]: A tuple of (local_assignment, all_assignments) where local_assignment contains
-        keys {"start", "end", "count"} for the current (pp_rank, vp_stage).
+        dict: A dict with keys {"start", "end", "count"} for the current (pp_rank, vp_stage).
     """
     if vp_rank is None:
         vp_rank = 0
@@ -398,7 +295,6 @@ def get_current_rank_layer_info(tf_config, vp_rank=None):
 
 
 def pp_gather(local_layers_router_map, tf_config):
-    # TODO: Consider non-uniform layer allocation cases.
     """
     Gather local router maps from all PP ranks into a global router map.
 
@@ -470,10 +366,6 @@ class RouterReplayHelper:
         Return the list of RouterReplay instances corresponding to the current micro-batch and local
         (pp_rank, vp_stage) layer range.
 
-        When virtual pipeline (VPP) is enabled, the local range for the PP rank is expanded to include
-        all VP stages by multiplying the per-VP count by vp_size. The returned slice is taken from the
-        global RouterReplay.router_instances list.
-
         Args:
             tf_config: Configuration object used to compute layer assignments.
             vp_rank (Optional[int]): Explicit virtual pipeline stage to query. If None, the current VP
@@ -497,22 +389,8 @@ class RouterReplayHelper:
         return router_instances_list
 
     @staticmethod
-    def is_r2_record_action(tf_config, vp_rank=None) -> bool:
-        """Return True if the current router_replay_action is RECORD (R2) for the local router instances.
-
-        This inspects the first local RouterReplay instance's router_replay_action and compares it to
-        RouterReplayAction.RECORD.
-        """
-        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
-        return router_instances_list and router_instances_list[0].router_replay_action == RouterReplayAction.RECORD
-
-    @staticmethod
     def is_replay_forward_action(tf_config, vp_rank=None) -> bool:
-        """Return True if the current router_replay_action is REPLAY_FORWARD for the local router instances.
-
-        This inspects the first local RouterReplay instance's router_replay_action and compares it to
-        RouterReplayAction.REPLAY_FORWARD.
-        """
+        """Return True if the current router_replay_action is REPLAY_FORWARD for the local router instances."""
         router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
         return (
             router_instances_list and router_instances_list[0].router_replay_action == RouterReplayAction.REPLAY_FORWARD
@@ -520,11 +398,7 @@ class RouterReplayHelper:
 
     @staticmethod
     def is_replay_backward_action(tf_config, vp_rank=None) -> bool:
-        """Return True if the current router_replay_action is REPLAY_BACKWARD for the local router instances.
-
-        This inspects the first local RouterReplay instance's router_replay_action and compares it to
-        RouterReplayAction.REPLAY_BACKWARD.
-        """
+        """Return True if the current router_replay_action is REPLAY_BACKWARD for the local router instances."""
         router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
         return (
             router_instances_list

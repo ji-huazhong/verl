@@ -43,7 +43,6 @@ from verl.utils.megatron.pipeline_parallel import make_batch_generator
 from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction
 from verl.utils.megatron.router_replay_utils import (
     RouterReplayHelper,
-    merge_router_topk_indices,
     pp_gather,
     reorder_and_merge_vpp_layers,
     set_router_replay_data,
@@ -317,16 +316,6 @@ class MegatronPPOActor(BasePPOActor):
                     entropys = entropys.to("cpu")
                 layers_topk_idx = None
 
-                if RouterReplayHelper.is_r2_record_action(self.tf_config):
-                    # (bs, max_seq_len/response_len,local_layer_num,topk)
-                    layers_topk_idx = output["mini_layer_topk_idx_tensor"].to(torch.uint8)
-                    if use_dynamic_bsz:
-                        indices = output["indices"]
-                        indices = list(itertools.chain.from_iterable(indices))
-                        assert len(indices) == layers_topk_idx.size(0), f"{len(indices)} vs. {layers_topk_idx.size()}"
-                        revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
-                        layers_topk_idx = layers_topk_idx[revert_indices]
-                    layers_topk_idx = pp_gather(layers_topk_idx, self.tf_config)
         # add empty cache after each compute
         get_torch_device().empty_cache()
 
@@ -694,11 +683,6 @@ class MegatronPPOActor(BasePPOActor):
                     "clip_ratio_c": clip_ratio_c,
                 }
 
-            if RouterReplayHelper.is_r2_record_action(self.tf_config, vp_rank):
-                merge_router_topk_indices(
-                    attention_mask, input_ids, self.mini_layer_topk_idx_list, self.tf_config, vp_rank
-                )
-
             if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
                 router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
                 for router in router_instance_list:
@@ -741,18 +725,6 @@ class MegatronPPOActor(BasePPOActor):
         losses_reduced = {"output": losses_reduced}
         if use_dynamic_bsz:
             losses_reduced["indices"] = indices
-        if RouterReplayHelper.is_r2_record_action(self.tf_config):
-            if self.tf_config.virtual_pipeline_model_parallel_size is not None:
-                # config = self.actor_module[0].module.module.config
-                vp_size = len(self.actor_module)
-                microbatch_group_size_per_vp_stage = self.tf_config.microbatch_group_size_per_vp_stage
-                bs = n_micro_batch
-                losses_reduced["mini_layer_topk_idx_tensor"] = reorder_and_merge_vpp_layers(
-                    self.mini_layer_topk_idx_list, bs, vp_size, microbatch_group_size_per_vp_stage
-                )
-            else:
-                losses_reduced["mini_layer_topk_idx_tensor"] = torch.cat(self.mini_layer_topk_idx_list, dim=0)
-            self.mini_layer_topk_idx_list = []
 
         # Collect and pass MTP metrics to losses_reduced
         if not forward_only and self.mtp_config and self.mtp_config.enable_train:
@@ -778,7 +750,7 @@ class MegatronPPOActor(BasePPOActor):
         """
         metrics = {}
         for data in dataloader:
-            if self.config.router_replay.mode in ["R2", "R3"]:
+            if self.config.router_replay.mode == "R3":
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
             self.actor_optimizer.zero_grad()
             # use use_contiguous_buffers_in_local_ddp and no overlap_dp_param_comm
@@ -824,7 +796,7 @@ class MegatronPPOActor(BasePPOActor):
             else:
                 raise NotImplementedError
 
-            if self.config.router_replay.mode in ["R2", "R3"]:
+            if self.config.router_replay.mode == "R3":
                 RouterReplay.clear_global_router_replay_action()
                 RouterReplay.clear_global_indices()
 

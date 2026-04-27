@@ -881,9 +881,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = config_source.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
 
-        if self.enable_routing_replay and self.config.actor.router_replay.mode == "R2":
-            RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
-
         if self.enable_routing_replay and self.config.actor.router_replay.mode == "R3":
             RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
 
@@ -896,10 +893,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             tensors=tensors,
             meta_info={"temperature": self.config.rollout.temperature},
         )
-        if self.config.actor.router_replay.mode == "R2":
-            output.batch["routed_experts"] = layers_topk_idx
 
-        if self.config.actor.router_replay.mode in ["R2", "R3"]:
+        if self.config.actor.router_replay.mode == "R3":
             RouterReplay.clear_global_indices()
             RouterReplay.clear_global_router_replay_action()
 
