@@ -531,6 +531,26 @@ def _select_fsdp2_wrap_targets(model, fsdp_transformer_layer_cls_to_wrap):
     return modules
 
 
+def _set_modules_to_forward_prefetch(main_block_list, num_to_forward_prefetch=1):
+    for i, block in enumerate(main_block_list):
+        if i >= len(main_block_list) - num_to_forward_prefetch:
+            break
+        blocks_to_prefetch = [
+            main_block_list[i + j] for j in range(1, num_to_forward_prefetch + 1)
+        ]
+        block.set_modules_to_forward_prefetch(blocks_to_prefetch)
+
+
+def _set_modules_to_backward_prefetch(main_block_list, num_to_backward_prefetch=1):
+    for i, block in enumerate(main_block_list):
+        if i < num_to_backward_prefetch:
+            continue
+        blocks_to_prefetch = [
+            main_block_list[i - j] for j in range(1, num_to_backward_prefetch + 1)
+        ]
+        block.set_modules_to_backward_prefetch(blocks_to_prefetch)
+
+
 def apply_fsdp2(model, fsdp_kwargs, config):
     """model: AutoModelForCausalLM"""
     assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
@@ -560,6 +580,11 @@ def apply_fsdp2(model, fsdp_kwargs, config):
     with maybe_patch_fsdp_module(model):
         fully_shard(model, **fsdp_kwargs)  # fsdp2 will not reshard_after_forward for root module
 
+    # configure manual prefetching when needed
+    need_manual_prefetch = config.fsdp_size < 0 or config.fsdp_size > 1
+    if need_manual_prefetch:
+        _set_modules_to_forward_prefetch(modules)
+        _set_modules_to_backward_prefetch(modules)
 
 def get_shard_placement_fn(fsdp_size):
     """Choose the dimension that can divide fsdp_size to avoid padding"""
