@@ -35,7 +35,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 class RouterReplayAction(Enum):
     REPLAY_FORWARD = "replay_forward" # 前向传播时使用
-    # REPLAY_BACKWARD = "replay_backward" # VPP backward 时使用
+    REPLAY_BACKWARD = "replay_backward" # VPP backward 时使用
 
 
 class RouterReplay:
@@ -88,13 +88,13 @@ class RouterReplay:
         """初始化给定层的RouterReplay实例."""
         self.target_topk_idx = None # 存储目标top-k索引
         self.router_replay_action = None # 当前重放动作
-        # self.replay_backward_list = [] # VPP backward时使用
+        self.replay_backward_list = [] # VPP backward时使用
         RouterReplay.router_instances.append(self)
 
     def set_target_indices(self, topk_indices: torch.Tensor):
         """为当前层设置目标top-k索引."""
         self.target_topk_idx = topk_indices
-        # self.replay_backward_list.append(topk_indices) # VPP backward时使用，跟前向一致
+        self.replay_backward_list.append(topk_indices) # VPP backward时使用，跟前向一致
 
     def clear_indices(self):
         """将当前层的target topk idx清空"""
