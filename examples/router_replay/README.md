@@ -7,7 +7,6 @@ Router Replay is an advanced routing replay functionality within the Verl framew
 
 ### Multiple Operating Modes
 - **`disabled`**: Router replay functionality is completely disabled
-- **`R2`**: Standard router replay mode for recording and replaying routing decisions
 - **`R3`**: Rollout-specific router replay mode optimized for reinforcement learning workflows
 
 ### Core Capabilities
@@ -21,30 +20,12 @@ Router Replay is an advanced routing replay functionality within the Verl framew
 
 ```yaml
 router_replay:
-  mode: "disabled"  # Available options: disabled, R2, R3
+  mode: "disabled"  # Available options: disabled, R3
   record_file: null  # Path for recording routing decisions
   replay_file: null   # Path for replaying recorded decisions
 ```
 
 ## Quick Start Guide
-
-### Enabling R2 Mode
-
-#### Configuration File Method
-Add the following to your training configuration:
-
-```yaml
-actor:
-  router_replay:
-    mode: "R2"
-```
-
-#### Command Line Method
-Enable R2 mode via command-line parameters:
-
-```bash
-actor_rollout_ref.actor.router_replay.mode="R2"
-```
 
 ### Enabling R3 Mode
 
