@@ -2,6 +2,13 @@
 set -x
 
 NODES=1
+N_GPUS_PER_NODE=1
+
+export export PYTHONPATH=/home/cxli/lcx/Megatron-LM:$PYTHONPATH
+#export CUDA_VISIBLE_DEVICES=4,5,6,7
+#export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0
+RAY_DEDUP_LOGS=0
 
 # R3: enable rollout routing replay
 # If enabling R3, please set actor_rollout_ref.rollout.enable_rollout_routing_replay=True
@@ -12,32 +19,40 @@ NODES=1
 ROUTING_REPLAY_MODE="R3" 
 ENABLE_ROLLOUT_ROUTING_REPLAY=True
 
-DIST_CKPT_PATH=""
-HF_MODEL_PATH=""
-TRAIN_DATA_PATH=""
-TEST_DATA_PATH=""
+DIST_CKPT_PATH="/home/cxli/lcx/model/Qwen3-30B-A3B-mcore"
+HF_MODEL_PATH="/home/cxli/lcx/model/Qwen3-30B-A3B"
+TRAIN_DATA_PATH="/home/cxli/lcx/data/gsm8k/train.parquet"
+TEST_DATA_PATH="/home/cxli/lcx/data/gsm8k/test.parquet"
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1 # For megatron communication/computation overlapping
 PP=1
 VPP=None
-TP=2
-EP=2
+#TP=2
+TP=1
+#EP=2
+EP=1
 ETP=1
-VLLM_INFER_TP=2
+#VLLM_INFER_TP=2
+VLLM_INFER_TP=1
 offload=True
 gpu_memory_utilization=0.65
 bs=8
 micro_bs=2
-use_dynamic_bsz=True
+use_dynamic_bsz=False
 max_prompt_length=1024
 max_response_length=1024
 ppo_mini_batch_size=8
 actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
 infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
 
-USE_LEGACY_WORKER_IMPL="disable" # disable, enable
-ROUTING_REPLAY_MODE_ARG="actor_rollout_ref.actor.megatron.router_replay.mode=${ROUTING_REPLAY_MODE}"
-remove_padding=True
+USE_LEGACY_WORKER_IMPL="enable" # disable, enable
+if [ "$USE_LEGACY_WORKER_IMPL" = "disable" ]; then
+    ROUTING_REPLAY_MODE_ARG="actor_rollout_ref.actor.megatron.router_replay.mode=${ROUTING_REPLAY_MODE}"
+    remove_padding=True
+else
+    ROUTING_REPLAY_MODE_ARG="actor_rollout_ref.actor.router_replay.mode=${ROUTING_REPLAY_MODE}"
+    remove_padding=False
+fi
 
 exper_name=Node${NODES}_bs${bs}_${PP}${TP}${EP}${ETP}_${VLLM_INFER_TP}_minbs${ppo_mini_batch_size}_micro_bs${micro_bs}
 
@@ -57,8 +72,6 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
     ${ROUTING_REPLAY_MODE_ARG} \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_enable_deepep=True \
-    +actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type=flex \
     +actor_rollout_ref.actor.megatron.override_transformer_config.apply_rope_fusion=True \
     +actor_rollout_ref.actor.megatron.override_transformer_config.bias_activation_fusion=True \
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_router_dtype=fp32 \
@@ -89,6 +102,10 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode=async \
     actor_rollout_ref.actor.megatron.use_mbridge=True \
+    actor_rollout_ref.actor.megatron.use_dist_checkpointing=False \
+    actor_rollout_ref.ref.megatron.use_dist_checkpointing=False \
+    actor_rollout_ref.actor.megatron.dist_checkpointing_path=$DIST_CKPT_PATH \
+    actor_rollout_ref.ref.megatron.dist_checkpointing_path=$DIST_CKPT_PATH \
     actor_rollout_ref.rollout.gpu_memory_utilization=$gpu_memory_utilization \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
@@ -108,10 +125,12 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     trainer.project_name='verl_grpo_example_gsm8k_math' \
     trainer.experiment_name="$exper_name" \
     trainer.nnodes=$NODES \
-    trainer.n_gpus_per_node=8 \
+    trainer.n_gpus_per_node=$N_GPUS_PER_NODE \
     trainer.save_freq=-1 \
     trainer.test_freq=10 \
     trainer.total_training_steps=50000 \
     trainer.balance_batch=False \
     trainer.use_legacy_worker_impl=${USE_LEGACY_WORKER_IMPL} \
     trainer.val_before_train=False 2>&1
+    #+actor_rollout_ref.actor.megatron.override_transformer_config.moe_enable_deepep=True \
+    #+actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type=flex \
