@@ -49,22 +49,12 @@ def get_num_layers_to_build(
     config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ) -> int:
     """
-    Determine the number of transformer layers to build for the current pipeline stage.
+    当前 GPU 流水线阶段，需要构建多少层 Transformer 解码器层。
     Args:
         config (TransformerConfig): Configuration object containing transformer model parameters.
         vp_stage (Optional[int]): Virtual pipeline stage number.
         pp_rank (Optional[int]): Pipeline parallel rank.
-
-    Returns:
-        int: The number of layers to be built for the current pipeline stage.
     """
-    if hasattr(config, "pipeline_model_parallel_layout") and config.pipeline_model_parallel_layout is not None:
-        from megatron.core.transformer.enums import LayerType
-
-        return config.pipeline_model_parallel_layout.get_num_layers_to_build(
-            layer_type=LayerType.decoder, vp_stage=vp_stage
-        )
-
     if pp_rank is None:
         pp_rank = mpu.get_pipeline_model_parallel_rank()
 
