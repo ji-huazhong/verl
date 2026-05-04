@@ -16,29 +16,19 @@ Router Replay Patch (R3 only)
 
 This module provides router replay functionality for MoE models in RL training.
 R3 mode: Rollout records routing decisions → Training replays them.
-
-Key difference from R2:
-- R2: Training records → Training replays (removed)
-- R3: Rollout records → Training replays (kept)
 """
 import inspect
 import types
-import warnings
 from enum import Enum
 from functools import wraps
 
 import torch
-
-try:
-    from megatron.core.transformer.moe.moe_utils import (
-        apply_router_token_dropping,
-        compute_routing_scores_for_aux_loss,
-        group_limited_topk,
-    )
-    from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
-except ImportError:
-    warnings.warn("NPU not support router replay for now.", stacklevel=2)
-    MoEAlltoAllTokenDispatcher = None
+from megatron.core.transformer.moe.moe_utils import (
+    apply_router_token_dropping,
+    compute_routing_scores_for_aux_loss,
+    group_limited_topk,
+)
+from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.transformer_config import TransformerConfig
 

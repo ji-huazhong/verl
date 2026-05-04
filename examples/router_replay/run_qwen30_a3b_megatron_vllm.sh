@@ -3,7 +3,6 @@ set -x
 
 NODES=1
 
-# R2: enable routing replay
 # R3: enable rollout routing replay
 # If enabling R3, please set actor_rollout_ref.rollout.enable_rollout_routing_replay=True
 # R3 example is based on vllm related pr:

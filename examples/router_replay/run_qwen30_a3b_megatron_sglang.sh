@@ -3,7 +3,6 @@ set -x
 
 NODES=6
 
-# R2: enable routing replay
 # R3: enable rollout routing replay
 # If enabling R3, please set actor_rollout_ref.rollout.enable_rollout_routing_replay=True
 # R3 example is based on SGLang related commit https://github.com/sgl-project/sglang/commit/bed301a5acaa9577c9aa706468bdf242f6a43051
