@@ -99,7 +99,7 @@ class RouterReplay:
     def clear_indices(self):
         """将当前层的target topk idx清空"""
         self.target_topk_idx = None
-        # self.replay_backward_list = []
+        self.replay_backward_list = []
 
     def set_router_replay_action(self, router_replay_action: RouterReplayAction):
         """为当前层设置router replay action."""
