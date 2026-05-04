@@ -52,7 +52,7 @@ from verl.utils.device import (
 from verl.utils.distributed import set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.fs import copy_to_local
-from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, apply_router_replay_patch
+from verl.utils.megatron.router_replay_patch import RouterReplay, apply_router_replay_patch
 from verl.utils.megatron_peft_utils import add_base_layer_suffix, build_peft_config_for_vllm
 from verl.utils.megatron_utils import (
     load_megatron_model_to_gpu,
@@ -881,9 +881,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         data.meta_info["use_dynamic_bsz"] = config_source.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
 
-        if self.enable_routing_replay and self.config.actor.router_replay.mode == "R3":
-            RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
-
         with adapter_ctx:
             output, entropys, layers_topk_idx = self.actor.compute_log_prob(data=data, calculate_entropy=not is_lora)
         tensors = {"ref_log_prob": output} if is_lora else {"old_log_probs": output}
@@ -896,7 +893,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
 
         if self.config.actor.router_replay.mode == "R3":
             RouterReplay.clear_global_indices()
-            RouterReplay.clear_global_router_replay_action()
 
         output = output.to("cpu")
         # clear kv cache

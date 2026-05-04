@@ -13,10 +13,13 @@
 # limitations under the License.
 
 """
-Router Replay Utilities (R3 only)
+Router Replay Utilities (R3 only - No VPP Support)
 
 Utilities for handling router replay functionality in Megatron models.
 R3 mode: Rollout records routing decisions → Training replays them.
+
+NOTE: This version does NOT support Virtual Pipeline Parallel (VPP).
+      If you need VPP support, please use the original version from git history.
 """
 
 import warnings
@@ -40,7 +43,7 @@ from verl.models.mcore.util import (
     preprocess_thd_no_padding,
 )
 from verl.utils.device import get_device_name
-from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction
+from verl.utils.megatron.router_replay_patch import RouterReplay
 
 
 def get_num_layers_to_build(
@@ -141,7 +144,8 @@ def get_moe_num_layers_to_build(
     # 1. 先算出：当前阶段一共要建多少层（普通层+moe层总和）
     total_layers = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
     # 2. 算出：这些层在【全局模型】中的起始偏移（从第几层开始）
-    layer_offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
+    # layer_offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
+    layer_offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
     # 3. 生成当前阶段负责的【全局层编号】
     local_global_indices = range(layer_offset, layer_offset + total_layers)
     # 4. 统计当前阶段负责的【全局层编号】中，有多少层是moe层
@@ -210,52 +214,33 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=N
 
 
 class RouterReplayHelper:
-    """帮当前 GPU / 当前虚拟流水线阶段，找到自己负责的那几个 MoE 路由器实例，并判断现在是要重放前向，还是重放反向"""
+    """帮当前GPU找到自己负责的那几个MoE路由器实例，并判断现在是否要重放前向
+    
+    Simplified version without VPP support.
+    """
+    
     @staticmethod
-    def get_micro_batch_router_list(tf_config, vp_rank=None):
+    def get_micro_batch_router_list(tf_config):
         """
-        Return the list of RouterReplay instances corresponding to the current micro-batch and local
-        (pp_rank, vp_stage) layer range.
+        Return the list of RouterReplay instances corresponding to the current PP rank.
+        
+        Simplified version without VPP support - directly returns all router instances
+        for the current PP rank without VPP offset calculation.
 
         Args:
             tf_config: Configuration object used to compute layer assignments.
-            vp_rank (Optional[int]): Explicit virtual pipeline stage to query. If None, the current VP
-                rank from Megatron parallel state is used when available.
+            
         Returns:
-            list: A contiguous sublist of RouterReplay.router_instances for the local layer range.
+            list: A list of RouterReplay.router_instances for the current PP rank.
         """
-        # 1. 获取虚拟流水线大小
-        vp_size = tf_config.virtual_pipeline_model_parallel_size
-        # 2. 如果开启了 VPP：计算router偏移
-        # 把前面所有虚拟阶段的MoE加起来，得到起始偏移
-        if vp_size is not None:
-            vp_rank = 0 if vp_rank is None else vp_rank
-            offset = 0
-            # 遍历当前虚拟阶段之前的所有 stage，累加 MoE 层数 → 得到偏移
-            for pre_vp_stage in range(vp_size):
-                if pre_vp_stage == vp_rank:
-                    break
-                offset += get_moe_num_layers_to_build(tf_config, pre_vp_stage)
-        else: # 没开vpp，偏移量是0
-            offset = 0
-        # RouterReplay在TopKRouter中被实例化
-        num_layers_to_build = get_moe_num_layers_to_build(tf_config, vp_rank)
-        router_instances_list = RouterReplay.router_instances[offset : offset + num_layers_to_build]
+        num_layers_to_build = get_moe_num_layers_to_build(tf_config)
+        router_instances_list = RouterReplay.router_instances[:num_layers_to_build]
         return router_instances_list
 
     @staticmethod
-    def is_replay_forward_action(tf_config, vp_rank=None) -> bool:
-        """Return True if the current router_replay_action is REPLAY_FORWARD for the local router instances."""
-        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+    def if_router_replay(tf_config) -> bool:
+        """Return True if target_topk_idx is set for the local router instances."""
+        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config)
         return (
-            router_instances_list and router_instances_list[0].router_replay_action == RouterReplayAction.REPLAY_FORWARD
-        )
-
-    @staticmethod
-    def is_replay_backward_action(tf_config, vp_rank=None) -> bool:
-        """Return True if the current router_replay_action is REPLAY_BACKWARD for the local router instances."""
-        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
-        return (
-            router_instances_list
-            and router_instances_list[0].router_replay_action == RouterReplayAction.REPLAY_BACKWARD
+            router_instances_list and router_instances_list[0].target_topk_idx is not None
         )

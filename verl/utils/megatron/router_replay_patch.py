@@ -12,15 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Router Replay Patch (R3 only)
+Router Replay Patch (R3 only - No VPP Support)
 
 This module provides router replay functionality for MoE models in RL training.
 R3 mode: Rollout records routing decisions → Training replays them.
+
+NOTE: This version does NOT support Virtual Pipeline Parallel (VPP).
+      If you need VPP support, please use the original version from git history.
 """
-import inspect
-import types
-from enum import Enum
-from functools import wraps
 
 import torch
 from megatron.core.transformer.moe.moe_utils import (
@@ -33,25 +32,19 @@ from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-class RouterReplayAction(Enum):
-    REPLAY_FORWARD = "replay_forward" # 前向传播时使用
-    REPLAY_BACKWARD = "replay_backward" # VPP backward 时使用
-
-
 class RouterReplay:
     """
     A class to manage the replaying of MoE routing decisions.
     It holds all router instances and provides static methods to globally
     control replaying.
 
-    R3 Mode Usage:
+    R3 Mode Usage (No VPP Support):
     1. Rollout phase: Records routing decisions (handled by inference engine)
     2. Training phase: set_target_indices() with recorded decisions
-    3. Forward pass: Uses REPLAY_FORWARD action
-    4. VPP Backward: Uses REPLAY_BACKWARD action
+    3. Forward pass: Replays routing decisions if target_topk_idx is set
     """
 
-    router_instances = [] # 全局管理所有 router 实例
+    router_instances = []
 
     @staticmethod
     def set_replay_data(all_layers_topk_indices: list):
@@ -64,7 +57,7 @@ class RouterReplay:
                 f"does not match the number of router instances ({len(RouterReplay.router_instances)})."
             )
         for i, router_instance in enumerate(RouterReplay.router_instances):
-            router_instance.set_target_indices(all_layers_topk_indices[i]) # 第i个路由实例存储第i层的topk索引
+            router_instance.set_target_indices(all_layers_topk_indices[i])
 
     @staticmethod
     def clear_global_indices():
@@ -72,42 +65,18 @@ class RouterReplay:
         for router in RouterReplay.router_instances:
             router.clear_indices()
 
-    @staticmethod
-    def set_global_router_replay_action(router_replay_action: RouterReplayAction):
-        """为所有路由实例设置router replay action."""
-        for router in RouterReplay.router_instances:
-            router.set_router_replay_action(router_replay_action)
-
-    @staticmethod
-    def clear_global_router_replay_action():
-        """将所有路由实例的router replay action清空"""
-        for router in RouterReplay.router_instances:
-            router.clear_router_replay_action()
-
     def __init__(self):
         """初始化给定层的RouterReplay实例."""
-        self.target_topk_idx = None # 存储目标top-k索引
-        self.router_replay_action = None # 当前重放动作
-        self.replay_backward_list = [] # VPP backward时使用
+        self.target_topk_idx = None
         RouterReplay.router_instances.append(self)
 
     def set_target_indices(self, topk_indices: torch.Tensor):
         """为当前层设置目标top-k索引."""
         self.target_topk_idx = topk_indices
-        self.replay_backward_list.append(topk_indices) # VPP backward时使用，跟前向一致
 
     def clear_indices(self):
         """将当前层的target topk idx清空"""
         self.target_topk_idx = None
-        self.replay_backward_list = []
-
-    def set_router_replay_action(self, router_replay_action: RouterReplayAction):
-        """为当前层设置router replay action."""
-        self.router_replay_action = router_replay_action
-
-    def clear_router_replay_action(self):
-        """将当前层的router replay action清空"""
-        self.router_replay_action = None
 
 
 def _patched_topk_routing_with_score_function(
@@ -141,31 +110,13 @@ def _patched_topk_routing_with_score_function(
             return torch.topk(scores, k=topk, dim=1)
 
     def compute_topk(scores, topk, num_groups=None, group_topk=None):
-        routing_action = router_replay.router_replay_action if router_replay is not None else None
-
-        if routing_action is None:
+        if router_replay is None or router_replay.target_topk_idx is None:
             return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
 
-        elif routing_action == RouterReplayAction.REPLAY_FORWARD:
-            if router_replay is None or router_replay.target_topk_idx is None:
-                return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
-
-            top_indices = router_replay.target_topk_idx
-            top_indices = top_indices.to(scores.device)
-            probs = scores.gather(1, top_indices)
-            return probs, top_indices
-
-        elif routing_action == RouterReplayAction.REPLAY_BACKWARD:
-            if router_replay is None or not router_replay.replay_backward_list:
-                return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
-
-            top_indices = router_replay.replay_backward_list.pop(0)
-            top_indices = top_indices.to(scores.device)
-            probs = scores.gather(1, top_indices)
-            return probs, top_indices
-
-        else:
-            return _compute_topk(scores, topk, num_groups=num_groups, group_topk=group_topk)
+        top_indices = router_replay.target_topk_idx
+        top_indices = top_indices.to(scores.device)
+        probs = scores.gather(1, top_indices)
+        return probs, top_indices
 
     if score_function == "softmax":
         if use_pre_softmax:
@@ -266,8 +217,16 @@ def apply_router_replay_patch():
     Applies the monkey patch for MoE Router Replay functionality.
     This patch dynamically adds the 'enable_routing_replay' attribute to TransformerConfig
     and modifies the TopKRouter to support replaying of routing decisions.
+    
+    NOTE: This version does NOT support Virtual Pipeline Parallel (VPP).
     """
-    print("Applying Router Replay Patch...")
+    print("Applying Router Replay Patch (No VPP Support)...")
+    
+    # Check if VPP is enabled
+    if hasattr(TransformerConfig, "virtual_pipeline_model_parallel_size"):
+        # This check will be performed at runtime when config is available
+        pass
+    
     RouterReplay.router_instances.clear()
     # Step 1: Patch TransformerConfig to include the feature flag
     if not hasattr(TransformerConfig, "enable_routing_replay"):
@@ -286,6 +245,13 @@ def apply_router_replay_patch():
 
             # Set the instance attribute
             self.enable_routing_replay = enable_routing_replay
+            
+            # Check for VPP and raise error if enabled
+            if hasattr(self, "virtual_pipeline_model_parallel_size") and self.virtual_pipeline_model_parallel_size is not None:
+                raise ValueError(
+                    "Virtual Pipeline Parallel (VPP) is enabled, but this version of router replay "
+                    "does not support VPP. Please use the original version from git history or disable VPP."
+                )
 
         # Apply the patch
         TransformerConfig.__init__ = patched_tf_config_init

@@ -32,7 +32,7 @@ from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
-from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, apply_router_replay_patch
+from verl.utils.megatron.router_replay_patch import RouterReplay, apply_router_replay_patch
 from verl.utils.megatron.router_replay_utils import (
     RouterReplayHelper,
     set_router_replay_data,
@@ -575,9 +575,6 @@ class MegatronEngine(BaseEngine):
 
         enable_routing_replay = tu.get_non_tensor_data(data, key="enable_routing_replay", default=False)
 
-        if enable_routing_replay:
-            RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
-
         # batch should be a list of batches inside micro-batches
         batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.module))
 
@@ -605,7 +602,6 @@ class MegatronEngine(BaseEngine):
             output = postprocess_batch_func(output_lst=losses_reduced, indices=indices, data=data)
         if enable_routing_replay:
             RouterReplay.clear_global_indices()
-            RouterReplay.clear_global_router_replay_action()
         return output
 
     def get_per_tensor_param(self, base_sync_done=False, **kwargs):
@@ -710,20 +706,9 @@ class MegatronEngineWithLMHead(MegatronEngine):
         multi_modal_inputs = model_inputs["multi_modal_inputs"]
         loss_mask = model_inputs["loss_mask"]
 
-        unwrapped_model = unwrap_model(model)
-        if hasattr(unwrapped_model, "vp_stage"):
-            vp_rank = unwrapped_model.vp_stage
-        else:
-            vp_rank = 0
-
-        if RouterReplayHelper.is_replay_backward_action(self.tf_config, vp_rank):
-            router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
-            for router in router_instance_list:
-                router.set_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
-
-        if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
+        if RouterReplayHelper.if_router_replay(self.tf_config):
             layers_topk_idx = model_inputs["routed_experts"]
-            set_router_replay_data(layers_topk_idx, None, self.tf_config, vp_rank)
+            set_router_replay_data(layers_topk_idx, None, self.tf_config)
 
         if pad_mode == DatasetPadMode.NO_PADDING:
             label = input_ids.clone()
@@ -808,12 +793,6 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 data_format="thd" if self.engine_config.use_remove_padding else "bshd",
                 mtp_enable_train=self.model_config.mtp.enable and self.model_config.mtp.enable_train,
             )
-
-        # Router replay: switch to backward replay mode for next backward pass
-        if RouterReplayHelper.is_replay_forward_action(self.tf_config, vp_rank):
-            router_instance_list = RouterReplayHelper.get_micro_batch_router_list(self.tf_config, vp_rank)
-            for router in router_instance_list:
-                router.set_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
 
         return output, partial(postprocess_micro_batch_func, data=batch)
 
