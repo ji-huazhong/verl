@@ -173,56 +173,6 @@ def get_moe_num_layers_to_build(
     return num_moe_layers
 
 
-def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=None):
-    """
-    Scatter the packed router top-k indices back to sequence-parallel ranks and update each local
-    RouterReplay instance with target indices for replay mode.
-
-    This function prepares the per-layer, per-sample top-k routing decisions (recorded during rollout)
-    so that training passes can follow exactly the same routing.
-
-    Args:
-        layers_topk_idx (torch.Tensor): Router top-k indices with shape [bs, max_seq_len, layer_num, topk].
-            This should be the data recorded during rollout phase.
-        attention_mask (torch.Tensor): Attention mask [batch_size, seq_len] used for pack/unpack alignment.
-        tf_config: Megatron/Transformer engine configuration object.
-        vp_rank (Optional[int]): Virtual pipeline stage rank override. If None, the current VP rank from
-            Megatron parallel state will be used.
-
-    Returns:
-        None: The function updates internal RouterReplay instances in-place.
-    """
-    with torch.no_grad():
-        if layers_topk_idx.is_nested:
-            layers_topk_idx_rmpad, _, _ = preprocess_thd_no_padding(layers_topk_idx, pre_process=True)
-        else:
-            layers_topk_idx_rmpad, _ = preprocess_packed_seqs(layers_topk_idx, attention_mask, pre_process=True)
-        layers_topk_idx_rmpad = layers_topk_idx_rmpad.contiguous()
-
-        layers_topk_idx_rmpad_split = scatter_to_sequence_parallel_region(
-            layers_topk_idx_rmpad.to(device_name).squeeze(dim=0)
-        ).unsqueeze(dim=0)
-
-        layers_topk_idx_reshape = layers_topk_idx_rmpad_split.permute(0, 2, 1, 3).squeeze(dim=0)
-        local_rank_info = get_current_rank_layer_info(tf_config, vp_rank)
-        offset, end = local_rank_info["start"], local_rank_info["end"]
-        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
-
-        index_by_layer = len(layers_topk_idx_reshape) == tf_config.num_layers
-
-        moe_idx = sum(1 for i in range(offset) if is_moe_layer(tf_config, i))
-
-        router_offset = 0
-        for layer_idx in range(offset, end):
-            if not is_moe_layer(tf_config, layer_idx):
-                continue
-            router = router_instances_list[router_offset]
-            idx = layer_idx if index_by_layer else moe_idx
-            router.set_target_indices(layers_topk_idx_reshape[idx].to(torch.int64))
-            router_offset += 1
-            moe_idx += 1
-
-
 def get_current_rank_layer_info(tf_config, vp_rank=None):
     """Return the local layer range/count for the current process.
 
@@ -244,6 +194,59 @@ def get_current_rank_layer_info(tf_config, vp_rank=None):
     local["end"] = offset + num_layers_to_build
     local["count"] = num_layers_to_build
     return local
+
+
+def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=None):
+    """
+    Scatter the packed router top-k indices back to sequence-parallel ranks and update each local
+    RouterReplay instance with target indices for replay mode.
+
+    This function prepares the per-layer, per-sample top-k routing decisions (recorded during rollout)
+    so that training passes can follow exactly the same routing.
+
+    Args:
+        layers_topk_idx (torch.Tensor): Router top-k indices with shape [bs, max_seq_len, layer_num, topk].
+            This should be the data recorded during rollout phase.
+        attention_mask (torch.Tensor): Attention mask [batch_size, seq_len] used for pack/unpack alignment.
+        tf_config: Megatron/Transformer engine configuration object.
+        vp_rank (Optional[int]): Virtual pipeline stage rank override. If None, the current VP rank from
+            Megatron parallel state will be used.
+
+    Returns:
+        None: The function updates internal RouterReplay instances in-place.
+    """
+    with torch.no_grad():
+        # cp
+        if layers_topk_idx.is_nested:
+            layers_topk_idx_rmpad, _, _ = preprocess_thd_no_padding(layers_topk_idx, pre_process=True)
+        else:
+            layers_topk_idx_rmpad, _ = preprocess_packed_seqs(layers_topk_idx, attention_mask, pre_process=True)
+        layers_topk_idx_rmpad = layers_topk_idx_rmpad.contiguous()
+
+        # sp(tp)
+        layers_topk_idx_rmpad_split = scatter_to_sequence_parallel_region(
+            layers_topk_idx_rmpad.to(device_name).squeeze(dim=0)
+        ).unsqueeze(dim=0)
+
+        # pp
+        layers_topk_idx_reshape = layers_topk_idx_rmpad_split.permute(0, 2, 1, 3).squeeze(dim=0)
+        local_rank_info = get_current_rank_layer_info(tf_config, vp_rank)
+        offset, end = local_rank_info["start"], local_rank_info["end"]
+        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
+
+        index_by_layer = len(layers_topk_idx_reshape) == tf_config.num_layers
+
+        moe_idx = sum(1 for i in range(offset) if is_moe_layer(tf_config, i))
+
+        router_offset = 0
+        for layer_idx in range(offset, end):
+            if not is_moe_layer(tf_config, layer_idx):
+                continue
+            router = router_instances_list[router_offset]
+            idx = layer_idx if index_by_layer else moe_idx
+            router.set_target_indices(layers_topk_idx_reshape[idx].to(torch.int64))
+            router_offset += 1
+            moe_idx += 1
 
 
 class RouterReplayHelper:
