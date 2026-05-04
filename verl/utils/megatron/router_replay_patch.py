@@ -34,8 +34,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 class RouterReplayAction(Enum):
-    REPLAY_FORWARD = "replay_forward"
-    REPLAY_BACKWARD = "replay_backward"
+    REPLAY_FORWARD = "replay_forward" # 前向传播时使用
+    # REPLAY_BACKWARD = "replay_backward" # VPP backward 时使用
 
 
 class RouterReplay:
@@ -51,15 +51,12 @@ class RouterReplay:
     4. VPP Backward: Uses REPLAY_BACKWARD action
     """
 
-    router_instances = []
+    router_instances = [] # 全局管理所有 router 实例
 
     @staticmethod
     def set_replay_data(all_layers_topk_indices: list):
-        """
-        Distributes the topk indices for all layers to their respective RouterReplay instances.
-        :param all_layers_topk_indices: A list of tensors, where each tensor contains the
-                                        topk indices for a specific layer. The order
-                                        must match the instantiation order of the routers.
+        """将所有moe层的topk索引分发给各自的RouterReplay实例
+        all_layers_topk_indices: 张量列表，每个张量包含特定层的topk索引。顺序必须与TopKRouter实例化顺序匹配。
         """
         if len(all_layers_topk_indices) != len(RouterReplay.router_instances):
             raise ValueError(
@@ -67,50 +64,50 @@ class RouterReplay:
                 f"does not match the number of router instances ({len(RouterReplay.router_instances)})."
             )
         for i, router_instance in enumerate(RouterReplay.router_instances):
-            router_instance.set_target_indices(all_layers_topk_indices[i])
+            router_instance.set_target_indices(all_layers_topk_indices[i]) # 第i个路由实例存储第i层的topk索引
 
     @staticmethod
     def clear_global_indices():
-        """Clears the target topk indices in all instances."""
+        """将所有路由实例的target topk idx清空"""
         for router in RouterReplay.router_instances:
             router.clear_indices()
 
-    def __init__(self):
-        """Initializes a RouterReplay instance for a specific layer."""
-        self.target_topk_idx = None
-        self.router_replay_action = None
-        self.replay_backward_list = []
-        RouterReplay.router_instances.append(self)
-
-    def set_target_indices(self, topk_indices: torch.Tensor):
-        """Sets the target topk indices for replay."""
-        self.target_topk_idx = topk_indices
-        self.replay_backward_list.append(topk_indices)
-
-    def clear_indices(self):
-        """Clears the target topk indices."""
-        self.target_topk_idx = None
-        self.replay_backward_list = []
-
-    def set_router_replay_action(self, router_replay_action: RouterReplayAction):
-        """Sets the router replay action for this layer."""
-        self.router_replay_action = router_replay_action
-
-    def clear_router_replay_action(self):
-        """Clears the router replay action for this layer."""
-        self.router_replay_action = None
-
     @staticmethod
     def set_global_router_replay_action(router_replay_action: RouterReplayAction):
-        """Sets the router replay action for all router instances."""
+        """为所有路由实例设置router replay action."""
         for router in RouterReplay.router_instances:
             router.set_router_replay_action(router_replay_action)
 
     @staticmethod
     def clear_global_router_replay_action():
-        """Clears the router replay action for all router instances."""
+        """将所有路由实例的router replay action清空"""
         for router in RouterReplay.router_instances:
             router.clear_router_replay_action()
+
+    def __init__(self):
+        """初始化给定层的RouterReplay实例."""
+        self.target_topk_idx = None # 存储目标top-k索引
+        self.router_replay_action = None # 当前重放动作
+        # self.replay_backward_list = [] # VPP backward时使用
+        RouterReplay.router_instances.append(self)
+
+    def set_target_indices(self, topk_indices: torch.Tensor):
+        """为当前层设置目标top-k索引."""
+        self.target_topk_idx = topk_indices
+        # self.replay_backward_list.append(topk_indices) # VPP backward时使用，跟前向一致
+
+    def clear_indices(self):
+        """将当前层的target topk idx清空"""
+        self.target_topk_idx = None
+        # self.replay_backward_list = []
+
+    def set_router_replay_action(self, router_replay_action: RouterReplayAction):
+        """为当前层设置router replay action."""
+        self.router_replay_action = router_replay_action
+
+    def clear_router_replay_action(self):
+        """将当前层的router replay action清空"""
+        self.router_replay_action = None
 
 
 def _patched_topk_routing_with_score_function(
@@ -207,30 +204,6 @@ def _patched_topk_routing_with_score_function(
     return routing_probs, routing_map
 
 
-def _get_aux_loss_coeff(_self, aux_loss_type: str) -> float:
-    """Return the aux loss coeff for the given auxiliary loss type.
-    If the auxiliary loss type is not found, return 0.0.
-    """
-    if isinstance(_self.routing_type, str):
-        if _self.routing_type == aux_loss_type:
-            return _self.config.moe_aux_loss_coeff
-    if isinstance(_self.routing_type, list):
-        try:
-            idx = _self.routing_type.index(aux_loss_type)
-            return _self.config.moe_aux_loss_coeff[idx]
-        except (ValueError, IndexError):
-            return 0.0
-    return 0.0
-
-
-def _is_aux_loss_enabled(_self) -> bool:
-    """Check if the auxiliary loss is enabled."""
-    for aux_loss_type in ["aux_loss", "seq_aux_loss", "global_aux_loss"]:
-        if _get_aux_loss_coeff(_self, aux_loss_type) > 0:
-            return True
-    return False
-
-
 def patched_routing(self, logits: torch.Tensor, *args, **kwargs):
     """Top-k routing function
 
@@ -247,8 +220,6 @@ def patched_routing(self, logits: torch.Tensor, *args, **kwargs):
 
     logits = self.apply_z_loss(logits)
 
-    moe_router_fusion = getattr(self.config, "moe_router_fusion", False)
-
     if self.routing_type == "sinkhorn":
         probs, routing_map = self.sinkhorn_load_balancing(logits)
     else:
@@ -261,7 +232,7 @@ def patched_routing(self, logits: torch.Tensor, *args, **kwargs):
             scaling_factor=self.config.moe_router_topk_scaling_factor,
             score_function=self.score_function,
             expert_bias=self.expert_bias,
-            fused=moe_router_fusion,
+            fused=self.config.moe_router_fusion,
             router_replay=getattr(self, "router_replay", None),
         )
 
@@ -275,8 +246,6 @@ def patched_routing(self, logits: torch.Tensor, *args, **kwargs):
             pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
         )
 
-    if not hasattr(self, "is_aux_loss_enabled"):
-        self.is_aux_loss_enabled = types.MethodType(_is_aux_loss_enabled, self)
     if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
         routing_map_for_aux_loss, scores_for_aux_loss = compute_routing_scores_for_aux_loss(
             logits, self.topk, self.score_function, fused=self.config.moe_router_fusion
@@ -300,66 +269,50 @@ def apply_router_replay_patch():
     """
     print("Applying Router Replay Patch...")
     RouterReplay.router_instances.clear()
+    # Step 1: Patch TransformerConfig to include the feature flag
+    if not hasattr(TransformerConfig, "enable_routing_replay"):
+        # Add class attribute with default value
+        TransformerConfig.enable_routing_replay = False
 
-    try:
-        sig = inspect.signature(TransformerConfig.__init__)
-        native_params = sig.parameters
-        params = list(sig.parameters.values())
-    except Exception:
-        sig = None
-        native_params = {}
-        params = []
-
-    ext_attrs = ["enable_routing_replay"]
-
-    for attr in ext_attrs:
-        if attr not in native_params:
-            if sig:
-                new_param = inspect.Parameter(attr, inspect.Parameter.KEYWORD_ONLY, default=False)
-                if params and params[-1].kind == inspect.Parameter.VAR_KEYWORD:
-                    params.insert(-1, new_param)
-                else:
-                    params.append(new_param)
-
-    if sig:
-        try:
-            TransformerConfig.__init__.__signature__ = sig.replace(parameters=params)
-        except Exception as e:
-            print(f"Failed to update signature metadata: {e}")
-
-    if not hasattr(TransformerConfig, "_verl_router_patched"):
         original_tf_config_init = TransformerConfig.__init__
 
-        @wraps(original_tf_config_init)
+        # Define new __init__ method that safely handles enable_routing_replay parameter
         def patched_tf_config_init(self, *args, **kwargs):
-            enable_routing_replay = kwargs.get("enable_routing_replay", False)
-            if "enable_routing_replay" not in native_params:
-                enable_routing_replay = kwargs.pop("enable_routing_replay", False)
+            # Simple solution: remove the unknown parameter before calling original constructor
+            enable_routing_replay = kwargs.pop("enable_routing_replay", TransformerConfig.enable_routing_replay)
 
+            # Call original constructor with remaining kwargs
             original_tf_config_init(self, *args, **kwargs)
 
+            # Set the instance attribute
             self.enable_routing_replay = enable_routing_replay
 
+        # Apply the patch
         TransformerConfig.__init__ = patched_tf_config_init
-        TransformerConfig._verl_router_patched = True
 
+     # Step 2: Patch TopKRouter only once to ensure idempotency.
     if hasattr(TopKRouter, "_router_replay_patched"):
         return
 
     original_init = TopKRouter.__init__
 
+    # Step 3: Define the new __init__ method
     def patched_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         self.router_replay = None
-        if getattr(self.config, "enable_routing_replay", False):
+        if self.config.enable_routing_replay:
             self.router_replay = RouterReplay()
 
+    # Step 4: Patch MoEAlltoAllTokenDispatcher.preprocess to handle router replay
+    # When router replay is enabled, duplicate indices in top_indices can cause
+    # routing_map.sum() < num_tokens * topk, leading to split size mismatch in alltoall.
     if MoEAlltoAllTokenDispatcher is not None and not hasattr(MoEAlltoAllTokenDispatcher, "_preprocess_patched"):
         original_preprocess = MoEAlltoAllTokenDispatcher.preprocess
 
         def patched_preprocess(self, routing_map):
             result = original_preprocess(self, routing_map)
 
+            # Fix num_out_tokens when router replay is enabled
             if (
                 getattr(self.config, "enable_routing_replay", False)
                 and not self.drop_and_pad
@@ -369,6 +322,8 @@ def apply_router_replay_patch():
                     or getattr(self.config, "moe_router_padding_for_fp8", None)
                 )
             ):
+                # With router replay, duplicate indices can reduce the actual routed
+                # token count, so derive it from the routing map instead.
                 self.num_out_tokens = int(routing_map.sum().item())
 
             return result
@@ -376,6 +331,7 @@ def apply_router_replay_patch():
         MoEAlltoAllTokenDispatcher.preprocess = patched_preprocess
         MoEAlltoAllTokenDispatcher._preprocess_patched = True
 
+    # Step 5: Apply the patches
     TopKRouter.__init__ = patched_init
     TopKRouter.routing = patched_routing
     TopKRouter._router_replay_patched = True
