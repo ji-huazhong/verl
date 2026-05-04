@@ -288,69 +288,6 @@ def get_current_rank_layer_info(tf_config, vp_rank=None):
     return local
 
 
-def pp_gather(local_layers_router_map, tf_config):
-    """
-    Gather local router maps from all PP ranks into a global router map.
-
-    Args:
-        local_layers_router_map (torch.Tensor): Local router map of shape
-            [bs, max_seq_len, local_num_layers, topk].
-        tf_config: Configuration providing pipeline_model_parallel_size.
-
-    Returns:
-        torch.Tensor: Global router map of shape [bs, max_seq_len, num_layers, topk] placed on CPU.
-    """
-    pp_size = tf_config.pipeline_model_parallel_size
-    if pp_size <= 1:
-        return local_layers_router_map
-
-    pp_group = mpu.get_pipeline_model_parallel_group()
-    world_size = torch.distributed.get_world_size(pp_group)
-    local_layers_router_map = local_layers_router_map.to(device_name)
-    if local_layers_router_map.is_nested:
-        layers_topk_idx_global_list = [None] * world_size
-        torch.distributed.all_gather_object(layers_topk_idx_global_list, local_layers_router_map, pp_group)
-    else:
-        layers_topk_idx_global_list = [
-            torch.empty(
-                size=local_layers_router_map.shape,
-                dtype=local_layers_router_map.dtype,
-                device=local_layers_router_map.device,
-            )
-            for _ in range(world_size)
-        ]
-        torch.distributed.all_gather(
-            tensor=local_layers_router_map,
-            tensor_list=layers_topk_idx_global_list,
-            group=pp_group,
-            async_op=False,
-        )
-    vp_size = tf_config.virtual_pipeline_model_parallel_size
-    if vp_size is not None:
-        vpp_router_map_offset = [[] for _ in range(pp_size)]
-        for pp_stage in range(pp_size):
-            vpp_router_map_offset[pp_stage].append(0)
-            for vp_stage in range(vp_size):
-                num_layers_to_build = get_moe_num_layers_to_build(tf_config, vp_stage, pp_stage)
-                vpp_router_map_offset[pp_stage].append(num_layers_to_build + vpp_router_map_offset[pp_stage][-1])
-        layers_topk_idx_global = []
-        for vp_stage in range(vp_size):
-            for pp_stage in range(pp_size):
-                piece = slice(vpp_router_map_offset[pp_stage][vp_stage], vpp_router_map_offset[pp_stage][vp_stage + 1])
-                if layers_topk_idx_global_list[pp_stage].is_nested:
-                    nested_item = layers_topk_idx_global_list[pp_stage]
-                    sliced_tensors = [t[:, piece, :] for t in nested_item.unbind()]
-                    sliced_nested = torch.nested.as_nested_tensor(sliced_tensors, layout=torch.jagged)
-                    layers_topk_idx_global.append(sliced_nested)
-                else:
-                    layers_topk_idx_global.append(layers_topk_idx_global_list[pp_stage][:, :, piece, :])
-        global_router_map = torch.cat(layers_topk_idx_global, dim=2).to("cpu")
-    else:
-        global_router_map = torch.cat(layers_topk_idx_global_list, dim=2).to("cpu")
-
-    return global_router_map
-
-
 class RouterReplayHelper:
     """Helper class to query router replay state and locate local RouterReplay instances."""
 
