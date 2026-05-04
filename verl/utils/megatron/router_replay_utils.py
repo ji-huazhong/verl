@@ -31,14 +31,11 @@ except ImportError:
     pass
 
 from megatron.core import parallel_state as mpu
-from megatron.core.pipeline_parallel.schedules import get_schedule_table
-from megatron.core.tensor_parallel import gather_from_sequence_parallel_region, scatter_to_sequence_parallel_region
+from megatron.core.tensor_parallel import scatter_to_sequence_parallel_region
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 
 from verl.models.mcore.util import (
-    postprocess_packed_seqs,
-    postprocess_thd_no_padding,
     preprocess_packed_seqs,
     preprocess_thd_no_padding,
 )
@@ -224,45 +221,6 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config, vp_rank=N
             router.set_target_indices(layers_topk_idx_reshape[idx].to(torch.int64))
             router_offset += 1
             moe_idx += 1
-
-
-def reorder_and_merge_vpp_layers(
-    micro_batch_tensor_list,
-    num_microbatches: int,
-    vpp_size: int,
-    microbatch_group_size_per_vp_stage: int,
-) -> torch.Tensor:
-    """
-    Reorder and merge per-VPP layer blocks into a contiguous layer dimension.
-
-    Args:
-        micro_batch_tensor_list : the list of Input tensor.
-        num_microbatches (int): Number of microbatches per pipeline stage (bs).
-        vpp_size (int): Virtual pipeline parallel size (number of model chunks).
-        microbatch_group_size_per_vp_stage (int): Number of consecutive microbatches processed per VPP stage.
-
-    Returns:
-        torch.Tensor: Output tensor of shape [bs, max_token_len, layer_num, topk].
-    """
-    schedule_table = get_schedule_table(num_microbatches, vpp_size, microbatch_group_size_per_vp_stage)
-
-    tensor_by_chunk = [[] for _ in range(vpp_size)]
-    mini_tensor_list = []
-
-    for vidx, (_mb, chunk_id) in enumerate(schedule_table):
-        tensor_by_chunk[chunk_id].append(micro_batch_tensor_list[vidx])
-
-    if micro_batch_tensor_list[0].is_nested:
-        for chunk_id in range(vpp_size):
-            tensors = [tensor for nt in tensor_by_chunk[chunk_id] for tensor in nt.unbind()]
-            mini_tensor_list.append(torch.nested.as_nested_tensor(tensors, layout=torch.jagged))
-    else:
-        for chunk_id in range(vpp_size):
-            mini_tensor_list.append(torch.cat(tensor_by_chunk[chunk_id], dim=0))
-
-    out = torch.cat(mini_tensor_list, dim=2)
-
-    return out
 
 
 def get_current_rank_layer_info(tf_config, vp_rank=None):
