@@ -41,10 +41,7 @@ from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
 from verl.utils.megatron.router_replay_patch import RouterReplay
-from verl.utils.megatron.router_replay_utils import (
-    RouterReplayHelper,
-    set_router_replay_data,
-)
+from verl.utils.megatron.router_replay_utils import set_router_replay_data
 from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
 from verl.utils.megatron_utils import get_megatron_mtp_loss, get_model_config, unwrap_model
 from verl.utils.profiler import GPUMemoryLogger
@@ -601,7 +598,7 @@ class MegatronPPOActor(BasePPOActor):
             label_mask[:, : -response_length - 1] = False
             label_mask[:, -1] = False
 
-            if RouterReplayHelper.if_router_replay(self.tf_config):
+            if self.config.router_replay.mode == "R3":
                 layers_topk_idx = batch["routed_experts"]
                 set_router_replay_data(layers_topk_idx, attention_mask, self.tf_config)
 

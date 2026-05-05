@@ -22,7 +22,6 @@ NOTE: This version does NOT support Virtual Pipeline Parallel (VPP).
       If you need VPP support, please use the original version from git history.
 """
 
-import warnings
 from typing import Optional
 
 import torch
@@ -163,14 +162,17 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config):
             layers_topk_idx_rmpad, _, _ = preprocess_thd_no_padding(layers_topk_idx, pre_process=True)
         else:
             layers_topk_idx_rmpad, _ = preprocess_packed_seqs(layers_topk_idx, attention_mask, pre_process=True)
-        layers_topk_idx_rmpad = layers_topk_idx_rmpad.contiguous()
+        layers_topk_idx_rmpad = layers_topk_idx_rmpad.contiguous() # [1, 440, 4, 8]
+        # print(f">>>{os.getpid()}debug lcx ")
 
-        # 序列并行（SP/TP）切分
+        # 序列并行（SP/TP）切分，在sequence维度上进一步切分，因为经过cp预处理（packing，起始bsz维始终为1了）
         layers_topk_idx_rmpad_split = scatter_to_sequence_parallel_region(
             layers_topk_idx_rmpad.to(get_device_name()).squeeze(dim=0)
-        ).unsqueeze(dim=0)
+        ).unsqueeze(dim=0) # [1, 220, 4, 8]
 
         # 调整维度 + 流水线并行（PP）切分
+        # bsz seq_len num-layers topk -> bsz layers seq-len topk->layer, seq-len topk【去掉bsz维，并把layer维放到第一维】
+        # [4, 220, 8]
         layers_topk_idx_reshape = layers_topk_idx_rmpad_split.permute(0, 2, 1, 3).squeeze(dim=0)
         # 获取当前GPU负责哪几层
         local_rank_info = get_current_rank_layer_info(tf_config)
@@ -191,36 +193,3 @@ def set_router_replay_data(layers_topk_idx, attention_mask, tf_config):
             router.set_target_indices(layers_topk_idx_reshape[idx].to(torch.int64))
             router_offset += 1
             moe_idx += 1
-
-
-class RouterReplayHelper:
-    """帮当前GPU找到自己负责的那几个MoE路由器实例，并判断现在是否要重放前向
-    
-    Simplified version without VPP support.
-    """
-    
-    @staticmethod
-    def get_micro_batch_router_list(tf_config):
-        """
-        Return the list of RouterReplay instances corresponding to the current PP rank.
-        
-        Simplified version without VPP support - directly returns all router instances
-        for the current PP rank without VPP offset calculation.
-
-        Args:
-            tf_config: Configuration object used to compute layer assignments.
-            
-        Returns:
-            list: A list of RouterReplay.router_instances for the current PP rank.
-        """
-        num_layers_to_build = get_moe_num_layers_to_build(tf_config)
-        router_instances_list = RouterReplay.router_instances[:num_layers_to_build]
-        return router_instances_list
-
-    @staticmethod
-    def if_router_replay(tf_config) -> bool:
-        """Return True if target_topk_idx is set for the local router instances."""
-        router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config)
-        return (
-            router_instances_list and router_instances_list[0].target_topk_idx is not None
-        )

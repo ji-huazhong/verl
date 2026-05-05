@@ -222,11 +222,6 @@ def apply_router_replay_patch():
     """
     print("Applying Router Replay Patch (No VPP Support)...")
     
-    # Check if VPP is enabled
-    if hasattr(TransformerConfig, "virtual_pipeline_model_parallel_size"):
-        # This check will be performed at runtime when config is available
-        pass
-    
     RouterReplay.router_instances.clear()
     # Step 1: Patch TransformerConfig to include the feature flag
     if not hasattr(TransformerConfig, "enable_routing_replay"):

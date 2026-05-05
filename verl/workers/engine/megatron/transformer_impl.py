@@ -33,10 +33,7 @@ from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.megatron.pipeline_parallel import make_batch_generator
 from verl.utils.megatron.router_replay_patch import RouterReplay, apply_router_replay_patch
-from verl.utils.megatron.router_replay_utils import (
-    RouterReplayHelper,
-    set_router_replay_data,
-)
+from verl.utils.megatron.router_replay_utils import set_router_replay_data
 from verl.utils.megatron.tensor_parallel import vocab_parallel_entropy, vocab_parallel_log_probs_from_logits
 from verl.utils.megatron_peft_utils import add_base_layer_suffix, build_peft_config_for_vllm
 from verl.utils.megatron_utils import (
@@ -706,9 +703,11 @@ class MegatronEngineWithLMHead(MegatronEngine):
         multi_modal_inputs = model_inputs["multi_modal_inputs"]
         loss_mask = model_inputs["loss_mask"]
 
-        if RouterReplayHelper.if_router_replay(self.tf_config):
+        try:
             layers_topk_idx = model_inputs["routed_experts"]
             set_router_replay_data(layers_topk_idx, None, self.tf_config)
+        except Exception:
+            pass
 
         if pad_mode == DatasetPadMode.NO_PADDING:
             label = input_ids.clone()

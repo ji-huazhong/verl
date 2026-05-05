@@ -43,30 +43,30 @@ def _compute_fp8_thd_align_size(align_size: int) -> tuple[int, int]:
 def preprocess_packed_seqs(
     input_ids: torch.Tensor, attention_mask: torch.Tensor, pre_process: bool = True, use_fp8_padding: bool = False
 ) -> tuple[torch.Tensor, PackedSeqParams]:
-    """
+    """ 在seqlens维度把序列切成cp*2 chunks,每个cp_rank获取2chunk0，cp_rank=0，拿第一个和最后一个chunk
     Preprocess packed sequences
     CP splits sequence into CP*2 chunks, and each GPU gets 2 chunks (GPU0 gets first and last chunks, GPU1
     gets second and second last chunks, and so on), this is for load balancing with causal masking.
     See https://github.com/NVIDIA/TransformerEngine/issues/1368
     """
-    batch_size = input_ids.shape[0]
+    batch_size = input_ids.shape[0] # batch_size=2, input_ids: [2, 1280, 4, 8]
 
-    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
-    tp_size = mpu.get_tensor_model_parallel_world_size()
-    cp_size = mpu.get_context_parallel_world_size()
-    cp_rank = mpu.get_context_parallel_rank()
-    align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
+    seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32) # [batch_size] [438, 438]
+    tp_size = mpu.get_tensor_model_parallel_world_size() # 1
+    cp_size = mpu.get_context_parallel_world_size() # 2
+    cp_rank = mpu.get_context_parallel_rank() # 0/1
+    align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size # 4
     if use_fp8_padding:
         per_seq_align, total_align = _compute_fp8_thd_align_size(align_size)
         align_size = per_seq_align
 
-    pad_size = (align_size - seqlens_in_batch % align_size) % align_size
-    seqlens_in_batch_padded = seqlens_in_batch + pad_size
+    pad_size = (align_size - seqlens_in_batch % align_size) % align_size # tensor([2, 2])
+    seqlens_in_batch_padded = seqlens_in_batch + pad_size # seqlens_in_batch_padded=tensor([440, 440])
 
     cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=input_ids.device)
-    cu_seqlens[1:] = torch.cumsum(seqlens_in_batch, dim=0)
-    cu_seqlens_padded = torch.zeros(batch_size + 1, dtype=torch.int32, device=input_ids.device)
-    cu_seqlens_padded[1:] = torch.cumsum(seqlens_in_batch_padded, dim=0)
+    cu_seqlens[1:] = torch.cumsum(seqlens_in_batch, dim=0)  # cu_seqlens=tensor([0, 438, 876])
+    cu_seqlens_padded = torch.zeros(batch_size + 1, dtype=torch.int32, device=input_ids.device) # [0, 0, 0]
+    cu_seqlens_padded[1:] = torch.cumsum(seqlens_in_batch_padded, dim=0) #tensor([0, 440, 880])
 
     if use_fp8_padding:
         pad_size_last = (total_align - cu_seqlens_padded[-1] % total_align) % total_align
@@ -77,17 +77,17 @@ def preprocess_packed_seqs(
     # Move the index information needed in the subsequent loop to the CPU at once,
     # to avoid frequent .item() calls in the loop that cause D2H synchronization
     # ----------------------------------------------------------------------------
-    seqlens_in_batch_cpu: list[int] = seqlens_in_batch.tolist()  # original valid lengths
-    seqlens_in_batch_padded_cpu: list[int] = seqlens_in_batch_padded.tolist()  # lengths after padding
-    cu_seqlens_padded_cpu: list[int] = cu_seqlens_padded.tolist()  # start positions (after padding)
+    seqlens_in_batch_cpu: list[int] = seqlens_in_batch.tolist()  # [438, 438]
+    seqlens_in_batch_padded_cpu: list[int] = seqlens_in_batch_padded.tolist()  # lengths after padding  [440, 440]
+    cu_seqlens_padded_cpu: list[int] = cu_seqlens_padded.tolist()  # start positions (after padding) [0, 440, 880]
 
     # Pure Python int calculation to avoid further synchronization
-    max_seqlen_in_batch = max(seqlens_in_batch_padded_cpu)
+    max_seqlen_in_batch = max(seqlens_in_batch_padded_cpu) # max_seqlen_in_batch = 440
 
-    shape = list(input_ids.shape[1:])
-    shape[0] = sum(seqlens_in_batch_padded_cpu) // cp_size
+    shape = list(input_ids.shape[1:]) # [1280, 4, 8]
+    shape[0] = sum(seqlens_in_batch_padded_cpu) // cp_size # shape = [440, 4, 8]
     if pre_process:
-        input_ids_rmpad = torch.zeros(shape, dtype=input_ids.dtype, device=input_ids.device)
+        input_ids_rmpad = torch.zeros(shape, dtype=input_ids.dtype, device=input_ids.device) # shape = [440, 4, 8], 这里是padding过的
         for i in range(batch_size):
             # Use Python int, so no GPU→CPU sync in the loop
             if cp_size <= 1:
@@ -97,11 +97,11 @@ def preprocess_packed_seqs(
                 continue
 
             seqlen_padded_i = seqlens_in_batch_padded_cpu[i]
-            seqlen = seqlen_padded_i // cp_size
-            half_seqlen = seqlen // 2
+            seqlen = seqlen_padded_i // cp_size  # seqlens_in_batch_padded_cpu = [440, 440], i = 0，cp_szie=2,则seqlen = 440//2=220
+            half_seqlen = seqlen // 2 # half_seqlen = 110(i=0时)
             start_idx = cu_seqlens_padded_cpu[i] // cp_size
             # split to 2 chunks
-            d = input_ids[i, attention_mask[i]]
+            d = input_ids[i, attention_mask[i]] # i=0时input_ids[0, attention_mask[0]]的shape[438, 4, 8]
             input_ids_rmpad[start_idx : start_idx + half_seqlen] = d[
                 half_seqlen * cp_rank : half_seqlen * (cp_rank + 1)
             ]
@@ -125,6 +125,13 @@ def preprocess_packed_seqs(
         cu_seqlens_kv_padded=cu_seqlens_padded,
     )
     if pre_process:
+        # 总结：两条样本拼接后有效长度都是440，cp_size=2，分成cp_size*2=4个chunk
+        # 样本0和样本1独立处理：
+        # 样本0分成四块[0-110, 110-220, 220-330, 330-440]
+        # cp_rank0拿：0-110+330-440->合起来220
+        # cp_rank1拿：110-220， 220-330->合起来220
+        # 样本1同样处理，
+        # 对于rank0的input_ids_rmpad来说，前220存放样本0的，后220存放样本1的；rank1同理
         return input_ids_rmpad.unsqueeze(0), packed_seq_params
     else:
         return input_ids, packed_seq_params
