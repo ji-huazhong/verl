@@ -371,7 +371,6 @@ class RayWorkerGroup(WorkerGroup):
                     "WG_PREFIX": self.name_prefix,
                     "WG_BACKEND": "ray",
                     "RAY_LOCAL_WORLD_SIZE": str(local_world_size),
-                    "RAY_LOCAL_RANK": str(local_rank),
                 }
                 if rank != 0:
                     env_vars["MASTER_ADDR"] = self._master_addr

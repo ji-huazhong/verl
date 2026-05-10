@@ -61,7 +61,7 @@ gen_tp=2
 sp_size=2
 fsdp_size=-1
 
-python3 -m recipe.one_step_off_policy.main_ppo \
+python3 -m verl.trainer.main_ppo_async \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
     data.prompt_key=prompt \
