@@ -85,11 +85,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         from verl.workers.engine import BaseEngine, EngineRegistry
 
-        # TODO(jhz): Switch to `set_expandable_segments` when the torch_npu library
-        # supports `torch.npu.memory._set_allocator_settings`
-        if is_npu_available:
-            os.environ["PYTORCH_NPU_ALLOC_CONF"] = "expandable_segments:True"
-
         initialize_global_process_group_ray(timeout_second=None)
 
         set_numa_affinity()
