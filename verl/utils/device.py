@@ -149,8 +149,9 @@ def set_expandable_segments(enable: bool) -> None:
             torch.npu.memory._set_allocator_settings(f"expandable_segments:{enable}")
         except Exception:
             logger.warning(
-                "Current version of torch-npu does not support `_set_allocator_settings`, please upgrade torch-npu to 2.9.0 or later"
-            )  
+                "Current version of torch-npu does not support `_set_allocator_settings`, "
+                "please upgrade torch-npu to 2.9.0 or later"
+            )
 
 
 def auto_set_device(config) -> None:
