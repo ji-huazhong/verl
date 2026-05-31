@@ -298,6 +298,8 @@ def split_resource_pool(
         start_bundle_idx_list = np.cumsum([0] + split_size_list[:-1])
 
     # ensure resource_pool.pgs has been initialized
+    # NB(ji-huazhong): Some actors run on CPU-only nodes. We use a heuristic to detect the NPU backend
+    # by checking the torch-npu installation, via is_torch_npu_available(check_device=False).
     device = "npu" if is_torch_npu_available(check_device=False) else "cuda"
     placement_groups = resource_pool.get_placement_groups(device_name=device)
     split_resource_pools = [
