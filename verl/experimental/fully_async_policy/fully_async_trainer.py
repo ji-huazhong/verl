@@ -169,7 +169,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         replicas = await self.rollouter.get_replicas.remote()
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
         self.checkpoint_manager = CheckpointEngineManager(
-            config=checkpoint_engine_config, actor_wg=self.actor_wg, replicas=replicas
+            config=checkpoint_engine_config,
+            actor_wg=self.actor_wg,
+            replicas=replicas,
+            suspend_nccl_comms=self.config.actor_rollout_ref.actor.suspend_nccl_comms,
         )
         print("[FullyAsyncTrainer] Checkpoint manager initialized")
 
@@ -206,6 +209,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             config=checkpoint_engine_config,
             actor_wg=self.actor_rollout_wg,
             replicas=[],  # Start empty; will be populated below
+            suspend_nccl_comms=self.config.actor_rollout_ref.actor.suspend_nccl_comms,
         )
 
         # Restore original backend value

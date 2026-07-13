@@ -280,6 +280,7 @@ class PPOTrainer(ABC):
             config=checkpoint_engine_config,
             actor_wg=self.actor_rollout_wg,
             replicas=self.llm_server_manager.get_replicas(),
+            suspend_nccl_comms=self.config.actor_rollout_ref.actor.suspend_nccl_comms,
         )
         logger.info("checkpoint engine manager initialized")
 

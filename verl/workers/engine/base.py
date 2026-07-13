@@ -24,6 +24,7 @@ import torch
 from tensordict import TensorDict
 
 from verl.utils.device import get_device_name, get_vendor
+from verl.utils.reloadable_process_group import ResumeResult, SuspendResult
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 
 
@@ -225,6 +226,14 @@ class BaseEngine:
         Disable all adapters temporarily under the context in the model for LoRA
         """
         return nullcontext()
+
+    def suspend_nccl_comms(self) -> SuspendResult:
+        """Release GPU memory held by idle NCCL process groups."""
+        return SuspendResult(success=False, skipped_reason="not_implemented")
+
+    def resume_nccl_comms(self) -> ResumeResult:
+        """Reverse ``suspend_nccl_comms``. Backends override when supported."""
+        return ResumeResult(success=False, skipped_reason="not_implemented")
 
 
 class BaseEngineCtx:

@@ -502,6 +502,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
+        if self.config.actor.get("suspend_nccl_comms", False):
+            if self.config.actor.strategy != "megatron":
+                raise ValueError("suspend_nccl_comms is currently supported only by the Megatron CUDA engine")
+            from verl.utils.reloadable_process_group import install_reloadable_process_groups
+
+            # This must run before either a colocated ref or actor initializes
+            # Megatron parallel_state and creates its NCCL subgroups.
+            install_reloadable_process_groups()
+
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
 
         # 1. build reference model
@@ -748,6 +757,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         self.base_sync_done = True
         set_expandable_segments(True)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def suspend_training_nccl_comms(self):
+        """RPC entry: destroy reloadable NCCL process groups on this actor rank."""
+        if self.actor is None:
+            return None
+        return self.actor.engine.suspend_nccl_comms()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def resume_training_nccl_comms(self):
+        """RPC entry: recreate NCCL process groups on this actor rank."""
+        if self.actor is None:
+            return None
+        return self.actor.engine.resume_nccl_comms()
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):

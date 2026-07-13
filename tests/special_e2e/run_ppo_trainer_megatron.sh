@@ -152,6 +152,10 @@ DISCRETE=${DISCRETE:-True}  # or True
 USE_REMOVE_PADDING=${USE_REMOVE_PADDING:-False}
 ROUTING_REPLAY_MODE=${ROUTING_REPLAY_MODE:-"disabled"}
 
+# Opt into destroying idle Megatron NCCL process groups during rollout and
+# recreating them before training. This does not require a recent NCCL.
+SUSPEND_NCCL_COMMS=${SUSPEND_NCCL_COMMS:-False}
+
 if [ "$ROUTING_REPLAY_MODE" = "R3" ]; then
     ENABLE_ROLLOUT_ROUTING_REPLAY=True
 else
@@ -197,6 +201,7 @@ common_params=(
     actor_rollout_ref.actor.megatron.param_offload=${ACTOR_PARAM_OFFLOAD}
     actor_rollout_ref.actor.megatron.optimizer_offload=${ACTOR_OPTIMIZER_OFFLOAD}
     actor_rollout_ref.actor.megatron.grad_offload=${ACTOR_GRAD_OFFLOAD}
+    actor_rollout_ref.actor.suspend_nccl_comms=${SUSPEND_NCCL_COMMS}
     actor_rollout_ref.actor.megatron.use_dist_checkpointing=${USE_DIST_CKPT}
     actor_rollout_ref.actor.megatron.dist_checkpointing_path=${DIST_CKPT_PATH}
     actor_rollout_ref.actor.use_kl_loss=True

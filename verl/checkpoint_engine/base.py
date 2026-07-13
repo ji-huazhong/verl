@@ -25,6 +25,7 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.utils.distributed import initialize_global_process_group_ray
 from verl.utils.import_utils import import_external_libs
 from verl.utils.ray_utils import auto_await
+from verl.utils.reloadable_process_group import log_aggregate_summary
 from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.rollout import BaseRollout, RolloutReplica, get_rollout_class
 from verl.workers.rollout.utils import ensure_async_iterator
@@ -369,6 +370,8 @@ class CheckpointEngineManager:
         config: The checkpoint engine config.
         actor_wg: The actor worker group (the training side that produces weights).
         replicas: The list of rollout replicas.
+        suspend_nccl_comms: Whether to destroy idle Megatron NCCL subgroups
+            during rollout and recreate them before training.
     """
 
     def __init__(
@@ -376,6 +379,7 @@ class CheckpointEngineManager:
         config: CheckpointEngineConfig,
         actor_wg: RayWorkerGroup,
         replicas: list[RolloutReplica],
+        suspend_nccl_comms: bool = False,
     ) -> None:
         self.config = config
         self.backend = config.backend
@@ -383,6 +387,32 @@ class CheckpointEngineManager:
         self.backend_cls = CheckpointEngineRegistry.get(config.backend)
         self.actor_wg = actor_wg
         self.replicas = replicas
+        self.suspend_nccl_comms_enabled = suspend_nccl_comms
+
+    def _validate_suspend_mode_compat(self) -> None:
+        if not self.replicas:
+            return
+        from verl.workers.rollout.replica import RolloutMode
+
+        if self.replicas[0].rollout_mode is RolloutMode.STANDALONE:
+            raise ValueError(
+                "suspend_nccl_comms=True is not supported with STANDALONE rollout: "
+                "trainer and rollout do not share GPU memory"
+            )
+
+    def _suspend_training_nccl_comms(self) -> None:
+        if not self.suspend_nccl_comms_enabled:
+            return
+        self._validate_suspend_mode_compat()
+        results = self.actor_wg.suspend_training_nccl_comms()
+        log_aggregate_summary("suspend", results, size_attr="freed_mb", size_verb="freed")
+
+    def _resume_training_nccl_comms(self) -> None:
+        if not self.suspend_nccl_comms_enabled:
+            return
+        self._validate_suspend_mode_compat()
+        results = self.actor_wg.resume_training_nccl_comms()
+        log_aggregate_summary("resume", results, size_attr="reclaimed_mb", size_verb="reclaimed")
 
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for actor worker group and rollout replicas."""
@@ -430,8 +460,9 @@ class CheckpointEngineManager:
 
     @auto_await
     async def sleep_replicas(self):
-        """Sleep all rollout replicas: free weight and kv_cache device memory."""
+        """Sleep rollout replicas, then restore training NCCL process groups."""
         await asyncio.gather(*[r.sleep() for r in self.replicas])
+        self._resume_training_nccl_comms()
 
     @auto_await
     async def wake_up_replicas(self):
@@ -477,6 +508,7 @@ class CheckpointEngineManager:
         # 0. update weights for sync training with colocated actor and rollout
         if self.backend == "naive":
             ray.get(self.actor_wg.update_weights(global_steps=global_steps, mode=self.backend))
+            self._suspend_training_nccl_comms()
             return
 
         # 1. abort and save all unfinished requests for partial rollout
@@ -506,6 +538,10 @@ class CheckpointEngineManager:
             actor_wg.execute_checkpoint_engine(["finalize"] * actor_wg.world_size)
             + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
         )
+
+        # The training side is now quiescent. Release its NCCL communicator
+        # memory before rollout restores the KV cache.
+        self._suspend_training_nccl_comms()
 
         # 7. restore kv_cache after weight sync
         await self.resume_kv_cache_replicas()

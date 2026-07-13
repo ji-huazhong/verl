@@ -192,6 +192,9 @@ class ActorConfig(BaseConfig):
     # global_batch_size: global batch size
     global_batch_info: dict = field(default_factory=dict)
     qat: QATConfig = field(default_factory=QATConfig)
+    # Destroy and recreate idle Megatron NCCL process groups at phase
+    # boundaries to release communicator memory. This works with old NCCL.
+    suspend_nccl_comms: bool = False
 
     def __post_init__(self):
         """Validate actor configuration parameters."""

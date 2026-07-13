@@ -138,6 +138,9 @@ class MegatronEngine(BaseEngine):
     def _init_device_mesh(self):
         # TODO: set different parallelism for actor, critic, ref
         if mpu.is_initialized():
+            from verl.utils.reloadable_process_group import seal_reloadable_process_groups
+
+            seal_reloadable_process_groups()
             return
 
         extra_args = dict()
@@ -163,6 +166,10 @@ class MegatronEngine(BaseEngine):
             nccl_communicator_config_path=None,
             **extra_args,
         )
+
+        from verl.utils.reloadable_process_group import seal_reloadable_process_groups
+
+        seal_reloadable_process_groups()
 
     def _build_tf_config(self):
         from verl.utils.megatron_utils import mapping_string_to_attn_backend
@@ -828,6 +835,18 @@ class MegatronEngine(BaseEngine):
 
     def disable_adapter(self) -> ContextManager:
         return self.peft_cls.disable_adapter(self.module)
+
+    def suspend_nccl_comms(self):
+        """Destroy idle Megatron NCCL subgroups while preserving proxy identities."""
+        from verl.utils.reloadable_process_group import suspend_nccl_process_groups
+
+        return suspend_nccl_process_groups()
+
+    def resume_nccl_comms(self):
+        """Recreate NCCL subgroups destroyed by ``suspend_nccl_comms``."""
+        from verl.utils.reloadable_process_group import resume_nccl_process_groups
+
+        return resume_nccl_process_groups()
 
     def forward_step(self, batch_iter, model, logits_processor_func, postprocess_micro_batch_func):
         raise NotImplementedError("forward_step must be implemented in subclass")

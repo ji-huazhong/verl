@@ -311,3 +311,6 @@ qat:
   # Path to vLLM quantization config JSON file
   quantization_config_path: null
 
+# Destroy and recreate idle Megatron NCCL process groups between rollout and
+# training phases so rollout can use the released communicator memory.
+suspend_nccl_comms: false
