@@ -734,6 +734,7 @@ class MegatronEngine(BaseEngine):
             num_batches_divided_by=num_batches_divided_by,
             same_micro_num_in_dp=True,
             min_num_micro_batch=None,
+            model_config=self.model_config.hf_config,
         )
 
         if num_batches_divided_by is not None:

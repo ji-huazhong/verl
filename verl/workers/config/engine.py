@@ -77,6 +77,7 @@ class EngineRouterReplayConfig(BaseConfig):
 class EngineConfig(BaseConfig):
     _mutable_fields = BaseConfig._mutable_fields | {
         "use_dynamic_bsz",
+        "balance_by_flops",
         "max_token_len_per_gpu",
         "micro_batch_size_per_gpu",
         "infer_max_token_len_per_gpu",
@@ -100,6 +101,8 @@ class EngineConfig(BaseConfig):
     dtype: str = "bfloat16"  # ["bfloat16", "float16"]
     # whether to use dynamic bsz
     use_dynamic_bsz: bool = True
+    # whether to use model-aware FLOPs for dynamic micro-batch balancing
+    balance_by_flops: bool = False
     # for training
     max_token_len_per_gpu: int = None
     micro_batch_size_per_gpu: int = None
@@ -117,7 +120,8 @@ class EngineConfig(BaseConfig):
     router_replay: EngineRouterReplayConfig = field(default_factory=EngineRouterReplayConfig)
 
     def __post_init__(self):
-        pass
+        if self.balance_by_flops and not self.use_dynamic_bsz:
+            raise ValueError("balance_by_flops requires use_dynamic_bsz=True")
         # TODO: turn on this check after we reorg config
         # if self.use_dynamic_bsz:
         #     assert self.max_token_len_per_gpu is not None

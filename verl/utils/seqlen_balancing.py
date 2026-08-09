@@ -15,6 +15,7 @@
 import copy
 import heapq
 from itertools import chain
+from typing import Any
 
 import torch
 from torch import distributed as dist
@@ -22,27 +23,48 @@ from torch import distributed as dist
 from verl.protocol import DataProto
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_name
+from verl.utils.flops_counter import ESTIMATE_FUNC
 
 
-def calculate_workload(seqlen_list: torch.Tensor) -> torch.Tensor:
-    """Calculate approximate computational workload for transformer attention.
+def calculate_fwd_flops(seqlen_list: list[int], model_config: Any) -> int:
+    """Estimate packed decoder-only forward FLOPs from a Hugging Face model config.
 
-    Estimates FLOPs for dense transformer blocks based on sequence length using
-    the formula: FLOPs ≈ 12 * hidden_size² * seqlen + 2 * hidden_size * seqlen²
+    The estimate reuses the architecture-aware training FLOPs counter, removes
+    its input-embedding term, and converts forward+backward FLOPs to forward.
+    """
+    model_type = model_config.model_type
+    if model_type not in ESTIMATE_FUNC:
+        raise ValueError(f"Cannot estimate model FLOPs; unsupported model_type: {model_type}")
 
-    The constants are calibrated for a 7B model (hidden_size=4096), yielding:
-    workload ∝ 24576 * seqlen + seqlen²
+    config = getattr(model_config, "text_config", model_config)
+    seqlens = [int(seqlen) for seqlen in seqlen_list]
+    tokens_sum = sum(seqlens)
+    train_flops = round(ESTIMATE_FUNC[model_type](model_config, tokens_sum, seqlens, 1.0) * 1e12)
+    embedding_flops = 6 * tokens_sum * config.hidden_size * config.vocab_size
+    return (train_flops - embedding_flops) // 3
+
+
+def calculate_workload(seqlen_list: torch.Tensor, model_config: Any | None = None) -> torch.Tensor:
+    """Calculate per-sequence transformer workload.
+
+    When ``model_config`` is provided, returns model-aware forward FLOPs. When
+    omitted, preserves the historical 7B-calibrated relative workload proxy:
+    ``24576 * seqlen + seqlen²``.
+
+    The model-aware values are estimates rather than measured wall time;
+    communication, padding, kernel efficiency, and MoE routing skew are not
+    modeled.
 
     Args:
         seqlen_list: Sequence lengths as a tensor.
+        model_config: Optional Hugging Face model config used for FLOPs mode.
 
     Returns:
-        torch.Tensor: Estimated workload values proportional to actual FLOPs.
-
-    Note:
-        The returned values are relative workloads, not actual FLOP counts.
-        Useful for balancing computation across data parallel ranks.
+        torch.Tensor: Per-sequence workload values.
     """
+    if model_config is not None:
+        workloads = [calculate_fwd_flops([int(seqlen)], model_config) for seqlen in seqlen_list]
+        return torch.tensor(workloads, dtype=torch.int64, device=seqlen_list.device)
     return 24576 * seqlen_list + seqlen_list**2
 
 
@@ -354,6 +376,8 @@ def rearrange_micro_batches(
     min_num_micro_batch=None,
     use_dynamic_bsz_balance=True,
     force_group_size=1,
+    balance_by_flops=False,
+    model_config=None,
 ):
     """
     Split a batch into micro-batches by total token count, with optional DP sync and padding.
@@ -411,10 +435,13 @@ def rearrange_micro_batches(
     # upcast to int64 to avoid potential overflow im `calculate_workload` computation.
     seq_len_effective = seq_len_effective.long()
 
+    workload_config = model_config if balance_by_flops else None
+    assert not balance_by_flops or model_config is not None, "model_config is required when balance_by_flops=True"
+
     # When force_group_size > 1, aggregate workloads by groups
     if force_group_size > 1:
         # Calculate workload for each group (sum of workloads of samples in the group)
-        workloads_per_sample = calculate_workload(seq_len_effective)
+        workloads_per_sample = calculate_workload(seq_len_effective, model_config=workload_config)
         workloads_per_sample_grouped = workloads_per_sample.view(num_groups, force_group_size)
         group_workloads = workloads_per_sample_grouped.sum(dim=1).cpu().tolist()
 
@@ -434,7 +461,7 @@ def rearrange_micro_batches(
     else:
         # Original logic for force_group_size == 1
         # note that seq_len_effective is a GPU tensor. We need to make it a list to avoid D2H!
-        workloads = calculate_workload(seq_len_effective).cpu().tolist()
+        workloads = calculate_workload(seq_len_effective, model_config=workload_config).cpu().tolist()
         micro_bsz_idx = get_seqlen_balanced_partitions(workloads, num_micro_batches, equal_size=False)
 
     if use_dynamic_bsz_balance:
@@ -494,6 +521,8 @@ def prepare_dynamic_batch(
     same_micro_num_in_dp=True,
     min_num_micro_batch=None,
     use_dynamic_bsz_balance=True,
+    balance_by_flops=False,
+    model_config=None,
 ) -> tuple[list[DataProto], list[list[int]]]:
     """
     Prepare a batch for dynamic batching.
@@ -514,6 +543,8 @@ def prepare_dynamic_batch(
         same_micro_num_in_dp=same_micro_num_in_dp,
         min_num_micro_batch=min_num_micro_batch,
         use_dynamic_bsz_balance=use_dynamic_bsz_balance,
+        balance_by_flops=balance_by_flops,
+        model_config=model_config,
     )
     micro_batches = []
     for i, batch_idx in enumerate(batch_idx_list):
@@ -555,6 +586,7 @@ def get_group_balanced_partitions(
     seqlen_list: list[int],
     uid_list: list,
     k_partitions: int,
+    model_config: Any | None = None,
 ) -> list[list[int]]:
     """
     Partition samples into k groups while keeping samples with the same uid together.
@@ -603,7 +635,9 @@ def get_group_balanced_partitions(
     group_workloads = []
     for indices, total_seqlen in groups:
         # Use sum of individual workloads for more accurate estimation
-        workload = sum(int(calculate_workload(torch.tensor([seqlen_list[i]])).item()) for i in indices)
+        workload = sum(
+            int(calculate_workload(torch.tensor([seqlen_list[i]]), model_config=model_config).item()) for i in indices
+        )
         group_workloads.append(workload)
 
     # Use Karmarkar-Karp to partition groups

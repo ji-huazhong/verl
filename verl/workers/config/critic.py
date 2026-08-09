@@ -58,6 +58,7 @@ class CriticConfig(BaseConfig):
         ppo_mini_batch_size (int): PPO mini-batch size per update.
         ppo_micro_batch_size (Optional[int]): Global micro batch size (deprecated).
         use_dynamic_bsz (bool): Whether to automatically adjust batch size at runtime.
+        balance_by_flops (bool): Whether to balance dynamic micro-batches by model-aware FLOPs.
         ppo_max_token_len_per_gpu (int): Max tokens per GPU in one PPO batch.
         forward_max_token_len_per_gpu (int): Max token length per GPU in forward pass.
         ppo_epochs (int): Number of PPO epochs per batch.
@@ -84,6 +85,7 @@ class CriticConfig(BaseConfig):
     rollout_n: int = 1
     ppo_mini_batch_size: int = 1
     use_dynamic_bsz: bool = False
+    balance_by_flops: bool = False
     ppo_max_token_len_per_gpu: int = 32768
     # deprecate this
     forward_max_token_len_per_gpu: int = 32768
@@ -106,6 +108,8 @@ class CriticConfig(BaseConfig):
         """Validate critic configuration parameters."""
         assert self.strategy != MISSING
 
+        if self.balance_by_flops and not self.use_dynamic_bsz:
+            raise ValueError("[critic] balance_by_flops requires use_dynamic_bsz=True")
         if not self.use_dynamic_bsz:
             self._check_mutually_exclusive(self.ppo_micro_batch_size, self.ppo_micro_batch_size_per_gpu, "critic")
 

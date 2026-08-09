@@ -210,6 +210,15 @@ class TestCriticConfig:
     def test_critic_config_validation_logic(self):
         """Test the __post_init__ validation logic for CriticConfig."""
         optim = OptimizerConfig(lr=0.1)
+        with pytest.raises(ValueError, match="balance_by_flops requires use_dynamic_bsz=True"):
+            CriticConfig(
+                strategy="fsdp2",
+                ppo_micro_batch_size_per_gpu=2,
+                use_dynamic_bsz=False,
+                balance_by_flops=True,
+                optim=optim,
+            )
+
         valid_config = CriticConfig(
             strategy="fsdp2", ppo_micro_batch_size_per_gpu=2, use_dynamic_bsz=False, optim=optim
         )

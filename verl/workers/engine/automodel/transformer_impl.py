@@ -230,7 +230,10 @@ class AutomodelEngine(BaseEngine):
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
         micro_batches, indices = prepare_micro_batches(
-            data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
+            data=data,
+            dp_group=self.get_data_parallel_group(),
+            same_micro_num_in_dp=True,
+            model_config=self.model_config.hf_config,
         )
 
         output_lst = []

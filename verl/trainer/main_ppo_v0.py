@@ -226,6 +226,7 @@ class TaskRunner(BaseTaskRunner):
             val_dataset=val_dataset,
             collate_fn=collate_fn,
             train_sampler=train_sampler,
+            model_config=model_config,
         )
         # Initialize the workers of the trainer.
         trainer.init_workers()

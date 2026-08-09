@@ -87,12 +87,14 @@ def prepare_micro_batches(
     same_micro_num_in_dp=True,
     min_num_micro_batch=None,
     use_dynamic_bsz_balance=True,
+    model_config=None,
 ):
     """
     Prepare micro batches from data.
     """
     use_dynamic_bsz = tu.get_non_tensor_data(data=data, key="use_dynamic_bsz", default=True)
     sp_size = tu.get_non_tensor_data(data=data, key="sp_size", default=1)
+    balance_by_flops = tu.get_non_tensor_data(data=data, key="balance_by_flops", default=False)
 
     force_group_size = tu.get_non_tensor_data(data=data, key="force_group_size", default=1)
 
@@ -109,6 +111,8 @@ def prepare_micro_batches(
             min_num_micro_batch=min_num_micro_batch,
             use_dynamic_bsz_balance=use_dynamic_bsz_balance,
             force_group_size=force_group_size,
+            balance_by_flops=balance_by_flops,
+            model_config=model_config,
         )
     else:
         total_data_size = len(data)

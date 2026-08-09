@@ -116,6 +116,7 @@ class ActorConfig(BaseConfig):
             If None, uses ppo_micro_batch_size_per_gpu.
         ppo_micro_batch_size_per_gpu (Optional[int]): Micro-batch size per GPU for PPO training.
         use_dynamic_bsz (bool): Whether to use dynamic batch sizing.
+        balance_by_flops (bool): Whether to balance DP ranks and dynamic micro-batches by model-aware FLOPs.
         ppo_max_token_len_per_gpu (int): Maximum token length per GPU for PPO training.
         clip_ratio (float): PPO clipping ratio for policy loss.
         clip_ratio_low (float): Lower bound for PPO clipping ratio.
@@ -156,6 +157,7 @@ class ActorConfig(BaseConfig):
     ppo_micro_batch_size_per_gpu: Optional[int] = None
     ppo_infer_micro_batch_size_per_gpu: Optional[int] = None
     use_dynamic_bsz: bool = False
+    balance_by_flops: bool = False
     ppo_max_token_len_per_gpu: int = 16384
     ppo_infer_max_token_len_per_gpu: int = 16384
     clip_ratio: float = 0.2
@@ -200,6 +202,8 @@ class ActorConfig(BaseConfig):
         """Validate actor configuration parameters."""
         assert self.strategy != MISSING
         assert self.rollout_n != MISSING
+        if self.balance_by_flops and not self.use_dynamic_bsz:
+            raise ValueError("[actor] balance_by_flops requires use_dynamic_bsz=True")
         if not self.use_dynamic_bsz:
             if self.ppo_micro_batch_size is not None and self.ppo_micro_batch_size_per_gpu is not None:
                 raise ValueError(

@@ -306,6 +306,7 @@ class RayPPOTrainer:
         collate_fn=None,
         train_sampler: Optional[Sampler] = None,
         device_name=None,
+        model_config=None,
     ):
         """
         Initialize distributed PPO trainer with Ray backend.
@@ -329,6 +330,9 @@ class RayPPOTrainer:
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
+        if model_config is None and self.config.actor_rollout_ref.actor.get("balance_by_flops", False):
+            model_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.model)
+        self.model_config = model_config
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -809,6 +813,7 @@ class RayPPOTrainer:
             engine_config: EngineConfig = orig_critic_cfg.engine
             engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
             engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
+            engine_config.balance_by_flops = critic_cfg.balance_by_flops
 
             # Build the critic profiler config via the hydra path (same as the actor / ref / SFT),
             # so its tool_config entries are real dataclass instances the torch/nsys/npu backends can
@@ -1163,7 +1168,8 @@ class RayPPOTrainer:
         attention_mask = batch.batch["attention_mask"]
         batch_size = attention_mask.shape[0]
         global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)  # (train_batch_size,)
-        workload_lst = calculate_workload(global_seqlen_lst)
+        model_config = self.model_config.hf_config if self.config.actor_rollout_ref.actor.balance_by_flops else None
+        workload_lst = calculate_workload(global_seqlen_lst, model_config=model_config)
         # Get dp_size from dispatch info to correctly balance across data parallel ranks
         # Note: world_size may include tensor/pipeline parallel dimensions, but we only want DP
         dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
@@ -1191,6 +1197,7 @@ class RayPPOTrainer:
                 seqlen_list=seqlen_list,
                 uid_list=uid_list,
                 k_partitions=dp_size,
+                model_config=model_config,
             )
 
         elif keep_minibatch:

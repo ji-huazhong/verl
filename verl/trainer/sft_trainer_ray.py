@@ -89,6 +89,10 @@ class SFTTrainer:
 
         self.model_config = omega_conf_to_dataclass(self.config.model)
         self.engine_config = omega_conf_to_dataclass(self.config.engine)
+        self.engine_config.balance_by_flops = self.config.data.balance_by_flops
+        if self.config.data.balance_by_flops and not self.config.data.use_dynamic_bsz:
+            raise ValueError("data.balance_by_flops requires data.use_dynamic_bsz=True")
+
         self.optimizer_config = omega_conf_to_dataclass(self.config.optim)
         self.checkpoint_config = omega_conf_to_dataclass(self.config.checkpoint)
         self.profiler_config = omega_conf_to_dataclass(self.config.profiler)
@@ -310,7 +314,8 @@ class SFTTrainer:
 
                 if self.config.trainer.balance_batch:
                     global_seqlen_lst = torch.Tensor([item.size()[0] for item in data["input_ids"]])
-                    global_seqlen_lst = calculate_workload(global_seqlen_lst)
+                    model_config = self.model_config.hf_config if self.config.data.balance_by_flops else None
+                    global_seqlen_lst = calculate_workload(global_seqlen_lst, model_config=model_config)
                     dp_size = max(self.training_client._query_dispatch_info("train")) + 1
 
                     global_partition_lst = get_seqlen_balanced_partitions(

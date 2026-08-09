@@ -171,6 +171,16 @@ class TestActorConfig(unittest.TestCase):
     def test_actor_config_validation_exceptions(self):
         """Test that ActorConfig.__post_init__ raises appropriate validation exceptions."""
         optim = OptimizerConfig(lr=0.1)
+        with self.assertRaisesRegex(ValueError, "balance_by_flops requires use_dynamic_bsz=True"):
+            ActorConfig(
+                strategy="fsdp",
+                use_dynamic_bsz=False,
+                balance_by_flops=True,
+                ppo_micro_batch_size_per_gpu=1,
+                optim=optim,
+                rollout_n=1,
+            )
+
         with self.assertRaises((ValueError, AssertionError)) as cm:
             ActorConfig(
                 strategy="fsdp",

@@ -18,6 +18,10 @@ data:
   micro_batch_size_per_gpu: 4  # this is also val batch size
   max_token_len_per_gpu: 8192
   use_dynamic_bsz: True
+  # Balance DP ranks and dynamic micro-batches with model-aware forward FLOPs.
+  # The token budget is not a hard cap in this mode, so leave memory headroom.
+  balance_by_flops: False
+
   train_files: ~/data/gsm8k/train.parquet
   val_files: null
   train_max_samples: -1  # set to -1 to use full dataset

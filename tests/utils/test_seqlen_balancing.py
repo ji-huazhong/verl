@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -20,12 +22,127 @@ from verl import DataProto
 from verl.utils.device import get_device_name, get_nccl_backend, get_torch_device
 from verl.utils.model import create_random_mask
 from verl.utils.seqlen_balancing import (
+    calculate_fwd_flops,
+    calculate_workload,
     ceildiv,
     get_reverse_idx,
     prepare_dynamic_batch,
     rearrange_micro_batches,
     restore_dynamic_batch,
 )
+
+
+def _small_dense_config(**overrides):
+    values = {
+        "model_type": "llama",
+        "hidden_size": 16,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "vocab_size": 32,
+        "intermediate_size": 64,
+        "num_hidden_layers": 2,
+        "head_dim": 8,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _batch_with_lengths(seqlens: list[int]):
+    max_seqlen = max(seqlens)
+    input_ids = torch.zeros((len(seqlens), max_seqlen), dtype=torch.long)
+    attention_mask = torch.zeros_like(input_ids)
+    for row, seqlen in enumerate(seqlens):
+        attention_mask[row, :seqlen] = 1
+    return DataProto.from_single_dict({"input_ids": input_ids, "attention_mask": attention_mask}).batch
+
+
+def test_calculate_fwd_flops_dense_and_moe():
+    dense_config = _small_dense_config()
+    assert calculate_fwd_flops([4], dense_config) == 70656
+    assert calculate_fwd_flops([4, 6], dense_config) == (
+        calculate_fwd_flops([4], dense_config) + calculate_fwd_flops([6], dense_config)
+    )
+
+    moe_config = _small_dense_config(
+        model_type="qwen3_moe",
+        num_experts=8,
+        moe_intermediate_size=32,
+        num_experts_per_tok=2,
+    )
+    assert calculate_fwd_flops([4], moe_config) == 72704
+
+
+def test_calculate_fwd_flops_qwen3_5_moe_without_dense_intermediate_size():
+    text_config = _small_dense_config(
+        num_key_value_heads=1,
+        num_hidden_layers=4,
+        linear_conv_kernel_dim=4,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_num_key_heads=2,
+        linear_num_value_heads=4,
+        full_attention_interval=4,
+        num_experts=8,
+        moe_intermediate_size=8,
+        shared_expert_intermediate_size=4,
+        num_experts_per_tok=2,
+    )
+    del text_config.intermediate_size
+    config = SimpleNamespace(model_type="qwen3_5_moe", text_config=text_config)
+
+    assert calculate_fwd_flops([8], config) == 166400
+
+
+def test_calculate_fwd_flops_gpt_oss_moe_with_sliding_attention():
+    config = _small_dense_config(
+        model_type="gpt_oss",
+        num_key_value_heads=1,
+        num_hidden_layers=2,
+        intermediate_size=16,
+        num_local_experts=8,
+        num_experts_per_tok=2,
+        sliding_window=4,
+        layer_types=["sliding_attention", "full_attention"],
+    )
+
+    assert calculate_fwd_flops([8], config) == 89088
+
+
+def test_calculate_workload_uses_nested_text_config():
+    seqlens = torch.tensor([4, 6], dtype=torch.int64)
+    text_config = _small_dense_config()
+    multimodal_config = SimpleNamespace(model_type="qwen3_vl", text_config=text_config)
+
+    workloads = calculate_workload(seqlens, model_config=multimodal_config)
+
+    assert workloads.tolist() == [
+        calculate_fwd_flops([4], text_config),
+        calculate_fwd_flops([6], text_config),
+    ]
+
+
+def test_balance_by_flops_requires_model_config():
+    batch = _batch_with_lengths([4, 4])
+
+    with pytest.raises(AssertionError, match="model_config is required"):
+        rearrange_micro_batches(batch, max_token_len=4, balance_by_flops=True)
+
+
+def test_balance_by_flops_documents_soft_token_cap():
+    seqlens = [1, 1, 4, 13, 13]
+    token_cap = 16
+    batch = _batch_with_lengths(seqlens)
+
+    _, micro_batch_indices = rearrange_micro_batches(
+        batch,
+        max_token_len=token_cap,
+        use_dynamic_bsz_balance=False,
+        balance_by_flops=True,
+        model_config=_small_dense_config(),
+    )
+
+    token_sums = sorted(sum(seqlens[index] for index in micro_batch) for micro_batch in micro_batch_indices)
+    assert token_sums == [15, 17]
 
 
 def test_seqlen_balancing():

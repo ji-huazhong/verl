@@ -250,6 +250,7 @@ class PPOTrainer(ABC):
             critic_cfg: CriticConfig = omega_conf_to_dataclass(self.config.critic)
             critic_cfg.engine.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
             critic_cfg.engine.max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
+            critic_cfg.engine.balance_by_flops = critic_cfg.balance_by_flops
 
             # Wire the critic profiler config via the hydra path (real dataclass tool_config), so the
             # standalone critic TrainingWorker gets a working DistProfiler instead of a silent no-op.
@@ -645,10 +646,10 @@ class PPOTrainer(ABC):
 
     def _init_tokenizer(self):
         """Initialize tokenizer and processor from the model config."""
-        model_config: HFModelConfig = omega_conf_to_dataclass(self.config.actor_rollout_ref.model)
-        self.tokenizer = model_config.tokenizer
+        self.model_config: HFModelConfig = omega_conf_to_dataclass(self.config.actor_rollout_ref.model)
+        self.tokenizer = self.model_config.tokenizer
         # Used for multimodal LLM, could be None
-        self.processor = model_config.processor
+        self.processor = self.model_config.processor
 
     def _init_dataloader(self):
         """Initialize train and validate dataloader."""
@@ -1465,7 +1466,8 @@ class PPOTrainer(ABC):
         batch_multiple = self._get_required_batch_multiple(dp_size)
         batch = upsample_batch_to_divisible_size(batch, batch_multiple, self.tokenizer.eos_token_id)
         global_seqlen_lst = torch.tensor([tag["seq_len"] for tag in batch.tags], dtype=torch.int64)
-        workload_lst = calculate_workload(global_seqlen_lst)
+        model_config = self.model_config.hf_config if self.config.actor_rollout_ref.actor.balance_by_flops else None
+        workload_lst = calculate_workload(global_seqlen_lst, model_config=model_config)
 
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
         global_partition_lst = get_seqlen_balanced_partitions(workload_lst, k_partitions=dp_size, equal_size=True)

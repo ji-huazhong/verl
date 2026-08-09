@@ -157,6 +157,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 engine_config: FSDPEngineConfig = self.orig_critic_cfg.model.fsdp_config
                 engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
                 engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
+                engine_config.balance_by_flops = critic_cfg.balance_by_flops
             else:
                 raise NotImplementedError(f"Unknown strategy {self.orig_critic_cfg.strategy=}")
 

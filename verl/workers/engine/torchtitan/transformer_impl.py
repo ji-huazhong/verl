@@ -350,6 +350,7 @@ class TorchTitanEngine(BaseEngine):
             data=data,
             dp_group=self.get_data_parallel_group(),
             same_micro_num_in_dp=True,
+            model_config=self.model_config.hf_config,
         )
 
         output_lst = []

@@ -346,6 +346,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         default_keys = dict(
             use_remove_padding=self.model_config.get("use_remove_padding", False),
             use_dynamic_bsz=self.engine_config.use_dynamic_bsz,
+            balance_by_flops=self.engine_config.balance_by_flops,
             max_token_len_per_gpu=self.engine_config.max_token_len_per_gpu,
             micro_batch_size_per_gpu=self.engine_config.micro_batch_size_per_gpu,
             use_fused_kernels=self.engine_config.use_fused_kernels,
@@ -400,6 +401,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         default_keys = dict(
             use_remove_padding=self.model_config.get("use_remove_padding", False),
             use_dynamic_bsz=self.engine_config.use_dynamic_bsz,
+            balance_by_flops=self.engine_config.balance_by_flops,
             max_token_len_per_gpu=self.engine_config.infer_max_token_len_per_gpu,
             micro_batch_size_per_gpu=self.engine_config.infer_micro_batch_size_per_gpu,
             use_fused_kernels=self.engine_config.use_fused_kernels,
@@ -572,6 +574,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             # assign engine configs
             ref_training_config.engine_config.use_dynamic_bsz = self.config.ref.use_dynamic_bsz
+            ref_training_config.engine_config.balance_by_flops = self.config.ref.balance_by_flops
             ref_training_config.engine_config.infer_max_token_len_per_gpu = self.config.ref.ppo_max_token_len_per_gpu
             ref_training_config.engine_config.infer_micro_batch_size_per_gpu = (
                 self.config.ref.ppo_micro_batch_size_per_gpu
@@ -611,6 +614,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             # assign engine configs
             actor_training_config.engine_config.use_dynamic_bsz = self.config.actor.use_dynamic_bsz
+            actor_training_config.engine_config.balance_by_flops = self.config.actor.balance_by_flops
             actor_training_config.engine_config.infer_max_token_len_per_gpu = (
                 self.config.rollout.log_prob_max_token_len_per_gpu
             )
