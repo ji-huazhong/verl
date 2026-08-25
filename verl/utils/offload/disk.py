@@ -20,10 +20,9 @@ import atexit
 import errno
 import logging
 import os
-import re
 import shutil
+import tempfile
 import threading
-import uuid
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -39,19 +38,6 @@ logger = logging.getLogger(__name__)
 # FSDP may persist live gradients as internal companion state for split training phases.
 _COMPONENTS = frozenset({"param", "grad", "optimizer"})
 _ALIGNMENT = 4096
-
-
-def _safe_segment(value: str) -> str:
-    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
-    return value or "unknown"
-
-
-def _runtime_job_id() -> str:
-    for name in ("RAY_JOB_ID", "SLURM_JOB_ID", "JOB_ID"):
-        value = os.environ.get(name)
-        if value:
-            return _safe_segment(value)
-    return f"pid-{os.getpid()}"
 
 
 def _align(value: int, alignment: int = _ALIGNMENT) -> int:
@@ -76,7 +62,7 @@ class _StagingSlot:
 
 
 class DiskOffloadStore:
-    """Store component tensors in one reusable flat file per rank.
+    """Store each component in one reusable flat file.
 
     Calls remain synchronous at the API boundary, while two fixed-size CPU
     staging tensors pipeline accelerator copies with file I/O.  Disk offload
@@ -93,7 +79,6 @@ class DiskOffloadStore:
         rank: int,
         chunk_size_mb: int = 64,
         cleanup_on_exit: bool = True,
-        job_id: str | None = None,
     ) -> None:
         if not path:
             raise ValueError("disk offload path must not be empty")
@@ -108,15 +93,10 @@ class DiskOffloadStore:
         self._copy_stream = None
         self._io_executor: ThreadPoolExecutor | None = None
         self._layouts: dict[str, dict[str, TensorDiskMetadata]] = {}
-        self._owner_token = uuid.uuid4().hex
 
-        job_segment = _safe_segment(job_id or _runtime_job_id())
-        self.root = (
-            Path(path).expanduser().resolve() / f"job_{job_segment}" / f"rank_{rank:06d}" / f"store_{self._owner_token}"
-        )
-        self.root.mkdir(parents=True, exist_ok=True)
-        self._owner_path = self.root / ".owner"
-        self._owner_path.write_text(self._owner_token, encoding="utf-8")
+        base_path = Path(path).expanduser().resolve()
+        base_path.mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix=f"store_{rank}_", dir=base_path))
         if cleanup_on_exit:
             atexit.register(self.close)
 
@@ -471,9 +451,5 @@ class DiskOffloadStore:
                 self._io_executor = None
             self._staging_slots = None
             self._copy_stream = None
-            if not self.cleanup_on_exit or not self._owner_path.exists():
-                return
-            if self._owner_path.read_text(encoding="utf-8") != self._owner_token:
-                logger.warning("Refusing to clean disk offload directory with a mismatched owner marker: %s", self.root)
-                return
-            shutil.rmtree(self.root)
+            if self.cleanup_on_exit:
+                shutil.rmtree(self.root, ignore_errors=True)

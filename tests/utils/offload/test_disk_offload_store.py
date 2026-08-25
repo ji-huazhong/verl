@@ -24,7 +24,6 @@ def _new_store(tmp_path, *, cleanup_on_exit=False):
         rank=3,
         chunk_size_mb=1,
         cleanup_on_exit=cleanup_on_exit,
-        job_id="test-job",
     )
 
 
@@ -83,7 +82,7 @@ def test_disk_store_uses_one_data_file_per_component(tmp_path):
     store.write_tensors("param", [(f"tensor-{index}", torch.ones(4)) for index in range(10)])
 
     store_files = sorted(path.name for path in store.root.iterdir())
-    assert store_files == [".owner", "param.bin"]
+    assert store_files == ["param.bin"]
 
 
 def test_disk_store_only_cleans_its_owned_directory(tmp_path):
@@ -105,7 +104,6 @@ def test_disk_store_isolates_store_instances(tmp_path):
         rank=3,
         chunk_size_mb=1,
         cleanup_on_exit=False,
-        job_id="test-job",
     )
 
     first.write_tensors("param", [("weight", torch.tensor([1.0]))])
@@ -116,5 +114,7 @@ def test_disk_store_isolates_store_instances(tmp_path):
     second.read_tensors("param", [("weight", second_target)])
 
     assert first.root != second.root
+    assert first.root.name.startswith("store_3_")
+    assert second.root.name.startswith("store_3_")
     assert first_target.item() == 1.0
     assert second_target.item() == 2.0

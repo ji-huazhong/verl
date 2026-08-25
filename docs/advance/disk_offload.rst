@@ -139,13 +139,13 @@ combinations follow verl's existing configuration style and are checked with
 Disk layout and memory use
 --------------------------
 
-``offload.disk.path`` must point to fast node-local storage. verl creates an
-isolated scratch directory for every engine store, so colocated roles may share
-the same configured root without colliding. In a multi-node job, the same path
-must resolve to local storage on every node. For each component, a store uses
-one reusable flat data file (for example, ``param.bin`` or ``optimizer.bin``)
-and keeps tensor layout metadata in worker memory; it does not create one file
-per tensor.
+``offload.disk.path`` must point to fast node-local storage. verl creates a
+``store_<rank>_<random>`` temporary directory for every engine store, so
+colocated roles may share the same configured root without colliding. In a
+multi-node job, the same path must resolve to local storage on every node. For
+each component, a store uses one reusable flat data file (for example,
+``param.bin`` or ``optimizer.bin``) and keeps tensor layout metadata in worker
+memory; it does not create one file per tensor.
 
 Disk I/O is chunked and double-buffered. The public store call remains
 synchronous, but internally one pinned CPU buffer can perform file I/O while
@@ -156,10 +156,9 @@ retain up to ``2 * chunk_size_mb`` of staging memory without retaining a full
 user-space copy of the component. Operating-system page cache remains outside
 this bound. Accelerator storage is released only after the complete disk
 write returns successfully. The files are not crash-durable or recoverable
-after worker exit. ``cleanup_on_exit`` uses a Python exit handler and
-removes only the exact store directory carrying the store's ownership marker.
-Cleanup is best effort: abrupt worker or node termination can leave scratch
-directories behind.
+after worker exit. ``cleanup_on_exit`` uses a Python exit handler and removes
+only the temporary directory created by that store. Cleanup is best effort:
+abrupt worker or node termination can leave scratch directories behind.
 
 Provision enough capacity for the rank-local state of every disk-target
 component and engine store on a node. Parameter and optimizer files coexist.

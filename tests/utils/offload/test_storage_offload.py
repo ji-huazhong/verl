@@ -29,7 +29,6 @@ def _store(tmp_path):
         rank=0,
         chunk_size_mb=1,
         cleanup_on_exit=False,
-        job_id="storage-test",
     )
 
 

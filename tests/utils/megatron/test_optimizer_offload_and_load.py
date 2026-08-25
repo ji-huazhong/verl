@@ -202,7 +202,6 @@ def test_precision_aware_optimizer_disk_offload_and_load(tmp_path):
             rank=0,
             chunk_size_mb=1,
             cleanup_on_exit=False,
-            job_id="optimizer-test",
         )
         refs = offload_megatron_optimizer_to_disk(optimizer, store)
         assert refs
@@ -247,7 +246,6 @@ def test_megatron_param_disk_round_trip_reclaims_grad(tmp_path):
             rank=0,
             chunk_size_mb=1,
             cleanup_on_exit=False,
-            job_id="model-test",
         )
         refs = offload_megatron_model_to_disk(model_chunks, store)
         assert all(buffer.param_data.storage().size() == 0 for buffer in buffers)
