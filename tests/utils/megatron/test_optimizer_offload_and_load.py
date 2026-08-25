@@ -252,7 +252,6 @@ def test_megatron_param_and_live_grad_disk_round_trip(tmp_path):
         offload_megatron_model_to_disk(
             model_chunks,
             store,
-            offload_param=True,
             offload_grad=True,
             preserve_grad=True,
         )
@@ -262,7 +261,6 @@ def test_megatron_param_and_live_grad_disk_round_trip(tmp_path):
         load_megatron_model_from_disk(
             model_chunks,
             store,
-            load_param=True,
             load_grad=True,
         )
         for buffer, expected_param, expected_grad in zip(buffers, expected_params, expected_grads, strict=True):

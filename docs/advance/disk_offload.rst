@@ -40,7 +40,8 @@ Disk offload configuration
 Disk offload is configured per role and for each state type exposed by that
 backend. Optimizer state is typically the best candidate because it is large
 and inactive outside the optimizer step. The following example moves actor
-parameters and gradients to CPU and Megatron optimizer state to disk.
+parameters to CPU and Megatron optimizer state to disk. Gradient storage
+follows the parameter target.
 
 .. code-block:: yaml
 
@@ -50,8 +51,6 @@ parameters and gradients to CPU and Megatron optimizer state to disk.
          offload:
            param:
              target: cpu
-           grad:
-             target: cpu
            optimizer:
              target: disk
            disk:
@@ -60,9 +59,9 @@ parameters and gradients to CPU and Megatron optimizer state to disk.
              cleanup_on_exit: true
 
 Each component accepts ``none``, ``cpu``, or ``disk`` when its backend supports
-that target. Parameter and gradient disk targets remain available for jobs that
-cannot fit those inactive states in host memory. ``offload.disk.path`` is
-required when any component selects ``disk``.
+that target. A parameter target also controls gradient storage; there is no
+independent gradient target. ``offload.disk.path`` is required when any
+component selects ``disk``.
 
 Megatron and VeOmni reference parameters follow the actor's parameter target
 and disk settings unless explicitly overridden. FSDP references retain their
@@ -76,12 +75,13 @@ the legacy boolean or backend default to decide the effective policy. Use
 ``none`` to explicitly disable offload.
 
 For backward compatibility, each backend's existing boolean fields remain
-available temporarily. Megatron retains ``param_offload``, ``grad_offload``,
-and ``optimizer_offload``; other backends retain only the fields they already
-exposed. They emit a ``FutureWarning`` and map ``true`` to ``cpu`` and ``false``
-to ``none``. A legacy ``true`` cannot be combined with an explicit target for
-the same component. Although an explicit target takes precedence over a legacy
-``false``, new configurations should not mix the two forms.
+available temporarily. They emit a ``FutureWarning`` and map ``true`` to
+``cpu`` and ``false`` to ``none``. A legacy ``true`` cannot be combined with an
+explicit target for the same component. Although an explicit target takes
+precedence over a legacy ``false``, new configurations should not mix the two
+forms. Megatron's former ``grad_offload`` field is not retained because it did
+not control the runtime gradient lifecycle; existing configurations must remove
+that field.
 
 Disk-target support matrix
 --------------------------
@@ -91,41 +91,33 @@ Disk-target support matrix
 
    * - Backend
      - Disk param
-     - Disk grad
      - Disk optimizer
      - Result when configured
    * - Megatron
      - yes
      - yes
-     - yes
      - supported
    * - FSDP1 / FSDP2
      - yes
-     - implicit with param
      - yes
      - supported
    * - VeOmni
      - yes
-     - implicit with param
      - yes
      - supported
    * - Megatron-FSDP
-     - TBD
      - TBD
      - TBD
      - ``AssertionError`` during config validation
    * - MindSpeed / NPU
      - yes
      - yes
-     - yes
      - supported through Megatron
    * - AutoModel
      - TBD
      - TBD
-     - TBD
      - ``AssertionError`` during config validation
    * - FSDP Turbo / TorchTitan
-     - TBD
      - TBD
      - TBD
      - ``AssertionError`` during config validation
@@ -134,12 +126,11 @@ Disk-target support matrix
 but may be added in a future release. Configuring a TBD target currently raises
 the error shown in the final column rather than silently ignoring the target.
 
-This matrix covers ``target: disk`` only. FSDP1/FSDP2 and VeOmni do not expose
-``grad.target`` because their original offload interface did not expose an
-independent gradient switch. Gradient storage follows parameter placement, so
-``param.target: disk`` also serializes live gradients to disk and
-``param.target: cpu`` keeps the existing CPU behavior. TorchTitan likewise
-moves gradient storage with parameters for CPU offload and rejects disk targets.
+This matrix covers ``target: disk`` only. Gradient storage follows parameter
+placement for every backend: ``param.target: disk`` serializes live gradients
+when they must survive a phase boundary, while ``param.target: cpu`` keeps the
+existing CPU behavior. TorchTitan moves gradient storage with parameters for
+CPU offload and rejects disk targets.
 
 FSDP and VeOmni also reject combining disk targets with ``offload_policy`` and
 ``enable_fsdp_offload``, respectively. Invalid targets and unsupported
@@ -171,11 +162,13 @@ Cleanup is best effort: abrupt worker or node termination can leave scratch
 directories behind.
 
 Provision enough capacity for the rank-local state of every disk-target
-component and engine store on a node. Parameter, gradient, and optimizer files
-coexist, and colocated actor, reference, and critic stores are independent.
-The files are reused across phase transitions, but no cluster-wide capacity
-check runs before the first write. Production deployments should monitor free
-space and remove orphaned job directories according to their retention policy.
+component and engine store on a node. Parameter and optimizer files coexist;
+a parameter generation can also have an internal live-gradient file when a
+split training operation must preserve gradients. Colocated actor, reference,
+and critic stores are independent. The files are reused across phase
+transitions, but no cluster-wide capacity check runs before the first write.
+Production deployments should monitor free space and remove orphaned job
+directories according to their retention policy.
 
 FSDP1 flat parameters and FSDP2/VeOmni DTensors are restored in place. verl
 writes each unique rank-local backing storage once, including shared flat-buffer

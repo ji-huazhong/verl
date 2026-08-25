@@ -37,6 +37,7 @@ from verl.utils.device import get_device_name, get_torch_device, is_device_avail
 
 logger = logging.getLogger(__name__)
 
+# Live gradients are internal companion state when parameter offload spans split training phases.
 _COMPONENTS = frozenset({"param", "grad", "optimizer"})
 _ALIGNMENT = 4096
 

@@ -348,17 +348,14 @@ def offload_fsdp_model_to_disk(
     model,
     store: DiskOffloadStore,
     *,
-    offload_param: bool,
     offload_grad: bool,
     preserve_grad: bool,
 ) -> dict[str, list[StorageOffloadRef]]:
     """Persist selected FSDP local shards and release their storages in place."""
 
     _prepare_fsdp_model_for_disk(model)
-    refs: dict[str, list[StorageOffloadRef]] = {}
-    if offload_param:
-        refs["param"] = storage_offload_refs(_iter_fsdp_model_disk_tensors(model, "param"))
-        store.write_tensors("param", ((ref.key, ref.tensor) for ref in refs["param"]))
+    refs = {"param": storage_offload_refs(_iter_fsdp_model_disk_tensors(model, "param"))}
+    store.write_tensors("param", ((ref.key, ref.tensor) for ref in refs["param"]))
     if offload_grad and preserve_grad:
         refs["grad"] = storage_offload_refs(_iter_fsdp_model_disk_tensors(model, "grad"))
         store.write_tensors("grad", ((ref.key, ref.tensor) for ref in refs["grad"]))
@@ -385,13 +382,11 @@ def load_fsdp_model_from_disk(
     store: DiskOffloadStore,
     refs: dict[str, list[StorageOffloadRef]],
     *,
-    load_param: bool,
     load_grad: bool,
 ) -> None:
     """Restore FSDP local shards into their original storages."""
 
-    if load_param:
-        read_storage_refs(store, "param", refs.get("param", ()))
+    read_storage_refs(store, "param", refs.get("param", ()))
     if load_grad:
         read_storage_refs(store, "grad", refs.get("grad", ()))
     get_torch_device().empty_cache()

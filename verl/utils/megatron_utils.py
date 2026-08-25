@@ -661,7 +661,7 @@ def _clear_te_fp8_weight_workspaces(model_chunk):
 
 
 @torch.no_grad()
-def offload_megatron_model_to_cpu(models, *, offload_param=True, offload_grad=True, preserve_grad=False):
+def offload_megatron_model_to_cpu(models, *, offload_grad=True, preserve_grad=False):
     """
     In megatron, the model and optimizer storage are:
     - bf16 parameter data chunked in model parallel group
@@ -675,7 +675,7 @@ def offload_megatron_model_to_cpu(models, *, offload_param=True, offload_grad=Tr
             for buffers in model_chunk_all_buffers:
                 for buffer in buffers:
                     # offload parameters
-                    if offload_param and buffer.param_data.storage().size() > 0:
+                    if buffer.param_data.storage().size() > 0:
                         # Reuse a single pinned cpu_data buffer per DDP buffer.
                         # The previous implementation reallocated cpu_data via
                         # `.cpu().pin_memory()` on every offload. Python evaluates
@@ -716,8 +716,7 @@ def offload_megatron_model_to_cpu(models, *, offload_param=True, offload_grad=Tr
                         buffer.param_data.cpu_data.copy_(buffer.param_data.data, non_blocking=False)
                         buffer.param_data.storage().resize_(0)
 
-                    if offload_param:
-                        assert buffer.param_data_size == buffer.param_data.cpu_data.storage().size()
+                    assert buffer.param_data_size == buffer.param_data.cpu_data.storage().size()
 
                     if offload_grad and buffer.grad_data.storage().size() > 0:
                         # if the grad_data size is already zero, we assume that it is already offloaded
@@ -740,16 +739,15 @@ def offload_megatron_model_to_cpu(models, *, offload_param=True, offload_grad=Tr
             # Offload frozen parameters not in DDP buffers (e.g. base model in LoRA/PEFT)
             # DDP buffers only contain requires_grad=True params, so frozen params must be offloaded separately.
             for param in model_chunk.module.parameters():
-                if offload_param and not param.requires_grad and param.device.type != "cpu":
+                if not param.requires_grad and param.device.type != "cpu":
                     param.data = param.data.to("cpu", non_blocking=True)
         else:
             # we need this for ref module
             for _, param in model_chunk.named_parameters():
-                if offload_param:
-                    old_data = param.data
-                    param.data = param.data.to("cpu")
-                    if _can_safely_resize_storage(old_data):
-                        old_data.storage().resize_(0)
+                old_data = param.data
+                param.data = param.data.to("cpu")
+                if _can_safely_resize_storage(old_data):
+                    old_data.storage().resize_(0)
                 if offload_grad and param.grad is not None:
                     old_grad = param.grad
                     param.grad = param.grad.to("cpu")
@@ -758,7 +756,7 @@ def offload_megatron_model_to_cpu(models, *, offload_param=True, offload_grad=Tr
 
         # Drop Transformer-Engine FP8 weight-workspace caches, which hold quantized
         # copies of the weights on GPU and are not covered by the parameter offload above.
-        cleared = _clear_te_fp8_weight_workspaces(model_chunk) if offload_param else 0
+        cleared = _clear_te_fp8_weight_workspaces(model_chunk)
         if cleared:
             logger.debug("Cleared %d TE FP8 weight workspaces on offload", cleared)
 
@@ -767,7 +765,7 @@ def offload_megatron_model_to_cpu(models, *, offload_param=True, offload_grad=Tr
 
 
 @torch.no_grad()
-def load_megatron_model_to_gpu(models, load_param=True, load_grad=True, load_frozen_params=True):
+def load_megatron_model_to_gpu(models, load_grad=True, load_frozen_params=True):
     """
     Load megatron model to GPU.
     Args:
@@ -795,13 +793,13 @@ def load_megatron_model_to_gpu(models, load_param=True, load_grad=True, load_fro
                             # zero in-place with current storage.
                             buffer.grad_data.zero_()
 
-                    if load_param and buffer.param_data.storage().size() == 0:
+                    if buffer.param_data.storage().size() == 0:
                         buffer.param_data.storage().resize_(buffer.param_data_size)
                         # copy data from cpu to cuda
                         buffer.param_data.copy_(buffer.param_data.cpu_data, non_blocking=True)
 
             # Load frozen parameters that were offloaded (e.g. base model in LoRA/PEFT)
-            if load_param and load_frozen_params:
+            if load_frozen_params:
                 device_id = get_device_id()
                 for param in model_chunk.module.parameters():
                     if not param.requires_grad and param.device.type == "cpu":
@@ -810,8 +808,7 @@ def load_megatron_model_to_gpu(models, load_param=True, load_grad=True, load_fro
             # we need this for ref module
             device_id = get_device_id()
             for _, param in model_chunk.named_parameters():
-                if load_param:
-                    param.data = param.data.to(device_id, non_blocking=True)
+                param.data = param.data.to(device_id, non_blocking=True)
                 if load_grad and param.grad is not None:
                     param.grad = param.grad.to(device_id, non_blocking=True)
     gc.collect()
@@ -871,17 +868,15 @@ def offload_megatron_model_to_disk(
     models,
     store: DiskOffloadStore,
     *,
-    offload_param: bool,
     offload_grad: bool,
     preserve_grad: bool,
 ) -> None:
     """Persist selected model state and then release accelerator storage."""
 
     releases: list[tuple[torch.Tensor, str]] = []
-    if offload_param:
-        entries = list(_model_disk_entries(models, "param"))
-        store.write_tensors("param", ((key, tensor) for key, tensor, _ in entries))
-        releases.extend((tensor, strategy) for _, tensor, strategy in entries)
+    entries = list(_model_disk_entries(models, "param"))
+    store.write_tensors("param", ((key, tensor) for key, tensor, _ in entries))
+    releases.extend((tensor, strategy) for _, tensor, strategy in entries)
 
     if offload_grad and preserve_grad:
         entries = list(_model_disk_entries(models, "grad"))
@@ -897,11 +892,10 @@ def offload_megatron_model_to_disk(
         else:
             _empty_tensor_data(tensor)
 
-    if offload_param:
-        for model_chunk in models:
-            cleared = _clear_te_fp8_weight_workspaces(model_chunk)
-            if cleared:
-                logger.debug("Cleared %d TE FP8 weight workspaces on disk offload", cleared)
+    for model_chunk in models:
+        cleared = _clear_te_fp8_weight_workspaces(model_chunk)
+        if cleared:
+            logger.debug("Cleared %d TE FP8 weight workspaces on disk offload", cleared)
 
     gc.collect()
     get_torch_device().empty_cache()
@@ -929,21 +923,18 @@ def load_megatron_model_from_disk(
     models,
     store: DiskOffloadStore,
     *,
-    load_param: bool,
     load_grad: bool,
     load_frozen_params: bool = True,
 ) -> None:
     """Restore selected Megatron model state from a committed disk generation."""
 
-    if load_param:
-        entries = [
-            entry for entry in _model_disk_entries(models, "param") if load_frozen_params or ".frozen." not in entry[0]
-        ]
-        targets = [
-            (key, _prepare_disk_restore_tensor(store, "param", key, tensor, strategy))
-            for key, tensor, strategy in entries
-        ]
-        store.read_tensors("param", targets)
+    entries = [
+        entry for entry in _model_disk_entries(models, "param") if load_frozen_params or ".frozen." not in entry[0]
+    ]
+    targets = [
+        (key, _prepare_disk_restore_tensor(store, "param", key, tensor, strategy)) for key, tensor, strategy in entries
+    ]
+    store.read_tensors("param", targets)
 
     if load_grad:
         entries = list(_model_disk_entries(models, "grad"))

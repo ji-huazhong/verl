@@ -890,6 +890,7 @@ class FSDPEngine(BaseEngine):
     ) -> None:
         """Move selected FSDP state to its configured target."""
 
+        assert not grad or model, "FSDP gradient offload requires parameter offload in the same request"
         selected = {
             "param": model and self._is_offload_param and self._component_resident["param"],
             "grad": grad and self._is_offload_param and self._component_resident["grad"],
@@ -913,11 +914,10 @@ class FSDPEngine(BaseEngine):
 
         disk_param = selected["param"] and self._offload_targets["param"] == "disk"
         disk_grad = selected["grad"] and self._offload_targets["param"] == "disk"
-        if disk_param or disk_grad:
+        if disk_param:
             refs = offload_fsdp_model_to_disk(
                 self.module,
                 self._require_disk_store(),
-                offload_param=disk_param,
                 offload_grad=disk_grad,
                 preserve_grad=preserve_grad,
             )
@@ -940,6 +940,7 @@ class FSDPEngine(BaseEngine):
     def onload(self, *, model: bool = True, optimizer: bool = True, grad: bool = True) -> None:
         """Restore selected FSDP state from CPU or disk."""
 
+        assert not grad or model, "FSDP gradient onload requires parameter onload in the same request"
         selected = {
             "param": model and self._is_offload_param and not self._component_resident["param"],
             "grad": grad and self._is_offload_param and not self._component_resident["grad"],
@@ -950,11 +951,9 @@ class FSDPEngine(BaseEngine):
                 and not self._component_resident["optimizer"]
             ),
         }
-        assert not selected["grad"] or selected["param"], "FSDP gradient onload must be coupled with parameter onload"
-
         cpu_param = selected["param"] and self._offload_targets["param"] == "cpu"
         cpu_grad = selected["grad"] and self._offload_targets["param"] == "cpu"
-        if cpu_param:
+        if cpu_param or cpu_grad:
             self.to(device=get_device_name(), model=True, optimizer=False, grad=cpu_grad)
             self._component_resident["param"] = True
             if cpu_grad:
@@ -966,7 +965,6 @@ class FSDPEngine(BaseEngine):
             load_fsdp_model_from_disk(
                 self._require_disk_store(),
                 self._disk_refs,
-                load_param=disk_param,
                 load_grad=disk_grad and self._grad_preserved,
             )
             if disk_param:

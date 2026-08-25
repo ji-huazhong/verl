@@ -43,7 +43,7 @@ def _reset_mindspeed_offload_state(engine, device: str, *, model: bool, optimize
 
     model = model and engine.is_param_offload_enabled
     optimizer = optimizer and engine.is_optimizer_offload_enabled
-    grad = grad and engine.is_grad_offload_enabled
+    grad = grad and engine.is_param_offload_enabled
     if model or optimizer or grad:
         reset_fp8_reuse_quantized_weight(engine, device, model, optimizer, grad)
 

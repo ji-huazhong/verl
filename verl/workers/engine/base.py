@@ -55,17 +55,6 @@ class BaseEngine:
         """Whether optimizer offloading is enabled."""
         raise NotImplementedError
 
-    @property
-    def is_grad_offload_enabled(self) -> bool:
-        """Whether gradient offloading is enabled.
-
-        Existing engines historically move gradient buffers together with
-        parameters.  They inherit this compatibility default; engines with an
-        independent gradient policy should override it.
-        """
-
-        return self.is_param_offload_enabled
-
     def train_mode(self, **kwargs):
         """
         Context manager entry for switching the engine and model into training mode.
@@ -347,11 +336,7 @@ class BaseEngineCtx:
     def _context_switch(self, device, *, preserve_grad=None):
         if self.disable_auto_offload:
             return
-        if not (
-            self.engine.is_param_offload_enabled
-            or self.engine.is_grad_offload_enabled
-            or self.engine.is_optimizer_offload_enabled
-        ):
+        if not (self.engine.is_param_offload_enabled or self.engine.is_optimizer_offload_enabled):
             return
         is_onload = device != "cpu"
         if self.mode == "eval":
@@ -363,7 +348,7 @@ class BaseEngineCtx:
             kwargs = {
                 "model": self.engine.is_param_offload_enabled,
                 "optimizer": self.engine.is_optimizer_offload_enabled,
-                "grad": self.engine.is_grad_offload_enabled,
+                "grad": self.engine.is_param_offload_enabled,
             }
             if is_onload:
                 self.engine.onload(**kwargs)
