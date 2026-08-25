@@ -562,20 +562,20 @@ class VeOmniEngine(FSDPEngine):
         from .utils import veomni_shard_export
 
         manual_offload = not getattr(self, "_uses_fsdp2_cpu_offload_policy", False)
-        was_resident = self._component_resident["param"]
-        cpu_offload_back = manual_offload and self._offload_targets["param"] == "cpu" and not was_resident
-        if manual_offload:
-            if self._is_offload_param:
-                self.onload(model=True, optimizer=False, grad=False)
-            else:
-                load_veomni_model_to_gpu(self.module)
+        offload_back = (
+            manual_offload and self._offload_targets["param"] == "cpu" and not self._component_resident["param"]
+        )
+        if manual_offload and self._is_offload_param:
+            self.onload(model=True, optimizer=False, grad=False)
+        elif manual_offload:
+            load_veomni_model_to_gpu(self.module)
         gen, meta = veomni_shard_export(self.module)
 
         def _with_offload_back():
             yield from gen
             self.offload(model=True, optimizer=False, grad=False)
 
-        return (_with_offload_back() if cpu_offload_back else gen), meta
+        return (_with_offload_back() if offload_back else gen), meta
 
     def _hf_delta_entry(self, name, spec, place, lidx, lval):
         """veomni's per-param entry builder: EP/converter specs (fused expert
@@ -601,11 +601,10 @@ class VeOmniEngine(FSDPEngine):
         # per-DTensor .to(device).full_tensor() in param_generator() below stages each
         # shard instead, so the manual whole-model move is unnecessary under CPU offload.
         manual_offload = not getattr(self, "_uses_fsdp2_cpu_offload_policy", False)
-        if manual_offload:
-            if self._is_offload_param:
-                self.onload(model=True, optimizer=False, grad=False)
-            else:
-                load_veomni_model_to_gpu(self.module)
+        if manual_offload and self._is_offload_param:
+            self.onload(model=True, optimizer=False, grad=False)
+        elif manual_offload:
+            load_veomni_model_to_gpu(self.module)
 
         # TODO: currently only for DeepseekV4, unify all models to export weights by converter.
         converter = get_checkpoint_tensor_converter(self.module)

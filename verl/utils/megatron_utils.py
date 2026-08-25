@@ -820,8 +820,13 @@ def _model_disk_entries(models) -> Iterator[tuple[str, torch.Tensor]]:
 
 
 @torch.no_grad()
-def _discard_megatron_grad(models) -> None:
-    """Apply verl's existing post-zero-grad storage reclamation."""
+def offload_megatron_model_to_disk(
+    models,
+    store: DiskOffloadStore,
+) -> list[StorageOffloadRef]:
+    """Persist selected model state and then release accelerator storage."""
+
+    refs = write_storage_refs(store, "param", _model_disk_entries(models))
 
     for model_chunk in models:
         if isinstance(model_chunk, DDP):
@@ -834,18 +839,6 @@ def _discard_megatron_grad(models) -> None:
             for param in model_chunk.parameters():
                 param.grad = None
 
-
-@torch.no_grad()
-def offload_megatron_model_to_disk(
-    models,
-    store: DiskOffloadStore,
-) -> list[StorageOffloadRef]:
-    """Persist selected model state and then release accelerator storage."""
-
-    refs = write_storage_refs(store, "param", _model_disk_entries(models))
-    _discard_megatron_grad(models)
-
-    for model_chunk in models:
         cleared = _clear_te_fp8_weight_workspaces(model_chunk)
         if cleared:
             logger.debug("Cleared %d TE FP8 weight workspaces on disk offload", cleared)

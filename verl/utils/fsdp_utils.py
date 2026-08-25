@@ -361,12 +361,6 @@ def load_fsdp_model_from_disk(
         read_storage_refs(store, "grad", refs.get("grad", ()))
 
 
-def _optimizer_instances(optimizer) -> list:
-    if getattr(optimizer, "_is_multi_optimizer", False):
-        return list(optimizer.optimizers_dict.values())
-    return [optimizer]
-
-
 def _iter_nested_tensors(value, prefix: str) -> Iterator[tuple[str, torch.Tensor]]:
     if isinstance(value, torch.Tensor):
         yield prefix, value
@@ -379,7 +373,10 @@ def _iter_nested_tensors(value, prefix: str) -> Iterator[tuple[str, torch.Tensor
 
 
 def _iter_fsdp_optimizer_disk_tensors(optimizer) -> Iterator[tuple[str, torch.Tensor]]:
-    for optimizer_index, current_optimizer in enumerate(_optimizer_instances(optimizer)):
+    optimizers = (
+        optimizer.optimizers_dict.values() if getattr(optimizer, "_is_multi_optimizer", False) else (optimizer,)
+    )
+    for optimizer_index, current_optimizer in enumerate(optimizers):
         for group_index, group in enumerate(current_optimizer.param_groups):
             for param_index, param in enumerate(group["params"]):
                 state = current_optimizer.state.get(param, {})

@@ -876,11 +876,6 @@ class FSDPEngine(BaseEngine):
         else:
             raise ValueError(f"Invalid device type: {device}")
 
-    def _require_disk_store(self) -> DiskOffloadStore:
-        if self._disk_store is None:
-            raise RuntimeError("FSDP disk offload was requested without an initialized disk store")
-        return self._disk_store
-
     def offload(
         self,
         *,
@@ -891,42 +886,35 @@ class FSDPEngine(BaseEngine):
         """Move selected FSDP state to its configured target."""
 
         assert not grad or model, "FSDP gradient offload requires parameter offload in the same request"
-        selected = {
-            "param": model and self._is_offload_param and self._component_resident["param"],
-            "optimizer": (
-                optimizer
-                and self.optimizer is not None
-                and self._is_offload_optimizer
-                and self._component_resident["optimizer"]
-            ),
-        }
+        offload_param = model and self._is_offload_param and self._component_resident["param"]
+        offload_optimizer = (
+            optimizer
+            and self.optimizer is not None
+            and self._is_offload_optimizer
+            and self._component_resident["optimizer"]
+        )
+        disk_offloaded = False
 
-        cpu_param = selected["param"] and self._offload_targets["param"] == "cpu"
-        if cpu_param:
-            self.to(device="cpu", model=True, optimizer=False, grad=grad)
+        if offload_param:
+            if self._offload_targets["param"] == "cpu":
+                self.to(device="cpu", model=True, optimizer=False, grad=grad)
+            else:
+                assert self._disk_store is not None, "FSDP disk offload store is not initialized"
+                refs = offload_fsdp_model_to_disk(self.module, self._disk_store, offload_grad=grad)
+                self._disk_refs.update(refs)
+                disk_offloaded = True
             self._component_resident["param"] = False
 
-        disk_param = selected["param"] and self._offload_targets["param"] == "disk"
-        if disk_param:
-            refs = offload_fsdp_model_to_disk(
-                self.module,
-                self._require_disk_store(),
-                offload_grad=grad,
-            )
-            self._disk_refs.update(refs)
-            self._component_resident["param"] = False
-
-        disk_optimizer = selected["optimizer"] and self._offload_targets["optimizer"] == "disk"
-        if selected["optimizer"]:
+        if offload_optimizer:
             if self._offload_targets["optimizer"] == "cpu":
                 self.to(device="cpu", model=False, optimizer=True, grad=False)
             else:
-                self._disk_refs["optimizer"] = offload_fsdp_optimizer_to_disk(
-                    self.optimizer, self._require_disk_store()
-                )
+                assert self._disk_store is not None, "FSDP disk offload store is not initialized"
+                self._disk_refs["optimizer"] = offload_fsdp_optimizer_to_disk(self.optimizer, self._disk_store)
+                disk_offloaded = True
             self._component_resident["optimizer"] = False
 
-        if disk_param or disk_optimizer:
+        if disk_offloaded:
             gc.collect()
             get_torch_device().empty_cache()
 
@@ -934,34 +922,28 @@ class FSDPEngine(BaseEngine):
         """Restore selected FSDP state from CPU or disk."""
 
         assert not grad or model, "FSDP gradient onload requires parameter onload in the same request"
-        selected = {
-            "param": model and self._is_offload_param and not self._component_resident["param"],
-            "optimizer": (
-                optimizer
-                and self.optimizer is not None
-                and self._is_offload_optimizer
-                and not self._component_resident["optimizer"]
-            ),
-        }
-        cpu_param = selected["param"] and self._offload_targets["param"] == "cpu"
-        if cpu_param:
-            self.to(device=get_device_name(), model=True, optimizer=False, grad=grad)
+        onload_param = model and self._is_offload_param and not self._component_resident["param"]
+        onload_optimizer = (
+            optimizer
+            and self.optimizer is not None
+            and self._is_offload_optimizer
+            and not self._component_resident["optimizer"]
+        )
+
+        if onload_param:
+            if self._offload_targets["param"] == "cpu":
+                self.to(device=get_device_name(), model=True, optimizer=False, grad=grad)
+            else:
+                assert self._disk_store is not None, "FSDP disk offload store is not initialized"
+                load_fsdp_model_from_disk(self._disk_store, self._disk_refs, load_grad=grad)
             self._component_resident["param"] = True
 
-        disk_param = selected["param"] and self._offload_targets["param"] == "disk"
-        if disk_param:
-            load_fsdp_model_from_disk(
-                self._require_disk_store(),
-                self._disk_refs,
-                load_grad=grad,
-            )
-            self._component_resident["param"] = True
-
-        if selected["optimizer"]:
+        if onload_optimizer:
             if self._offload_targets["optimizer"] == "cpu":
                 self.to(device=get_device_name(), model=False, optimizer=True, grad=False)
             else:
-                load_fsdp_optimizer_from_disk(self._require_disk_store(), self._disk_refs["optimizer"])
+                assert self._disk_store is not None, "FSDP disk offload store is not initialized"
+                load_fsdp_optimizer_from_disk(self._disk_store, self._disk_refs["optimizer"])
             self._component_resident["optimizer"] = True
 
     @contextmanager

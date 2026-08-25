@@ -38,16 +38,6 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-def _reset_mindspeed_offload_state(engine, device: str, *, model: bool, optimizer: bool, grad: bool) -> None:
-    """Preserve MindSpeed's transfer hook around the offload lifecycle API."""
-
-    model = model and engine.is_param_offload_enabled
-    optimizer = optimizer and engine.is_optimizer_offload_enabled
-    grad = grad and engine.is_param_offload_enabled
-    if model or optimizer or grad:
-        reset_fp8_reuse_quantized_weight(engine, device, model, optimizer, grad)
-
-
 def _mindspeed_repatch(engine_config):
     if repatch is not None:
         from verl.utils.megatron_utils import mapping_string_to_attn_backend
@@ -65,6 +55,13 @@ def _mindspeed_repatch(engine_config):
 
 
 class _MindspeedOffloadMixin:
+    def _reset_offload_state(self, device: str, *, model: bool, optimizer: bool, grad: bool) -> None:
+        model = model and self.is_param_offload_enabled
+        optimizer = optimizer and self.is_optimizer_offload_enabled
+        grad = grad and self.is_param_offload_enabled
+        if model or optimizer or grad:
+            reset_fp8_reuse_quantized_weight(self, device, model, optimizer, grad)
+
     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
         """
         Move model parameters, optimizer states, or both to the specified device.
@@ -85,12 +82,11 @@ class _MindspeedOffloadMixin:
         optimizer: bool = True,
         grad: bool = True,
     ) -> None:
-        _reset_mindspeed_offload_state(self, "cpu", model=model, optimizer=optimizer, grad=grad)
+        self._reset_offload_state("cpu", model=model, optimizer=optimizer, grad=grad)
         super().offload(model=model, optimizer=optimizer, grad=grad)
 
     def onload(self, *, model: bool = True, optimizer: bool = True, grad: bool = True, **kwargs) -> None:
-        _reset_mindspeed_offload_state(
-            self,
+        self._reset_offload_state(
             get_device_name(),
             model=model,
             optimizer=optimizer,

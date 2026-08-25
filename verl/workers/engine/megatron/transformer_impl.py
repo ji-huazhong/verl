@@ -773,11 +773,6 @@ class MegatronEngine(BaseEngine):
         else:
             raise ValueError(f"Invalid device type: {device}")
 
-    def _require_disk_store(self) -> DiskOffloadStore:
-        if self._disk_store is None:
-            raise RuntimeError("Megatron disk offload was requested without an initialized disk store")
-        return self._disk_store
-
     def offload(
         self,
         *,
@@ -788,42 +783,35 @@ class MegatronEngine(BaseEngine):
         """Move selected Megatron state to its configured target."""
 
         assert not grad or model, "Megatron gradient offload requires parameter offload in the same request"
-        selected = {
-            "param": model and self._is_offload_param and self._component_resident["param"],
-            "optimizer": (
-                optimizer
-                and self.optimizer is not None
-                and self._is_offload_optimizer
-                and self._component_resident["optimizer"]
-            ),
-        }
+        offload_param = model and self._is_offload_param and self._component_resident["param"]
+        offload_optimizer = (
+            optimizer
+            and self.optimizer is not None
+            and self._is_offload_optimizer
+            and self._component_resident["optimizer"]
+        )
+        disk_offloaded = False
 
-        cpu_param = selected["param"] and self._offload_targets["param"] == "cpu"
-        if cpu_param:
-            offload_megatron_model_to_cpu(self.module)
+        if offload_param:
+            if self._offload_targets["param"] == "cpu":
+                offload_megatron_model_to_cpu(self.module)
+            else:
+                assert self._disk_store is not None, "Megatron disk offload store is not initialized"
+                self._disk_refs["param"] = offload_megatron_model_to_disk(self.module, self._disk_store)
+                disk_offloaded = True
             self._component_resident["param"] = False
             self._frozen_params_resident = False
 
-        disk_param = selected["param"] and self._offload_targets["param"] == "disk"
-        if disk_param:
-            self._disk_refs["param"] = offload_megatron_model_to_disk(
-                self.module,
-                self._require_disk_store(),
-            )
-            self._component_resident["param"] = False
-            self._frozen_params_resident = False
-
-        disk_optimizer = selected["optimizer"] and self._offload_targets["optimizer"] == "disk"
-        if selected["optimizer"]:
+        if offload_optimizer:
             if self._offload_targets["optimizer"] == "cpu":
                 offload_megatron_optimizer(self.optimizer)
             else:
-                self._disk_refs["optimizer"] = offload_megatron_optimizer_to_disk(
-                    self.optimizer, self._require_disk_store()
-                )
+                assert self._disk_store is not None, "Megatron disk offload store is not initialized"
+                self._disk_refs["optimizer"] = offload_megatron_optimizer_to_disk(self.optimizer, self._disk_store)
+                disk_offloaded = True
             self._component_resident["optimizer"] = False
 
-        if disk_param or disk_optimizer:
+        if disk_offloaded:
             gc.collect()
             get_torch_device().empty_cache()
 
@@ -838,45 +826,40 @@ class MegatronEngine(BaseEngine):
         """Restore selected Megatron state from CPU or disk."""
 
         assert not grad or model, "Megatron gradient onload requires parameter onload in the same request"
-        selected = {
-            "param": (
-                model
-                and self._is_offload_param
-                and (not self._component_resident["param"] or (load_frozen_params and not self._frozen_params_resident))
-            ),
-            "optimizer": (
-                optimizer
-                and self.optimizer is not None
-                and self._is_offload_optimizer
-                and not self._component_resident["optimizer"]
-            ),
-        }
-        cpu_param = selected["param"] and self._offload_targets["param"] == "cpu"
-        if cpu_param:
-            load_megatron_model_to_gpu(
-                self.module,
-                load_grad=grad,
-                load_frozen_params=load_frozen_params,
-            )
-            self._component_resident["param"] = True
-            if load_frozen_params:
+        onload_param = (
+            model
+            and self._is_offload_param
+            and (not self._component_resident["param"] or (load_frozen_params and not self._frozen_params_resident))
+        )
+        onload_optimizer = (
+            optimizer
+            and self.optimizer is not None
+            and self._is_offload_optimizer
+            and not self._component_resident["optimizer"]
+        )
+
+        if onload_param:
+            if self._offload_targets["param"] == "cpu":
+                load_megatron_model_to_gpu(
+                    self.module,
+                    load_grad=grad,
+                    load_frozen_params=load_frozen_params,
+                )
+                if load_frozen_params:
+                    self._frozen_params_resident = True
+            else:
+                assert self._disk_store is not None, "Megatron disk offload store is not initialized"
+                load_megatron_model_from_disk(self._disk_store, self._disk_refs["param"])
+                load_megatron_model_to_gpu(self.module, load_grad=grad, load_frozen_params=False)
                 self._frozen_params_resident = True
-
-        disk_param = selected["param"] and self._offload_targets["param"] == "disk"
-        if disk_param:
-            load_megatron_model_from_disk(
-                self._require_disk_store(),
-                self._disk_refs["param"],
-            )
-            load_megatron_model_to_gpu(self.module, load_grad=grad, load_frozen_params=False)
             self._component_resident["param"] = True
-            self._frozen_params_resident = True
 
-        if selected["optimizer"]:
+        if onload_optimizer:
             if self._offload_targets["optimizer"] == "cpu":
                 load_megatron_optimizer(self.optimizer)
             else:
-                load_megatron_optimizer_from_disk(self._require_disk_store(), self._disk_refs["optimizer"])
+                assert self._disk_store is not None, "Megatron disk offload store is not initialized"
+                load_megatron_optimizer_from_disk(self._disk_store, self._disk_refs["optimizer"])
             self._component_resident["optimizer"] = True
 
     @contextmanager
