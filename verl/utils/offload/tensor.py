@@ -103,8 +103,8 @@ def storage_offload_refs(tensors: Iterable[tuple[str, torch.Tensor]]) -> list[St
             continue
 
         storage = tensor.untyped_storage()
-        storage_id = storage._cdata
-        existing = seen.get(storage_id)
+        storage_ptr = storage.data_ptr()
+        existing = seen.get(storage_ptr)
         if existing is not None:
             if existing.tensor.dtype != tensor.dtype or existing.tensor.device != tensor.device:
                 raise ValueError(f"Storage {key!r} is aliased through incompatible tensor views")
@@ -133,7 +133,7 @@ def storage_offload_refs(tensors: Iterable[tuple[str, torch.Tensor]]) -> list[St
             storage=storage,
             nbytes=nbytes,
         )
-        seen[storage_id] = ref
+        seen[storage_ptr] = ref
         refs.append(ref)
     return refs
 
@@ -161,7 +161,11 @@ def write_storage_refs(
 def read_storage_refs(store: DiskOffloadStore, component: str, refs: Iterable[StorageOffloadRef]) -> None:
     """Resize previously released storages and restore the committed bytes."""
 
-    resolved = [(ref, store.metadata(component, ref.key)) for ref in refs]
+    refs = list(refs)
+    if not refs:
+        return
+    metadata = store.metadata_many(component, (ref.key for ref in refs))
+    resolved = list(zip(refs, metadata, strict=True))
     # Validate the complete generation before resizing any live storage. A
     # stale/missing later entry must not leave earlier tensors half-restored.
     for ref, metadata in resolved:

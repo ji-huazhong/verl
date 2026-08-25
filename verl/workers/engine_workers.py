@@ -159,11 +159,34 @@ class TrainingWorker(Worker, DistProfilerExtension):
     def to(self, device, model=True, optimizer=True, grad=True):
         """Manual control of load/offload"""
         assert device in ["cpu", "device"]
+        assert not grad or model, "Gradient buffers must be moved together with model parameters"
 
-        if device == "device":
-            device = get_device_name()
+        managed_model = model and self.engine_config.get_offload_target("param") != "none"
+        managed_optimizer = optimizer and self.engine_config.get_offload_target("optimizer") != "none"
+        if managed_model or managed_optimizer:
+            if device == "device":
+                self.engine.onload(
+                    model=managed_model,
+                    optimizer=managed_optimizer,
+                    grad=grad and managed_model,
+                )
+            else:
+                self.engine.offload(
+                    model=managed_model,
+                    optimizer=managed_optimizer,
+                    grad=grad and managed_model,
+                )
 
-        self.engine.to(device=device, model=model, optimizer=optimizer, grad=grad)
+        manual_model = model and not managed_model
+        manual_optimizer = optimizer and not managed_optimizer
+        if manual_model or manual_optimizer:
+            target = get_device_name() if device == "device" else "cpu"
+            self.engine.to(
+                device=target,
+                model=manual_model,
+                optimizer=manual_optimizer,
+                grad=grad and manual_model,
+            )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_loss_fn(self, loss_fn):
@@ -756,7 +779,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":
             if effective_mode == "delta_sharded":
-                # The delta engine owns seed and snapshot state, so it drives export itself.
+                # the delta engine owns the sync state machine (seed vs steady,
+                # snapshot prime), so it drives the training engine itself.
                 metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
             else:
                 per_tensor_param, _ = self.actor.engine.get_per_tensor_param()

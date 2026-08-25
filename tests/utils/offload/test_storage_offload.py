@@ -85,12 +85,18 @@ def test_fsdp_style_model_param_and_grad_round_trip(tmp_path):
         model,
         store,
         offload_grad=True,
-        preserve_grad=True,
     )
     assert all(param.untyped_storage().nbytes() == 0 for param in model.parameters())
     assert all(param.grad.untyped_storage().nbytes() == 0 for param in model.parameters())
     assert model.scale.untyped_storage().nbytes() == 0
 
+    load_fsdp_model_from_disk(store, refs, load_grad=False)
+    assert all(param.untyped_storage().nbytes() > 0 for param in model.parameters())
+    assert all(param.grad.untyped_storage().nbytes() == 0 for param in model.parameters())
+
+    refreshed_refs = offload_fsdp_model_to_disk(model, store, offload_grad=False)
+    assert "grad" not in refreshed_refs
+    refs.update(refreshed_refs)
     load_fsdp_model_from_disk(store, refs, load_grad=True)
 
     assert [id(param) for param in model.parameters()] == param_ids

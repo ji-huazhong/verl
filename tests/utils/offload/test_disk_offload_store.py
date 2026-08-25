@@ -40,7 +40,6 @@ def test_disk_store_round_trip_and_layout_reuse(tmp_path):
     store.write_tensors("param", [("first", first), ("second", second)])
     first_metadata = store.metadata("param", "first")
     second_metadata = store.metadata("param", "second")
-    assert first_metadata.device_type == "cpu"
     state_path = store.root / "param" / "state.bin"
     initial_file_size = state_path.stat().st_size
 
@@ -69,7 +68,7 @@ def test_disk_store_rejects_uncommitted_generation(tmp_path):
     store = _new_store(tmp_path)
     tensor = torch.ones(8, dtype=torch.float32)
     store.write_tensors("grad", [("grad", tensor)])
-    store.invalidate("grad")
+    (store.root / "grad" / "generation").unlink()
 
     with pytest.raises(RuntimeError, match="No committed grad"):
         store.read_tensors("grad", [("grad", tensor)])

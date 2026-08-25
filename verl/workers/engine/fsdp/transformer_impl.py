@@ -142,6 +142,7 @@ class FSDPEngine(BaseEngine):
         if self.engine_config.full_determinism:
             enable_full_determinism(seed=self.engine_config.seed)
 
+        # set FSDP offload params
         self._init_offload_state()
         self._is_lora = self.model_config.lora_rank > 0
         # Set in _build_fsdp_module when FSDP2 CPUOffloadPolicy is configured (see #5995).
@@ -189,9 +190,7 @@ class FSDPEngine(BaseEngine):
         }
         self._is_offload_param = self._offload_targets["param"] != "none"
         self._is_offload_optimizer = self._offload_targets["optimizer"] != "none"
-        self._component_resident = {"param": True, "grad": True, "optimizer": True}
-        self._grad_preserved = False
-        self._disk_refs = {"param": [], "grad": [], "optimizer": []}
+        self._reset_offload_residency()
         self._disk_store = None
         if "disk" in self._offload_targets.values():
             disk_config = self.engine_config.offload.disk
@@ -201,6 +200,10 @@ class FSDPEngine(BaseEngine):
                 chunk_size_mb=disk_config.chunk_size_mb,
                 cleanup_on_exit=disk_config.cleanup_on_exit,
             )
+
+    def _reset_offload_residency(self) -> None:
+        self._component_resident = {"param": True, "optimizer": True}
+        self._disk_refs = {"param": [], "grad": [], "optimizer": []}
 
     def is_mp_src_rank_with_outputs(self):
         if self.ulysses_device_mesh is not None:
@@ -217,6 +220,7 @@ class FSDPEngine(BaseEngine):
         Sets up checkpoint manager and FLOPs counter.
         """
         # This is used to import external_lib into the huggingface systems
+        self._reset_offload_residency()
         self._build_model_optimizer()
 
         self.checkpoint_manager = FSDPCheckpointManager(
@@ -232,7 +236,6 @@ class FSDPEngine(BaseEngine):
             model=self._is_offload_param,
             optimizer=self._is_offload_optimizer,
             grad=self._is_offload_param,
-            preserve_grad=False,
         )
 
         log_gpu_memory_usage("After offload model/optimizer/grad during init", logger=logger)
@@ -423,11 +426,9 @@ class FSDPEngine(BaseEngine):
 
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh, zero3_enable=self.engine_config.reshard_after_forward)
-        explicit_offload_policy = any(
-            getattr(self.engine_config.offload, component).target is not None for component in ("param", "optimizer")
-        )
+        explicit_param_offload = self.engine_config.offload.param.target is not None
         use_forward_cpu_offload = self.engine_config.forward_only and (
-            self._offload_targets["param"] == "cpu" or not explicit_offload_policy
+            self._offload_targets["param"] == "cpu" or not explicit_param_offload
         )
 
         # Note: We force turn off CPUOffload because it causes incorrect results when using grad accumulation
@@ -886,14 +887,12 @@ class FSDPEngine(BaseEngine):
         model: bool = True,
         optimizer: bool = True,
         grad: bool = True,
-        preserve_grad: bool = True,
     ) -> None:
         """Move selected FSDP state to its configured target."""
 
         assert not grad or model, "FSDP gradient offload requires parameter offload in the same request"
         selected = {
             "param": model and self._is_offload_param and self._component_resident["param"],
-            "grad": grad and self._is_offload_param and self._component_resident["grad"],
             "optimizer": (
                 optimizer
                 and self.optimizer is not None
@@ -901,32 +900,21 @@ class FSDPEngine(BaseEngine):
                 and self._component_resident["optimizer"]
             ),
         }
-        assert not selected["grad"] or selected["param"], "FSDP gradient offload must be coupled with parameter offload"
 
         cpu_param = selected["param"] and self._offload_targets["param"] == "cpu"
-        cpu_grad = selected["grad"] and self._offload_targets["param"] == "cpu"
         if cpu_param:
-            self.to(device="cpu", model=True, optimizer=False, grad=cpu_grad)
+            self.to(device="cpu", model=True, optimizer=False, grad=grad)
             self._component_resident["param"] = False
-            if cpu_grad:
-                self._component_resident["grad"] = False
-                self._grad_preserved = preserve_grad
 
         disk_param = selected["param"] and self._offload_targets["param"] == "disk"
-        disk_grad = selected["grad"] and self._offload_targets["param"] == "disk"
         if disk_param:
             refs = offload_fsdp_model_to_disk(
                 self.module,
                 self._require_disk_store(),
-                offload_grad=disk_grad,
-                preserve_grad=preserve_grad,
+                offload_grad=grad,
             )
             self._disk_refs.update(refs)
-            if disk_param:
-                self._component_resident["param"] = False
-            if disk_grad:
-                self._component_resident["grad"] = False
-                self._grad_preserved = preserve_grad
+            self._component_resident["param"] = False
 
         if selected["optimizer"]:
             if self._offload_targets["optimizer"] == "cpu":
@@ -943,7 +931,6 @@ class FSDPEngine(BaseEngine):
         assert not grad or model, "FSDP gradient onload requires parameter onload in the same request"
         selected = {
             "param": model and self._is_offload_param and not self._component_resident["param"],
-            "grad": grad and self._is_offload_param and not self._component_resident["grad"],
             "optimizer": (
                 optimizer
                 and self.optimizer is not None
@@ -952,28 +939,18 @@ class FSDPEngine(BaseEngine):
             ),
         }
         cpu_param = selected["param"] and self._offload_targets["param"] == "cpu"
-        cpu_grad = selected["grad"] and self._offload_targets["param"] == "cpu"
-        if cpu_param or cpu_grad:
-            self.to(device=get_device_name(), model=True, optimizer=False, grad=cpu_grad)
+        if cpu_param:
+            self.to(device=get_device_name(), model=True, optimizer=False, grad=grad)
             self._component_resident["param"] = True
-            if cpu_grad:
-                self._component_resident["grad"] = True
 
         disk_param = selected["param"] and self._offload_targets["param"] == "disk"
-        disk_grad = selected["grad"] and self._offload_targets["param"] == "disk"
-        if disk_param or (disk_grad and self._grad_preserved):
+        if disk_param:
             load_fsdp_model_from_disk(
                 self._require_disk_store(),
                 self._disk_refs,
-                load_grad=disk_grad and self._grad_preserved,
+                load_grad=grad,
             )
-            if disk_param:
-                self._component_resident["param"] = True
-            if disk_grad and self._grad_preserved:
-                self._component_resident["grad"] = True
-        if disk_grad and not self._grad_preserved:
-            # Gradients discarded after zero_grad are recreated by autograd.
-            self._component_resident["grad"] = True
+            self._component_resident["param"] = True
 
         if selected["optimizer"]:
             if self._offload_targets["optimizer"] == "cpu":
@@ -983,20 +960,19 @@ class FSDPEngine(BaseEngine):
             self._component_resident["optimizer"] = True
 
     @contextmanager
-    def resident(self, *, model: bool = False, optimizer: bool = False, grad: bool = False):
+    def resident(self, *, model: bool = False, optimizer: bool = False):
         """Temporarily make selected state resident and restore its prior placement."""
 
-        requested = {"param": model, "optimizer": optimizer, "grad": grad}
+        requested = {"param": model, "optimizer": optimizer}
         was_resident = {name: self._component_resident[name] for name, enabled in requested.items() if enabled}
-        self.onload(model=model, optimizer=optimizer, grad=grad)
+        self.onload(model=model, optimizer=optimizer, grad=False)
         try:
             yield
         finally:
             self.offload(
                 model=model and not was_resident.get("param", True),
                 optimizer=optimizer and not was_resident.get("optimizer", True),
-                grad=grad and not was_resident.get("grad", True),
-                preserve_grad=True,
+                grad=False,
             )
 
     def save_checkpoint(
@@ -1043,9 +1019,7 @@ class FSDPEngine(BaseEngine):
         # asserts flat params are GPU-resident; FSDP2 state_dict() only collects
         # DTensor refs and the generator below stages each shard lazily.
         _needs_staging = fsdp_version(self.module) == 1
-        was_resident = self._component_resident["param"]
-        disk_offload_back = self._offload_targets["param"] == "disk" and not was_resident
-        if disk_offload_back:
+        if self._offload_targets["param"] == "disk":
             self.onload(model=True, optimizer=False, grad=False)
         elif _needs_staging and not self._uses_fsdp2_cpu_offload_policy:
             if self._is_offload_param:
@@ -1055,7 +1029,7 @@ class FSDPEngine(BaseEngine):
         params = self.module.state_dict()
         params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
         if _needs_staging and self._offload_targets["param"] == "cpu":
-            self.offload(model=True, optimizer=False, grad=False, preserve_grad=True)
+            self.offload(model=True, optimizer=False, grad=False)
 
         device = get_device_id()
 
@@ -1069,8 +1043,6 @@ class FSDPEngine(BaseEngine):
                     p = p.to(torch.bfloat16, non_blocking=True)
                 local = p.to_local() if hasattr(p, "to_local") else p
                 yield name, local.reshape(-1), spec
-            if disk_offload_back:
-                self.offload(model=True, optimizer=False, grad=False, preserve_grad=True)
 
         return _gen(), None
 
@@ -1104,9 +1076,8 @@ class FSDPEngine(BaseEngine):
     def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
-        was_resident = self._component_resident["param"]
-        disk_offload_back = self._offload_targets["param"] == "disk" and not was_resident
-        if disk_offload_back:
+        disk_param = self._offload_targets["param"] == "disk"
+        if disk_param:
             self.onload(model=True, optimizer=False, grad=False)
 
         # FSDP2 CPUOffloadPolicy owns CPU<->GPU placement; calling model.to(device) here
@@ -1119,7 +1090,7 @@ class FSDPEngine(BaseEngine):
         # (adapter merge does real weight math on the module).
         _is_peft = hasattr(getattr(self.module, "_fsdp_wrapped_module", self.module), "peft_config")
         _skip_staging = fsdp_version(self.module) == 2 and not _is_peft
-        if not disk_offload_back and not self._uses_fsdp2_cpu_offload_policy and not _skip_staging:
+        if not disk_param and not self._uses_fsdp2_cpu_offload_policy and not _skip_staging:
             if self._is_offload_param:
                 self.onload(model=True, optimizer=False, grad=False)
             else:
@@ -1154,7 +1125,7 @@ class FSDPEngine(BaseEngine):
 
         log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
         if self._offload_targets["param"] == "cpu" and not _skip_staging:
-            self.offload(model=True, optimizer=False, grad=False, preserve_grad=True)
+            self.offload(model=True, optimizer=False, grad=False)
         log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
 
         if peft_config is not None and base_sync_done:
@@ -1192,15 +1163,6 @@ class FSDPEngine(BaseEngine):
                 target_device=torch.device("cpu"),
             )
 
-        if disk_offload_back:
-            source = per_tensor_param
-
-            def _with_disk_offload_back():
-                yield from source
-                self.offload(model=True, optimizer=False, grad=False, preserve_grad=True)
-
-            per_tensor_param = _with_disk_offload_back()
-
         peft_config_dict = peft_config.to_dict() if peft_config is not None else None
         return per_tensor_param, peft_config_dict
 
@@ -1232,7 +1194,7 @@ class FSDPEngine(BaseEngine):
         finally:
             log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
             if self._is_offload_param:
-                self.offload(model=True, optimizer=False, grad=False, preserve_grad=True)
+                self.offload(model=True, optimizer=False, grad=False)
             log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
 
     def disable_adapter(self) -> ContextManager:

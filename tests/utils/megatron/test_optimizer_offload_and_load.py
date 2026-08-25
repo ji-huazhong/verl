@@ -27,6 +27,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 from verl.utils.megatron_utils import (
     load_megatron_model_from_disk,
+    load_megatron_model_to_gpu,
     load_megatron_optimizer,
     load_megatron_optimizer_from_disk,
     offload_megatron_model_to_disk,
@@ -203,11 +204,11 @@ def test_precision_aware_optimizer_disk_offload_and_load(tmp_path):
             cleanup_on_exit=False,
             job_id="optimizer-test",
         )
-        offload_megatron_optimizer_to_disk(optimizer, store)
-        assert precision_aware_optimizer_is_on_device(optimizer, torch.device("cpu"))
-        assert all(state.numel() == 0 for state in snapshot_optimizer_state(optimizer))
+        refs = offload_megatron_optimizer_to_disk(optimizer, store)
+        assert refs
+        assert all(ref.storage.nbytes() == 0 for ref in refs)
 
-        load_megatron_optimizer_from_disk(optimizer, store)
+        load_megatron_optimizer_from_disk(store, refs)
         assert precision_aware_optimizer_is_on_device(optimizer, torch.device("cuda:0"))
         for actual, expected in zip(snapshot_optimizer_state(optimizer), expected_state, strict=True):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -216,7 +217,7 @@ def test_precision_aware_optimizer_disk_offload_and_load(tmp_path):
         dist.destroy_process_group()
 
 
-def test_megatron_param_and_live_grad_disk_round_trip(tmp_path):
+def test_megatron_param_disk_round_trip_reclaims_grad(tmp_path):
     rendezvous_file = tmp_path / "rdzv_model_disk"
 
     torch.cuda.set_device(0)
@@ -240,7 +241,6 @@ def test_megatron_param_and_live_grad_disk_round_trip(tmp_path):
         for buffer in buffers:
             buffer.grad_data.copy_(torch.randn_like(buffer.grad_data))
         expected_params = [buffer.param_data.clone() for buffer in buffers]
-        expected_grads = [buffer.grad_data.clone() for buffer in buffers]
 
         store = DiskOffloadStore(
             str(tmp_path / "offload"),
@@ -249,23 +249,15 @@ def test_megatron_param_and_live_grad_disk_round_trip(tmp_path):
             cleanup_on_exit=False,
             job_id="model-test",
         )
-        offload_megatron_model_to_disk(
-            model_chunks,
-            store,
-            offload_grad=True,
-            preserve_grad=True,
-        )
+        refs = offload_megatron_model_to_disk(model_chunks, store)
         assert all(buffer.param_data.storage().size() == 0 for buffer in buffers)
         assert all(buffer.grad_data.storage().size() == 0 for buffer in buffers)
 
-        load_megatron_model_from_disk(
-            model_chunks,
-            store,
-            load_grad=True,
-        )
-        for buffer, expected_param, expected_grad in zip(buffers, expected_params, expected_grads, strict=True):
+        load_megatron_model_from_disk(store, refs)
+        load_megatron_model_to_gpu(model_chunks, load_grad=True)
+        for buffer, expected_param in zip(buffers, expected_params, strict=True):
             torch.testing.assert_close(buffer.param_data, expected_param, rtol=0, atol=0)
-            torch.testing.assert_close(buffer.grad_data, expected_grad, rtol=0, atol=0)
+            assert torch.count_nonzero(buffer.grad_data).item() == 0
     finally:
         mpu.destroy_model_parallel()
         dist.destroy_process_group()

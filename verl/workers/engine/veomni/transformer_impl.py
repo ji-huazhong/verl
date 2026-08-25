@@ -223,6 +223,7 @@ class VeOmniEngine(FSDPEngine):
         Applies device, dtype, and precision configurations, including mixed precision.
         Sets up checkpoint manager and FLOPs counter.
         """
+        self._reset_offload_residency()
         self._build_model_optimizer()
 
         if self.enable_routing_replay:
@@ -262,7 +263,6 @@ class VeOmniEngine(FSDPEngine):
             model=self._is_offload_param,
             optimizer=self._is_offload_optimizer,
             grad=self._is_offload_param,
-            preserve_grad=False,
         )
 
         log_gpu_memory_usage("After offload model/optimizer/grad during init", logger=logger)
@@ -563,7 +563,7 @@ class VeOmniEngine(FSDPEngine):
 
         manual_offload = not getattr(self, "_uses_fsdp2_cpu_offload_policy", False)
         was_resident = self._component_resident["param"]
-        offload_back = manual_offload and self._is_offload_param and not was_resident
+        cpu_offload_back = manual_offload and self._offload_targets["param"] == "cpu" and not was_resident
         if manual_offload:
             if self._is_offload_param:
                 self.onload(model=True, optimizer=False, grad=False)
@@ -573,10 +573,9 @@ class VeOmniEngine(FSDPEngine):
 
         def _with_offload_back():
             yield from gen
-            if offload_back:
-                self.offload(model=True, optimizer=False, grad=False, preserve_grad=True)
+            self.offload(model=True, optimizer=False, grad=False)
 
-        return _with_offload_back(), meta
+        return (_with_offload_back() if cpu_offload_back else gen), meta
 
     def _hf_delta_entry(self, name, spec, place, lidx, lval):
         """veomni's per-param entry builder: EP/converter specs (fused expert
@@ -602,30 +601,22 @@ class VeOmniEngine(FSDPEngine):
         # per-DTensor .to(device).full_tensor() in param_generator() below stages each
         # shard instead, so the manual whole-model move is unnecessary under CPU offload.
         manual_offload = not getattr(self, "_uses_fsdp2_cpu_offload_policy", False)
-        was_resident = self._component_resident["param"]
-        disk_offload_back = self._offload_targets["param"] == "disk" and not was_resident
         if manual_offload:
             if self._is_offload_param:
                 self.onload(model=True, optimizer=False, grad=False)
             else:
                 load_veomni_model_to_gpu(self.module)
 
-        def _with_disk_offload_back(source):
-            yield from source
-            if disk_offload_back:
-                self.offload(model=True, optimizer=False, grad=False, preserve_grad=True)
-
         # TODO: currently only for DeepseekV4, unify all models to export weights by converter.
         converter = get_checkpoint_tensor_converter(self.module)
         if converter is not None and hasattr(converter, "export_weights"):
-            exported = converter.export_weights(self.module)
-            return (_with_disk_offload_back(exported) if disk_offload_back else exported), None
+            return converter.export_weights(self.module), None
 
         params = self.module.state_dict()
         params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
 
         if self._offload_targets["param"] == "cpu":
-            self.offload(model=True, optimizer=False, grad=False, preserve_grad=True)
+            self.offload(model=True, optimizer=False, grad=False)
 
         ps = parallel_state.get_parallel_state()
         model_type = getattr(self.module.config, "model_type", "default")
@@ -657,8 +648,7 @@ class VeOmniEngine(FSDPEngine):
                         yield name, unsharded_tensor
 
         # TODO: support VeOmni LoRA
-        exported = param_generator()
-        return (_with_disk_offload_back(exported) if disk_offload_back else exported), None
+        return param_generator(), None
 
 
 class EngineEvalModeCtx(BaseEngineCtx):

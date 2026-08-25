@@ -33,11 +33,11 @@ from typing import Iterable, Iterator
 
 import torch
 
-from verl.utils.device import get_device_name, get_torch_device, is_device_available
+from verl.utils.device import get_torch_device, is_device_available
 
 logger = logging.getLogger(__name__)
 
-# Live gradients are internal companion state when parameter offload spans split training phases.
+# FSDP may persist live gradients as internal companion state for split training phases.
 _COMPONENTS = frozenset({"param", "grad", "optimizer"})
 _ALIGNMENT = 4096
 
@@ -64,18 +64,13 @@ class TensorDiskMetadata:
     key: str
     offset: int
     nbytes: int
-    numel: int
     dtype: str
     shape: tuple[int, ...]
-    device_type: str
 
     @classmethod
     def from_dict(cls, value: dict) -> TensorDiskMetadata:
         value = dict(value)
         value["shape"] = tuple(value["shape"])
-        # Version-1 scratch manifests written before device-aware optimizer
-        # offload contained accelerator tensors only.
-        value.setdefault("device_type", get_device_name())
         return cls(**value)
 
 
@@ -405,7 +400,6 @@ class DiskOffloadStore:
                 nbytes = self._tensor_nbytes(tensor)
                 shape = tuple(tensor.shape)
                 dtype = str(tensor.dtype)
-                device_type = tensor.device.type
                 existing = layout.get(key)
                 if existing is not None:
                     if (existing.nbytes, existing.shape, existing.dtype) != (nbytes, shape, dtype):
@@ -414,26 +408,14 @@ class DiskOffloadStore:
                             f"disk={(existing.shape, existing.dtype, existing.nbytes)}, "
                             f"current={(shape, dtype, nbytes)}"
                         )
-                    if existing.device_type != device_type:
-                        layout[key] = TensorDiskMetadata(
-                            key=existing.key,
-                            offset=existing.offset,
-                            nbytes=existing.nbytes,
-                            numel=existing.numel,
-                            dtype=existing.dtype,
-                            shape=existing.shape,
-                            device_type=device_type,
-                        )
                     continue
                 next_offset = _align(next_offset)
                 layout[key] = TensorDiskMetadata(
                     key=key,
                     offset=next_offset,
                     nbytes=nbytes,
-                    numel=tensor.numel(),
                     dtype=dtype,
                     shape=shape,
-                    device_type=device_type,
                 )
                 next_offset += nbytes
 
@@ -488,22 +470,24 @@ class DiskOffloadStore:
             finally:
                 os.close(fd)
 
-    def metadata(self, component: str, key: str) -> TensorDiskMetadata:
-        _, manifest_path, generation_path = self._paths(component)
-        generation, layout = self._load_manifest(manifest_path)
-        if not generation_path.exists() or generation_path.read_text(encoding="utf-8") != str(generation):
-            raise RuntimeError(f"No committed {component} disk-offload generation under {self.root}")
-        try:
-            return layout[key]
-        except KeyError as exc:
-            raise KeyError(f"Tensor {key!r} is missing from the {component} disk manifest") from exc
-
-    def invalidate(self, component: str) -> None:
-        """Invalidate a component whose live value was deliberately discarded."""
+    def metadata_many(self, component: str, keys: Iterable[str]) -> list[TensorDiskMetadata]:
+        """Resolve metadata for several tensors from one manifest read."""
 
         with self._lock:
-            _, _, generation_path = self._paths(component)
-            generation_path.unlink(missing_ok=True)
+            _, manifest_path, generation_path = self._paths(component)
+            generation, layout = self._load_manifest(manifest_path)
+            if not generation_path.exists() or generation_path.read_text(encoding="utf-8") != str(generation):
+                raise RuntimeError(f"No committed {component} disk-offload generation under {self.root}")
+            resolved = []
+            for key in keys:
+                try:
+                    resolved.append(layout[key])
+                except KeyError as exc:
+                    raise KeyError(f"Tensor {key!r} is missing from the {component} disk manifest") from exc
+            return resolved
+
+    def metadata(self, component: str, key: str) -> TensorDiskMetadata:
+        return self.metadata_many(component, (key,))[0]
 
     def close(self) -> None:
         with self._lock:

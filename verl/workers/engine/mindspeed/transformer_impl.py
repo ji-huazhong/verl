@@ -64,26 +64,7 @@ def _mindspeed_repatch(engine_config):
         repatch(repatch_config)
 
 
-@EngineRegistry.register(model_type="language_model", backend="megatron", device="npu")
-class MindspeedEngineWithLMHead(MegatronEngineWithLMHead):
-    def __init__(
-        self,
-        model_config: HFModelConfig,
-        engine_config: McoreEngineConfig,
-        optimizer_config: McoreOptimizerConfig,
-        checkpoint_config: CheckpointConfig,
-    ):
-        super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
-
-    def _init_device_mesh(self):
-        # repatch must happen before initialize_model_parallel so that
-        # initialize_model_parallel_cp_wrapper is in effect when the call is made.
-        # The initial MindSpeed patch pass sees context_parallel_size=1 (default) because
-        # verl passes CP size via hydra config rather than --context-parallel-size CLI arg,
-        # so the CP ring-rank initialization wrapper is not registered on the first pass.
-        _mindspeed_repatch(self.engine_config)
-        super()._init_device_mesh()
-
+class _MindspeedOffloadMixin:
     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
         """
         Move model parameters, optimizer states, or both to the specified device.
@@ -103,10 +84,9 @@ class MindspeedEngineWithLMHead(MegatronEngineWithLMHead):
         model: bool = True,
         optimizer: bool = True,
         grad: bool = True,
-        preserve_grad: bool = True,
     ) -> None:
         _reset_mindspeed_offload_state(self, "cpu", model=model, optimizer=optimizer, grad=grad)
-        super().offload(model=model, optimizer=optimizer, grad=grad, preserve_grad=preserve_grad)
+        super().offload(model=model, optimizer=optimizer, grad=grad)
 
     def onload(self, *, model: bool = True, optimizer: bool = True, grad: bool = True, **kwargs) -> None:
         _reset_mindspeed_offload_state(
@@ -119,8 +99,29 @@ class MindspeedEngineWithLMHead(MegatronEngineWithLMHead):
         super().onload(model=model, optimizer=optimizer, grad=grad, **kwargs)
 
 
+@EngineRegistry.register(model_type="language_model", backend="megatron", device="npu")
+class MindspeedEngineWithLMHead(_MindspeedOffloadMixin, MegatronEngineWithLMHead):
+    def __init__(
+        self,
+        model_config: HFModelConfig,
+        engine_config: McoreEngineConfig,
+        optimizer_config: McoreOptimizerConfig,
+        checkpoint_config: CheckpointConfig,
+    ):
+        super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
+
+    def _init_device_mesh(self):
+        # repatch must happen before initialize_model_parallel so that
+        # initialize_model_parallel_cp_wrapper is in effect when the call is made.
+        # The initial MindSpeed patch pass sees context_parallel_size=1 (default) because
+        # verl passes CP size via hydra config rather than --context-parallel-size CLI arg,
+        # so the CP ring-rank initialization wrapper is not registered on the first pass.
+        _mindspeed_repatch(self.engine_config)
+        super()._init_device_mesh()
+
+
 @EngineRegistry.register(model_type="value_model", backend="megatron", device="npu")
-class MindspeedEngineWithValueHead(MegatronEngineWithValueHead):
+class MindspeedEngineWithValueHead(_MindspeedOffloadMixin, MegatronEngineWithValueHead):
     def __init__(
         self,
         model_config: HFModelConfig,

@@ -290,17 +290,6 @@ def _prepare_fsdp_model_for_disk(model) -> None:
                 raise RuntimeError("FSDP1 flat parameter did not return to its persistent local shard")
         return
 
-    # FSDP2 cannot reshard modules left in transient forward/backward states.
-    try:
-        from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
-        from torch.distributed.fsdp._fully_shard._fsdp_state import _get_module_fsdp_state
-
-        for module in model.modules():
-            state = _get_module_fsdp_state(module)
-            if state is not None and state._fsdp_param_group is not None:
-                state._fsdp_param_group._training_state = TrainingState.IDLE
-    except ImportError:
-        pass
     if hasattr(model, "reshard"):
         model.reshard()
 
@@ -330,39 +319,21 @@ def _iter_fsdp_model_disk_tensors(model, component: str) -> Iterator[tuple[str, 
 
 
 @torch.no_grad()
-def discard_fsdp_grad(model) -> None:
-    """Discard dead gradients without touching parameter storage."""
-
-    if fsdp_version(model) == 1:
-        _lazy_init(model, model)
-        for handle in model._all_handles:
-            handle.flat_param.grad = None
-    else:
-        for param in model.parameters():
-            param.grad = None
-    get_torch_device().empty_cache()
-
-
-@torch.no_grad()
 def offload_fsdp_model_to_disk(
     model,
     store: DiskOffloadStore,
     *,
     offload_grad: bool,
-    preserve_grad: bool,
 ) -> dict[str, list[StorageOffloadRef]]:
     """Persist selected FSDP local shards and release their storages in place."""
 
     _prepare_fsdp_model_for_disk(model)
     refs = {"param": storage_offload_refs(_iter_fsdp_model_disk_tensors(model, "param"))}
     store.write_tensors("param", ((ref.key, ref.tensor) for ref in refs["param"]))
-    if offload_grad and preserve_grad:
+    if offload_grad:
         refs["grad"] = storage_offload_refs(_iter_fsdp_model_disk_tensors(model, "grad"))
-        store.write_tensors("grad", ((ref.key, ref.tensor) for ref in refs["grad"]))
-    elif offload_grad:
-        store.invalidate("grad")
-        discard_fsdp_grad(model)
-        refs["grad"] = []
+        if refs["grad"]:
+            store.write_tensors("grad", ((ref.key, ref.tensor) for ref in refs["grad"]))
 
     try:
         for component_refs in refs.values():
@@ -410,19 +381,14 @@ def _iter_nested_tensors(value, prefix: str) -> Iterator[tuple[str, torch.Tensor
 
 
 def _iter_fsdp_optimizer_disk_tensors(optimizer) -> Iterator[tuple[str, torch.Tensor]]:
-    seen: set[int] = set()
     for optimizer_index, current_optimizer in enumerate(_optimizer_instances(optimizer)):
         for group_index, group in enumerate(current_optimizer.param_groups):
             for param_index, param in enumerate(group["params"]):
                 state = current_optimizer.state.get(param, {})
-                for key, tensor in _iter_nested_tensors(
+                yield from _iter_nested_tensors(
                     state,
                     f"optimizer.{optimizer_index}.group.{group_index}.param.{param_index}",
-                ):
-                    if id(tensor) in seen:
-                        continue
-                    seen.add(id(tensor))
-                    yield key, tensor
+                )
 
 
 @torch.no_grad()

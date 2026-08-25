@@ -126,11 +126,10 @@ Disk-target support matrix
 but may be added in a future release. Configuring a TBD target currently raises
 the error shown in the final column rather than silently ignoring the target.
 
-This matrix covers ``target: disk`` only. Gradient storage follows parameter
-placement for every backend: ``param.target: disk`` serializes live gradients
-when they must survive a phase boundary, while ``param.target: cpu`` keeps the
-existing CPU behavior. TorchTitan moves gradient storage with parameters for
-CPU offload and rejects disk targets.
+This matrix covers ``target: disk`` only. Gradient storage has no independent
+target and retains each backend's parameter-offload lifecycle. TorchTitan
+continues to move gradients with parameters for CPU offload and rejects disk
+targets.
 
 FSDP and VeOmni also reject combining disk targets with ``offload_policy`` and
 ``enable_fsdp_offload``, respectively. Invalid targets and unsupported
@@ -162,10 +161,10 @@ Cleanup is best effort: abrupt worker or node termination can leave scratch
 directories behind.
 
 Provision enough capacity for the rank-local state of every disk-target
-component and engine store on a node. Parameter and optimizer files coexist;
-a parameter generation can also have an internal live-gradient file when a
-split training operation must preserve gradients. Colocated actor, reference,
-and critic stores are independent. The files are reused across phase
+component and engine store on a node. Parameter and optimizer files coexist.
+FSDP may also create an internal live-gradient file when split training keeps
+gradients across a phase boundary. Colocated actor, reference, and critic
+stores are independent. The files are reused across phase
 transitions, but no cluster-wide capacity check runs before the first write.
 Production deployments should monitor free space and remove orphaned job
 directories according to their retention policy.
@@ -178,18 +177,11 @@ same object, preserving Parameter identity, DTensor placements, and aliases.
 Gradient semantics
 ------------------
 
-Gradient data is written only while it is live.  This matters for split
-training APIs that separate ``forward_backward`` from ``optimizer_step`` (for
-example, the Tinker worker): leaving the first call with
-``zero_grad_on_exit=false`` persists the gradient, and entering the optimizer
-step restores it.
-
-In the standard PPO/GRPO update path, the optimizer has already consumed the
-gradient and the train context clears it before offload.  verl then applies its
-existing gradient-buffer reclamation and does not write cleared gradients to
-disk. Cleared gradients are not restored from disk: Megatron recreates its
-gradient buffers before use, while FSDP and VeOmni allow autograd to recreate
-``param.grad`` during the next backward pass.
+There is no public gradient target. Megatron retains its existing parameter
+offload behavior of reclaiming and recreating gradient buffers. FSDP and VeOmni
+persist an existing live gradient only when it must cross a split training
+phase; the standard PPO/GRPO path clears gradients before offload and therefore
+does not write a gradient file.
 
 Disk offload limitations
 ------------------------

@@ -256,7 +256,6 @@ class BaseEngine:
         model: bool = True,
         optimizer: bool = True,
         grad: bool = True,
-        preserve_grad: bool = True,
     ) -> None:
         """Move selected state to its configured offload target.
 
@@ -264,7 +263,6 @@ class BaseEngine:
         supporting non-device targets such as disk override this method.
         """
 
-        del preserve_grad
         self.to(device="cpu", model=model, optimizer=optimizer, grad=grad)
 
     def onload(self, *, model: bool = True, optimizer: bool = True, grad: bool = True) -> None:
@@ -333,7 +331,7 @@ class BaseEngineCtx:
         self.disable_auto_offload = kwargs.pop("disable_auto_offload", False)
         self.zero_grad_on_exit = kwargs.pop("zero_grad_on_exit", True)
 
-    def _context_switch(self, device, *, preserve_grad=None):
+    def _context_switch(self, device):
         if self.disable_auto_offload:
             return
         if not (self.engine.is_param_offload_enabled or self.engine.is_optimizer_offload_enabled):
@@ -353,16 +351,14 @@ class BaseEngineCtx:
             if is_onload:
                 self.engine.onload(**kwargs)
             else:
-                if preserve_grad is None:
-                    preserve_grad = not self.zero_grad_on_exit
-                self.engine.offload(**kwargs, preserve_grad=preserve_grad)
+                self.engine.offload(**kwargs)
 
     def __enter__(self):
         self.engine.mode = self.mode
         self._context_switch(get_device_name())
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._context_switch("cpu", preserve_grad=not self.zero_grad_on_exit and exc_type is None)
+        self._context_switch("cpu")
         self.engine.mode = None
 
 
