@@ -39,7 +39,7 @@ from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
-from verl.utils.device import get_device_id, get_device_name
+from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     FSDPModule,
@@ -916,6 +916,7 @@ class FSDPEngine(BaseEngine):
             self._disk_refs.update(refs)
             self._component_resident["param"] = False
 
+        disk_optimizer = selected["optimizer"] and self._offload_targets["optimizer"] == "disk"
         if selected["optimizer"]:
             if self._offload_targets["optimizer"] == "cpu":
                 self.to(device="cpu", model=False, optimizer=True, grad=False)
@@ -924,6 +925,10 @@ class FSDPEngine(BaseEngine):
                     self.optimizer, self._require_disk_store()
                 )
             self._component_resident["optimizer"] = False
+
+        if disk_param or disk_optimizer:
+            gc.collect()
+            get_torch_device().empty_cache()
 
     def onload(self, *, model: bool = True, optimizer: bool = True, grad: bool = True) -> None:
         """Restore selected FSDP state from CPU or disk."""

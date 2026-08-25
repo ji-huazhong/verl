@@ -833,8 +833,6 @@ def _discard_megatron_grad(models) -> None:
         else:
             for param in model_chunk.parameters():
                 param.grad = None
-    gc.collect()
-    get_torch_device().empty_cache()
 
 
 @torch.no_grad()
@@ -852,8 +850,6 @@ def offload_megatron_model_to_disk(
         if cleared:
             logger.debug("Cleared %d TE FP8 weight workspaces on disk offload", cleared)
 
-    gc.collect()
-    get_torch_device().empty_cache()
     return refs
 
 
@@ -865,8 +861,6 @@ def load_megatron_model_from_disk(
     """Restore selected Megatron model state from a committed disk generation."""
 
     read_storage_refs(store, "param", refs)
-    gc.collect()
-    get_torch_device().empty_cache()
 
 
 def _iter_megatron_optimizer_tensors(optimizers) -> Iterator[tuple[str, torch.Tensor]]:
@@ -910,8 +904,6 @@ def offload_megatron_optimizer_to_disk(optimizers, store: DiskOffloadStore) -> l
     except ImportError:
         pass
     get_global_memory_buffer().buffer.clear()
-    gc.collect()
-    get_torch_device().empty_cache()
     return refs
 
 
@@ -920,8 +912,6 @@ def load_megatron_optimizer_from_disk(store: DiskOffloadStore, refs: list[Storag
     """Restore Megatron optimizer tensors from a committed disk generation."""
 
     read_storage_refs(store, "optimizer", refs)
-    gc.collect()
-    get_torch_device().empty_cache()
 
 
 @torch.no_grad()

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import inspect
 import logging
 import os
@@ -812,6 +813,7 @@ class MegatronEngine(BaseEngine):
             self._component_resident["param"] = False
             self._frozen_params_resident = False
 
+        disk_optimizer = selected["optimizer"] and self._offload_targets["optimizer"] == "disk"
         if selected["optimizer"]:
             if self._offload_targets["optimizer"] == "cpu":
                 offload_megatron_optimizer(self.optimizer)
@@ -820,6 +822,10 @@ class MegatronEngine(BaseEngine):
                     self.optimizer, self._require_disk_store()
                 )
             self._component_resident["optimizer"] = False
+
+        if disk_param or disk_optimizer:
+            gc.collect()
+            get_torch_device().empty_cache()
 
     def onload(
         self,

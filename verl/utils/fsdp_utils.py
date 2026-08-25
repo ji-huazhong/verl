@@ -344,7 +344,6 @@ def offload_fsdp_model_to_disk(
             if component_refs:
                 read_storage_refs(store, component, component_refs)
         raise
-    get_torch_device().empty_cache()
     return refs
 
 
@@ -360,7 +359,6 @@ def load_fsdp_model_from_disk(
     read_storage_refs(store, "param", refs.get("param", ()))
     if load_grad:
         read_storage_refs(store, "grad", refs.get("grad", ()))
-    get_torch_device().empty_cache()
 
 
 def _optimizer_instances(optimizer) -> list:
@@ -393,9 +391,7 @@ def _iter_fsdp_optimizer_disk_tensors(optimizer) -> Iterator[tuple[str, torch.Te
 
 @torch.no_grad()
 def offload_fsdp_optimizer_to_disk(optimizer, store: DiskOffloadStore) -> list[StorageOffloadRef]:
-    refs = write_storage_refs(store, "optimizer", _iter_fsdp_optimizer_disk_tensors(optimizer))
-    get_torch_device().empty_cache()
-    return refs
+    return write_storage_refs(store, "optimizer", _iter_fsdp_optimizer_disk_tensors(optimizer))
 
 
 @torch.no_grad()
@@ -404,7 +400,6 @@ def load_fsdp_optimizer_from_disk(
     refs: list[StorageOffloadRef],
 ) -> None:
     read_storage_refs(store, "optimizer", refs)
-    get_torch_device().empty_cache()
 
 
 @contextmanager
