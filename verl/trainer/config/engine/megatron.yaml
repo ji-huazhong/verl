@@ -11,13 +11,9 @@ offload:
 
   _target_: verl.workers.config.EngineOffloadConfig
 
-  param:
-    _target_: verl.workers.config.ComponentOffloadConfig
-    target: null
+  param: null
 
-  optimizer:
-    _target_: verl.workers.config.ComponentOffloadConfig
-    target: null
+  optimizer: null
 
   disk:
     _target_: verl.workers.config.DiskOffloadConfig

@@ -1,7 +1,7 @@
 Role-aware disk offload
 =======================
 
-Last updated: 08/25/2026.
+Last updated: 08/26/2026.
 
 Why disk offload?
 -----------------
@@ -49,10 +49,8 @@ follows the parameter target.
      actor:
        megatron:
          offload:
-           param:
-             target: cpu
-           optimizer:
-             target: disk
+           param: cpu
+           optimizer: disk
            disk:
              path: /local_nvme/verl-offload
              chunk_size_mb: 64
@@ -65,7 +63,7 @@ component selects ``disk``.
 
 Megatron and VeOmni reference parameters follow the actor's parameter target
 and disk settings unless explicitly overridden. FSDP references retain their
-pre-existing forward-only CPU offload when ``param.target`` is ``null``;
+pre-existing forward-only CPU offload when ``offload.param`` is ``null``;
 ``none`` disables that implicit behavior, while ``cpu`` and ``disk`` select an
 explicit target. Critic offload settings are independent of the actor and must
 be configured explicitly.
@@ -126,7 +124,7 @@ Disk-target support matrix
 but may be added in a future release. Configuring a TBD target currently raises
 the error shown in the final column rather than silently ignoring the target.
 
-This matrix covers ``target: disk`` only. Gradient storage has no independent
+This matrix covers the ``disk`` target only. Gradient storage has no independent
 target and retains each backend's parameter-offload lifecycle. TorchTitan
 continues to move gradients with parameters for CPU offload and rejects disk
 targets.
@@ -180,7 +178,7 @@ Disk offload limitations
 ------------------------
 
 * Disk offload for Megatron-FSDP, AutoModel, FSDP Turbo, and TorchTitan is TBD.
-  The current implementation rejects disk targets.
+  The current implementation rejects the ``disk`` target.
 * Disk offload reclaims inactive state only. Each component is restored before
   use, so it does not reduce the memory peak of an active forward, backward, or
   ``optimizer.step``.

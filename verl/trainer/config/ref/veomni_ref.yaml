@@ -22,8 +22,7 @@ veomni:
   expert_parallel_size: ${oc.select:actor_rollout_ref.actor.veomni.expert_parallel_size,1}
   param_offload: ${oc.select:actor_rollout_ref.actor.veomni.param_offload,null}
   offload:
-    param:
-      target: ${oc.select:actor_rollout_ref.actor.veomni.offload.param.target,null}
+    param: ${oc.select:actor_rollout_ref.actor.veomni.offload.param,null}
     disk:
       path: ${oc.select:actor_rollout_ref.actor.veomni.offload.disk.path,null}
       chunk_size_mb: ${oc.select:actor_rollout_ref.actor.veomni.offload.disk.chunk_size_mb,64}

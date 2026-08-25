@@ -15,12 +15,8 @@ optimizer_offload: null
 # Gradients retain the parameter placement for backward compatibility.
 offload:
   _target_: verl.workers.config.EngineOffloadConfig
-  param:
-    _target_: verl.workers.config.ComponentOffloadConfig
-    target: null
-  optimizer:
-    _target_: verl.workers.config.ComponentOffloadConfig
-    target: null
+  param: null
+  optimizer: null
   disk:
     _target_: verl.workers.config.DiskOffloadConfig
     path: null

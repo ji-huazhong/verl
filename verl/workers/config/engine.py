@@ -26,7 +26,6 @@ from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
 __all__ = [
-    "ComponentOffloadConfig",
     "DiskOffloadConfig",
     "EngineOffloadConfig",
     "FSDPEngineConfig",
@@ -43,22 +42,6 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
-
-
-@dataclass
-class ComponentOffloadConfig(BaseConfig):
-    """Offload policy for one engine state type.
-
-    ``None`` keeps backward compatibility with the legacy boolean fields on
-    :class:`EngineConfig`: ``True`` resolves to ``"cpu"`` and ``False`` to
-    ``"none"``.  An explicit target takes precedence only when the matching
-    legacy field is left at its default value.
-    """
-
-    target: Optional[Literal["none", "cpu", "disk"]] = None
-
-    def __post_init__(self) -> None:
-        assert self.target in (None, "none", "cpu", "disk"), f"Unsupported offload target: {self.target!r}"
 
 
 @dataclass
@@ -79,17 +62,16 @@ class DiskOffloadConfig(BaseConfig):
 
 @dataclass
 class EngineOffloadConfig(BaseConfig):
-    """Per-state offload targets for an engine instance."""
+    """Per-state offload targets; ``None`` defers to legacy booleans or backend defaults."""
 
-    param: ComponentOffloadConfig = field(default_factory=ComponentOffloadConfig)
-    optimizer: ComponentOffloadConfig = field(default_factory=ComponentOffloadConfig)
+    param: Optional[Literal["none", "cpu", "disk"]] = None
+    optimizer: Optional[Literal["none", "cpu", "disk"]] = None
     disk: DiskOffloadConfig = field(default_factory=DiskOffloadConfig)
 
     def __post_init__(self) -> None:
         for name in ("param", "optimizer"):
-            component = getattr(self, name)
-            if not isinstance(component, ComponentOffloadConfig):
-                object.__setattr__(self, name, ComponentOffloadConfig(**dict(component)))
+            target = getattr(self, name)
+            assert target in (None, "none", "cpu", "disk"), f"Unsupported {name} offload target: {target!r}"
         if not isinstance(self.disk, DiskOffloadConfig):
             object.__setattr__(self, "disk", DiskOffloadConfig(**dict(self.disk)))
 
@@ -184,7 +166,7 @@ class EngineConfig(BaseConfig):
             warnings.warn(
                 f"The legacy {self.strategy} offload boolean field(s) "
                 f"{', '.join(legacy_fields)} are deprecated and will be removed in a future release. "
-                "Use offload.<component>.target='cpu' for true or 'none' for false.",
+                "Use offload.<component>='cpu' for true or 'none' for false.",
                 FutureWarning,
                 stacklevel=3,
             )
@@ -194,13 +176,13 @@ class EngineConfig(BaseConfig):
             object.__setattr__(self, "offload", EngineOffloadConfig(**dict(self.offload)))
 
         for component in ("param", "optimizer"):
-            configured_target = getattr(self.offload, component).target
+            configured_target = getattr(self.offload, component)
             legacy_enabled = getattr(self, f"{component}_offload")
             assert configured_target is None or not legacy_enabled, (
-                f"Configure either {component}_offload=true (legacy CPU target) or offload.{component}.target, not both"
+                f"Configure either {component}_offload=true (legacy CPU target) or offload.{component}, not both"
             )
         disk_components = [
-            component for component in ("param", "optimizer") if getattr(self.offload, component).target == "disk"
+            component for component in ("param", "optimizer") if getattr(self.offload, component) == "disk"
         ]
         # TODO: Remove this guard after AutoModel, TorchTitan, and FSDP-Turbo add
         # backend-specific disk serialization and restoration for both state types.
@@ -218,7 +200,7 @@ class EngineConfig(BaseConfig):
         """Resolve a component target while preserving legacy boolean behavior."""
 
         assert component in ("param", "optimizer"), f"Unknown engine state type: {component!r}"
-        configured_target = getattr(self.offload, component).target
+        configured_target = getattr(self.offload, component)
         if configured_target is not None:
             return configured_target
         return "cpu" if getattr(self, f"{component}_offload") else "none"

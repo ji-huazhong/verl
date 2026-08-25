@@ -426,7 +426,7 @@ class FSDPEngine(BaseEngine):
 
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh, zero3_enable=self.engine_config.reshard_after_forward)
-        explicit_param_offload = self.engine_config.offload.param.target is not None
+        explicit_param_offload = self.engine_config.offload.param is not None
         use_forward_cpu_offload = self.engine_config.forward_only and (
             self._offload_targets["param"] == "cpu" or not explicit_param_offload
         )

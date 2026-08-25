@@ -26,12 +26,8 @@ actor_rollout_ref:
       optimizer_offload: null
       offload:
         _target_: verl.workers.config.EngineOffloadConfig
-        param:
-          _target_: verl.workers.config.ComponentOffloadConfig
-          target: null
-        optimizer:
-          _target_: verl.workers.config.ComponentOffloadConfig
-          target: null
+        param: null
+        optimizer: null
         disk:
           _target_: verl.workers.config.DiskOffloadConfig
           path: null
@@ -184,12 +180,8 @@ actor_rollout_ref:
       optimizer_offload: null
       offload:
         _target_: verl.workers.config.EngineOffloadConfig
-        param:
-          _target_: verl.workers.config.ComponentOffloadConfig
-          target: null
-        optimizer:
-          _target_: verl.workers.config.ComponentOffloadConfig
-          target: null
+        param: null
+        optimizer: null
         disk:
           _target_: verl.workers.config.DiskOffloadConfig
           path: null
@@ -535,12 +527,8 @@ critic:
     optimizer_offload: null
     offload:
       _target_: verl.workers.config.EngineOffloadConfig
-      param:
-        _target_: verl.workers.config.ComponentOffloadConfig
-        target: null
-      optimizer:
-        _target_: verl.workers.config.ComponentOffloadConfig
-        target: null
+      param: null
+      optimizer: null
       disk:
         _target_: verl.workers.config.DiskOffloadConfig
         path: null
