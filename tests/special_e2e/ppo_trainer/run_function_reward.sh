@@ -23,6 +23,7 @@ SKIP_TOKENIZER_INIT="True"
 
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.7}
 OFFLOAD_TARGET=${OFFLOAD_TARGET:-cpu}
+OPTIMIZER_OFFLOAD_TARGET=${OPTIMIZER_OFFLOAD_TARGET:-${OFFLOAD_TARGET}}
 DISK_OFFLOAD_PATH=${DISK_OFFLOAD_PATH:-null}
 DISK_OFFLOAD_CHUNK_SIZE_MB=${DISK_OFFLOAD_CHUNK_SIZE_MB:-64}
 
@@ -34,7 +35,15 @@ case "${OFFLOAD_TARGET}" in
         ;;
 esac
 
-if [ "${OFFLOAD_TARGET}" = disk ] && [ "${DISK_OFFLOAD_PATH}" = null ]; then
+case "${OPTIMIZER_OFFLOAD_TARGET}" in
+    none | cpu | disk) ;;
+    *)
+        echo "[ERROR] OPTIMIZER_OFFLOAD_TARGET must be one of none, cpu, or disk; got: ${OPTIMIZER_OFFLOAD_TARGET}"
+        exit 1
+        ;;
+esac
+
+if { [ "${OFFLOAD_TARGET}" = disk ] || [ "${OPTIMIZER_OFFLOAD_TARGET}" = disk ]; } && [ "${DISK_OFFLOAD_PATH}" = null ]; then
     echo "[ERROR] DISK_OFFLOAD_PATH must point to node-local scratch storage for disk offload"
     exit 1
 fi
@@ -141,7 +150,7 @@ exp_name="${VERL_EXP_NAME:-$(basename "${MODEL_ID,,}")-function-reward-minimal}"
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${train_traj_micro_bsz_per_gpu} \
     actor_rollout_ref.actor.strategy=${STRATEGY} \
     actor_rollout_ref.actor.fsdp_config.offload.param.target=${OFFLOAD_TARGET} \
-    actor_rollout_ref.actor.fsdp_config.offload.optimizer.target=${OFFLOAD_TARGET} \
+    actor_rollout_ref.actor.fsdp_config.offload.optimizer.target=${OPTIMIZER_OFFLOAD_TARGET} \
     actor_rollout_ref.actor.fsdp_config.offload.disk.path="${DISK_OFFLOAD_PATH}" \
     actor_rollout_ref.actor.fsdp_config.offload.disk.chunk_size_mb=${DISK_OFFLOAD_CHUNK_SIZE_MB} \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=${FSDP_SIZE} \
@@ -171,7 +180,7 @@ exp_name="${VERL_EXP_NAME:-$(basename "${MODEL_ID,,}")-function-reward-minimal}"
     critic.ppo_micro_batch_size_per_gpu=${train_traj_micro_bsz_per_gpu} \
     critic.strategy=${STRATEGY} \
     critic.fsdp.offload.param.target=${OFFLOAD_TARGET} \
-    critic.fsdp.offload.optimizer.target=${OFFLOAD_TARGET} \
+    critic.fsdp.offload.optimizer.target=${OPTIMIZER_OFFLOAD_TARGET} \
     critic.fsdp.offload.disk.path="${DISK_OFFLOAD_PATH}" \
     critic.fsdp.offload.disk.chunk_size_mb=${DISK_OFFLOAD_CHUNK_SIZE_MB} \
     reward.custom_reward_function.path="${reward_fn_file_path}"\
