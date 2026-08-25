@@ -38,19 +38,6 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-# TODO: Remove this guard after adding NPU-aware staging and validating storage
-# release/restore for MindSpeed parameter, gradient-buffer, and optimizer state.
-def _reject_disk_offload(engine_config: McoreEngineConfig) -> None:
-    disk_components = [
-        component
-        for component in ("param", "grad", "optimizer")
-        if engine_config.get_offload_target(component) == "disk"
-    ]
-    assert not disk_components, (
-        f"MindSpeed/NPU does not support disk offload yet; configured components: {', '.join(disk_components)}"
-    )
-
-
 def _reset_mindspeed_offload_state(engine, device: str, *, model: bool, optimizer: bool, grad: bool) -> None:
     """Preserve MindSpeed's transfer hook around the offload lifecycle API."""
 
@@ -86,7 +73,6 @@ class MindspeedEngineWithLMHead(MegatronEngineWithLMHead):
         optimizer_config: McoreOptimizerConfig,
         checkpoint_config: CheckpointConfig,
     ):
-        _reject_disk_offload(engine_config)
         super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
 
     def _init_device_mesh(self):
@@ -142,7 +128,6 @@ class MindspeedEngineWithValueHead(MegatronEngineWithValueHead):
         optimizer_config: McoreOptimizerConfig,
         checkpoint_config: CheckpointConfig,
     ):
-        _reject_disk_offload(engine_config)
         super().__init__(model_config, engine_config, optimizer_config, checkpoint_config)
 
     def _init_device_mesh(self):

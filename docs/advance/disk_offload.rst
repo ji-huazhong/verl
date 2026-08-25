@@ -115,10 +115,10 @@ Disk-target support matrix
      - TBD
      - ``AssertionError`` during config validation
    * - MindSpeed / NPU
-     - TBD
-     - TBD
-     - TBD
-     - ``AssertionError`` during engine construction
+     - yes
+     - yes
+     - yes
+     - supported through Megatron
    * - AutoModel
      - TBD
      - TBD
@@ -201,8 +201,8 @@ gradient buffers before use, while FSDP and VeOmni allow autograd to recreate
 Disk offload limitations
 ------------------------
 
-* Disk offload for Megatron-FSDP, MindSpeed/NPU, AutoModel, FSDP Turbo, and
-  TorchTitan is TBD. The current implementation rejects disk targets.
+* Disk offload for Megatron-FSDP, AutoModel, FSDP Turbo, and TorchTitan is TBD.
+  The current implementation rejects disk targets.
 * Disk offload reclaims inactive state only. Each component is restored before
   use, so it does not reduce the memory peak of an active forward, backward, or
   ``optimizer.step``.

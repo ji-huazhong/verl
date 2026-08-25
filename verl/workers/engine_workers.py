@@ -755,17 +755,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":
-            try:
-                if effective_mode == "delta_sharded":
-                    # The delta engine owns seed and snapshot state, so it drives export itself.
-                    metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
-                else:
-                    per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
-                    metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
-                return metrics or {}
-            finally:
-                if self.actor.engine.is_param_offload_enabled:
-                    self.actor.engine.offload(model=True, optimizer=False, grad=False)
+            if effective_mode == "delta_sharded":
+                # The delta engine owns seed and snapshot state, so it drives export itself.
+                metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
+            else:
+                per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+                metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
+            if self.actor.engine.is_param_offload_enabled:
+                self.actor.engine.offload(model=True, optimizer=False, grad=False)
+            return metrics or {}
 
         set_expandable_segments(False)
         aggressive_empty_cache(force_sync=True)

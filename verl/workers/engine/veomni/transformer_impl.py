@@ -572,11 +572,9 @@ class VeOmniEngine(FSDPEngine):
         gen, meta = veomni_shard_export(self.module)
 
         def _with_offload_back():
-            try:
-                yield from gen
-            finally:
-                if offload_back:
-                    self.offload(model=True, optimizer=False, grad=False, preserve_grad=True)
+            yield from gen
+            if offload_back:
+                self.offload(model=True, optimizer=False, grad=False, preserve_grad=True)
 
         return _with_offload_back(), meta
 
@@ -613,11 +611,9 @@ class VeOmniEngine(FSDPEngine):
                 load_veomni_model_to_gpu(self.module)
 
         def _with_disk_offload_back(source):
-            try:
-                yield from source
-            finally:
-                if disk_offload_back:
-                    self.offload(model=True, optimizer=False, grad=False, preserve_grad=True)
+            yield from source
+            if disk_offload_back:
+                self.offload(model=True, optimizer=False, grad=False, preserve_grad=True)
 
         # TODO: currently only for DeepseekV4, unify all models to export weights by converter.
         converter = get_checkpoint_tensor_converter(self.module)

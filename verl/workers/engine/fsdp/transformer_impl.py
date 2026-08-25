@@ -1064,17 +1064,15 @@ class FSDPEngine(BaseEngine):
         from ..spec import ShardSpec
 
         def _gen():
-            try:
-                for name, param in params.items():
-                    spec = ShardSpec.from_param(param)
-                    p = param.to(device, non_blocking=True)
-                    if p.is_floating_point():
-                        p = p.to(torch.bfloat16, non_blocking=True)
-                    local = p.to_local() if hasattr(p, "to_local") else p
-                    yield name, local.reshape(-1), spec
-            finally:
-                if disk_offload_back:
-                    self.offload(model=True, optimizer=False, grad=False, preserve_grad=True)
+            for name, param in params.items():
+                spec = ShardSpec.from_param(param)
+                p = param.to(device, non_blocking=True)
+                if p.is_floating_point():
+                    p = p.to(torch.bfloat16, non_blocking=True)
+                local = p.to_local() if hasattr(p, "to_local") else p
+                yield name, local.reshape(-1), spec
+            if disk_offload_back:
+                self.offload(model=True, optimizer=False, grad=False, preserve_grad=True)
 
         return _gen(), None
 
@@ -1200,10 +1198,8 @@ class FSDPEngine(BaseEngine):
             source = per_tensor_param
 
             def _with_disk_offload_back():
-                try:
-                    yield from source
-                finally:
-                    self.offload(model=True, optimizer=False, grad=False, preserve_grad=True)
+                yield from source
+                self.offload(model=True, optimizer=False, grad=False, preserve_grad=True)
 
             per_tensor_param = _with_disk_offload_back()
 
