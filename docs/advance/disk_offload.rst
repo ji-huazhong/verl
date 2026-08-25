@@ -38,8 +38,9 @@ Disk offload configuration
 --------------------------
 
 Disk offload is configured per role and for each state type exposed by that
-backend. The following example uses Megatron, which exposes independent
-parameter, gradient, and optimizer targets.
+backend. Optimizer state is typically the best candidate because it is large
+and inactive outside the optimizer step. The following example moves actor
+parameters and gradients to CPU and Megatron optimizer state to disk.
 
 .. code-block:: yaml
 
@@ -48,9 +49,9 @@ parameter, gradient, and optimizer targets.
        megatron:
          offload:
            param:
-             target: disk
+             target: cpu
            grad:
-             target: disk
+             target: cpu
            optimizer:
              target: disk
            disk:
@@ -58,29 +59,10 @@ parameter, gradient, and optimizer targets.
              chunk_size_mb: 64
              cleanup_on_exit: true
 
-     ref:
-       megatron:
-         offload:
-           param:
-             target: disk
-           disk:
-             path: /local_nvme/verl-offload
-
-   critic:
-     megatron:
-       offload:
-         param:
-           target: cpu
-         grad:
-           target: disk
-         optimizer:
-           target: disk
-         disk:
-           path: /local_nvme/verl-offload
-
 Each component accepts ``none``, ``cpu``, or ``disk`` when its backend supports
-that target. ``offload.disk.path`` is required when any component selects
-``disk``.
+that target. Parameter and gradient disk targets remain available for jobs that
+cannot fit those inactive states in host memory. ``offload.disk.path`` is
+required when any component selects ``disk``.
 
 Megatron and VeOmni reference parameters follow the actor's parameter target
 and disk settings unless explicitly overridden. FSDP references retain their
@@ -187,13 +169,6 @@ are not made crash-durable. ``cleanup_on_exit`` uses a Python exit handler and
 removes only the exact store directory carrying the store's ownership marker.
 Cleanup is best effort: abrupt worker or node termination can leave scratch
 directories behind.
-
-For disk-target parameters, read-only engine operations reuse a current
-generation. Reference forwards, actor old-log-prob computation, critic value
-inference, and rollout weight export restore parameters as needed, then release
-accelerator storage without rewriting unchanged parameters. Optimizer steps,
-checkpoint loads, and other weight replacements invalidate this reuse by
-advancing the parameter version.
 
 Provision enough capacity for the rank-local state of every disk-target
 component and engine store on a node. Parameter, gradient, and optimizer files

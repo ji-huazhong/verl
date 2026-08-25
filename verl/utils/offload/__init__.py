@@ -17,7 +17,6 @@ from .tensor import (
     StorageOffloadRef,
     local_tensor,
     read_storage_refs,
-    release_storage_refs,
     storage_offload_refs,
     write_storage_refs,
 )
@@ -28,7 +27,6 @@ __all__ = [
     "TensorDiskMetadata",
     "local_tensor",
     "read_storage_refs",
-    "release_storage_refs",
     "storage_offload_refs",
     "write_storage_refs",
 ]

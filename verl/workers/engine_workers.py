@@ -765,7 +765,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 return metrics or {}
             finally:
                 if self.actor.engine.is_param_offload_enabled:
-                    self.actor.engine.offload_after_read()
+                    self.actor.engine.offload(model=True, optimizer=False, grad=False)
 
         set_expandable_segments(False)
         aggressive_empty_cache(force_sync=True)
@@ -810,7 +810,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage("After update_weights", logger=logger)
 
         if self.actor.engine.is_param_offload_enabled:
-            self.actor.engine.offload_after_read()
+            self.actor.engine.offload(model=True, optimizer=False, grad=False)
         aggressive_empty_cache(force_sync=True)
 
         # 4. resume kv_cache

@@ -22,7 +22,7 @@ import logging
 import os
 import warnings
 from dataclasses import dataclass
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterator
 
 import torch
 import torch.nn.functional as F
@@ -866,28 +866,6 @@ def _discard_megatron_grad(models) -> None:
     get_torch_device().empty_cache()
 
 
-def _release_megatron_entries(entries: Iterable[tuple[torch.Tensor, str]]) -> None:
-    for tensor, strategy in entries:
-        if strategy == "storage":
-            tensor.storage().resize_(0)
-        else:
-            _empty_tensor_data(tensor)
-
-
-@torch.no_grad()
-def discard_megatron_param(models) -> None:
-    """Release resident parameters while retaining their committed disk generation."""
-
-    entries = list(_model_disk_entries(models, "param"))
-    _release_megatron_entries((tensor, strategy) for _, tensor, strategy in entries)
-    for model_chunk in models:
-        cleared = _clear_te_fp8_weight_workspaces(model_chunk)
-        if cleared:
-            logger.debug("Cleared %d TE FP8 weight workspaces while discarding parameters", cleared)
-    gc.collect()
-    get_torch_device().empty_cache()
-
-
 @torch.no_grad()
 def offload_megatron_model_to_disk(
     models,
@@ -913,7 +891,11 @@ def offload_megatron_model_to_disk(
         store.invalidate("grad")
         _discard_megatron_grad(models)
 
-    _release_megatron_entries(releases)
+    for tensor, strategy in releases:
+        if strategy == "storage":
+            tensor.storage().resize_(0)
+        else:
+            _empty_tensor_data(tensor)
 
     if offload_param:
         for model_chunk in models:

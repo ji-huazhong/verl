@@ -65,7 +65,7 @@ from verl.utils.fsdp_utils import (
     replace_lora_wrapper,
 )
 from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
-from verl.utils.offload import DiskOffloadStore, release_storage_refs
+from verl.utils.offload import DiskOffloadStore
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.seqlen_balancing import ceildiv
 from verl.utils.torch_functional import logprobs_from_logits
@@ -216,7 +216,6 @@ class FSDPEngine(BaseEngine):
         Applies device, dtype, and precision configurations, including mixed precision.
         Sets up checkpoint manager and FLOPs counter.
         """
-        self.mark_parameters_updated()
         # This is used to import external_lib into the huggingface systems
         self._build_model_optimizer()
 
@@ -924,9 +923,6 @@ class FSDPEngine(BaseEngine):
             )
             self._disk_refs.update(refs)
             if disk_param:
-                self._record_disk_param_snapshot()
-        if disk_param or disk_grad:
-            if disk_param:
                 self._component_resident["param"] = False
             if disk_grad:
                 self._component_resident["grad"] = False
@@ -940,23 +936,6 @@ class FSDPEngine(BaseEngine):
                     self.optimizer, self._require_disk_store()
                 )
             self._component_resident["optimizer"] = False
-
-    def offload_after_read(self, *, model: bool = True) -> None:
-        """Reclaim read-only FSDP parameters without rewriting a current snapshot."""
-
-        reuse_param_snapshot = (
-            model
-            and self._is_offload_param
-            and self._component_resident["param"]
-            and self._offload_targets["param"] == "disk"
-            and self._is_disk_param_snapshot_current()
-        )
-        if not reuse_param_snapshot:
-            self.offload(model=model, optimizer=False, grad=False, preserve_grad=True)
-            return
-
-        release_storage_refs(self._require_disk_store(), "param", self._disk_refs["param"])
-        self._component_resident["param"] = False
 
     def onload(self, *, model: bool = True, optimizer: bool = True, grad: bool = True) -> None:
         """Restore selected FSDP state from CPU or disk."""
@@ -1049,7 +1028,6 @@ class FSDPEngine(BaseEngine):
         Load FSDP checkpoint, restoring parameters and optimizer state.
         """
         with self.resident(model=True, optimizer=self.optimizer is not None):
-            self.mark_parameters_updated()
             self.checkpoint_manager.load_checkpoint(
                 local_path=local_path,
                 hdfs_path=hdfs_path,
@@ -1096,7 +1074,7 @@ class FSDPEngine(BaseEngine):
                     yield name, local.reshape(-1), spec
             finally:
                 if disk_offload_back:
-                    self.offload_after_read()
+                    self.offload(model=True, optimizer=False, grad=False, preserve_grad=True)
 
         return _gen(), None
 
@@ -1225,7 +1203,7 @@ class FSDPEngine(BaseEngine):
                 try:
                     yield from source
                 finally:
-                    self.offload_after_read()
+                    self.offload(model=True, optimizer=False, grad=False, preserve_grad=True)
 
             per_tensor_param = _with_disk_offload_back()
 
@@ -1260,7 +1238,7 @@ class FSDPEngine(BaseEngine):
         finally:
             log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
             if self._is_offload_param:
-                self.offload_after_read()
+                self.offload(model=True, optimizer=False, grad=False, preserve_grad=True)
             log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
 
     def disable_adapter(self) -> ContextManager:
