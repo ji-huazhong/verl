@@ -851,7 +851,7 @@ def load_megatron_model_from_disk(
     store: DiskOffloadStore,
     refs: list[StorageOffloadRef],
 ) -> None:
-    """Restore selected Megatron model state from a committed disk generation."""
+    """Restore selected Megatron model state from disk."""
 
     read_storage_refs(store, "param", refs)
 
@@ -902,7 +902,7 @@ def offload_megatron_optimizer_to_disk(optimizers, store: DiskOffloadStore) -> l
 
 @torch.no_grad()
 def load_megatron_optimizer_from_disk(store: DiskOffloadStore, refs: list[StorageOffloadRef]) -> None:
-    """Restore Megatron optimizer tensors from a committed disk generation."""
+    """Restore Megatron optimizer tensors from disk."""
 
     read_storage_refs(store, "optimizer", refs)
 

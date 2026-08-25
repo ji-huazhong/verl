@@ -27,7 +27,7 @@ def _new_store(tmp_path, *, cleanup_on_exit=False):
     )
 
 
-def test_disk_store_round_trip_and_layout_reuse(tmp_path):
+def test_disk_store_round_trip_across_repeated_writes(tmp_path):
     store = _new_store(tmp_path)
     first = torch.arange(300_000, dtype=torch.float32)
     second = torch.arange(257, dtype=torch.int64)
@@ -35,11 +35,6 @@ def test_disk_store_round_trip_and_layout_reuse(tmp_path):
     expected_second = second.clone()
 
     store.write_tensors("param", [("first", first), ("second", second)])
-    first_metadata = store.metadata("param", "first")
-    second_metadata = store.metadata("param", "second")
-    state_path = store.root / "param.bin"
-    initial_file_size = state_path.stat().st_size
-
     first.zero_()
     second.zero_()
     store.read_tensors("param", [("first", first), ("second", second)])
@@ -47,10 +42,15 @@ def test_disk_store_round_trip_and_layout_reuse(tmp_path):
     torch.testing.assert_close(second, expected_second, rtol=0, atol=0)
 
     first.add_(1)
+    second.add_(2)
+    expected_first = first.clone()
+    expected_second = second.clone()
     store.write_tensors("param", [("first", first), ("second", second)])
-    assert store.metadata("param", "first").offset == first_metadata.offset
-    assert store.metadata("param", "second").offset == second_metadata.offset
-    assert state_path.stat().st_size == initial_file_size
+    first.zero_()
+    second.zero_()
+    store.read_tensors("param", [("first", first), ("second", second)])
+    torch.testing.assert_close(first, expected_first, rtol=0, atol=0)
+    torch.testing.assert_close(second, expected_second, rtol=0, atol=0)
 
 
 def test_disk_store_rejects_layout_changes(tmp_path):
@@ -77,12 +77,20 @@ def test_disk_store_does_not_publish_failed_write(tmp_path, monkeypatch):
         store.read_tensors("grad", [("grad", tensor)])
 
 
-def test_disk_store_uses_one_data_file_per_component(tmp_path):
+def test_disk_store_keeps_components_independent(tmp_path):
     store = _new_store(tmp_path)
-    store.write_tensors("param", [(f"tensor-{index}", torch.ones(4)) for index in range(10)])
+    param = torch.tensor([1.0])
+    optimizer = torch.tensor([2.0])
+    store.write_tensors("param", [("state", param)])
+    store.write_tensors("optimizer", [("state", optimizer)])
 
-    store_files = sorted(path.name for path in store.root.iterdir())
-    assert store_files == ["param.bin"]
+    param.zero_()
+    optimizer.zero_()
+    store.read_tensors("param", [("state", param)])
+    store.read_tensors("optimizer", [("state", optimizer)])
+
+    assert param.item() == 1.0
+    assert optimizer.item() == 2.0
 
 
 def test_disk_store_only_cleans_its_owned_directory(tmp_path):

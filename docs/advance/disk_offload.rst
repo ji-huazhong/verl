@@ -30,9 +30,9 @@ retaining a full user-space CPU copy of a component by moving state through a
 pair of reusable staging buffers. ``chunk_size_mb`` controls the size of each
 buffer. An engine store allocates these buffers lazily when disk I/O first
 occurs and can then retain up to ``2 * chunk_size_mb`` of staging memory.
-Operating-system page cache and fallback read allocations on platforms without
-``preadv`` are additional and are not bounded by this setting. The trade-off is
-additional latency at phase transitions and additional storage traffic.
+Operating-system page cache is additional and is not bounded by this setting.
+The trade-off is additional latency at phase transitions and additional
+storage traffic.
 
 Disk offload configuration
 --------------------------
@@ -136,29 +136,27 @@ FSDP and VeOmni also reject combining disk targets with ``offload_policy`` and
 combinations follow verl's existing configuration style and are checked with
 ``assert``.
 
-Disk layout and memory use
---------------------------
+Storage requirements and lifecycle
+----------------------------------
 
 ``offload.disk.path`` must point to fast node-local storage. verl creates a
 ``store_<rank>_<random>`` temporary directory for every engine store, so
 colocated roles may share the same configured root without colliding. In a
-multi-node job, the same path must resolve to local storage on every node. For
-each component, a store uses one reusable flat data file (for example,
-``param.bin`` or ``optimizer.bin``) and keeps tensor layout metadata in worker
-memory; it does not create one file per tensor.
+multi-node job, the same path must resolve to local storage on every node.
 
 Disk I/O is chunked and double-buffered. The public store call remains
 synchronous, but internally one pinned CPU buffer can perform file I/O while
 the other transfers the adjacent chunk between host and accelerator on a
-dedicated copy stream. Reads use ``preadv`` where available to fill the staging
-buffer directly. ``chunk_size_mb`` bounds each buffer, so one active store can
-retain up to ``2 * chunk_size_mb`` of staging memory without retaining a full
-user-space copy of the component. Operating-system page cache remains outside
-this bound. Accelerator storage is released only after the complete disk
-write returns successfully. The files are not crash-durable or recoverable
-after worker exit. ``cleanup_on_exit`` uses a Python exit handler and removes
-only the temporary directory created by that store. Cleanup is best effort:
-abrupt worker or node termination can leave scratch directories behind.
+dedicated copy stream. ``chunk_size_mb`` bounds each buffer, so one active
+store can retain up to ``2 * chunk_size_mb`` of staging memory without
+retaining a full user-space copy of the component. Operating-system page cache
+remains outside this bound.
+
+Accelerator storage is released only after the complete disk write returns
+successfully. The files are process-local scratch data rather than recoverable
+state. ``cleanup_on_exit`` removes the store's temporary directory through a
+Python exit handler. Cleanup is best effort: abrupt worker or node termination
+can leave scratch directories behind.
 
 Provision enough capacity for the rank-local state of every disk-target
 component and engine store on a node. Parameter and optimizer files coexist.
@@ -168,11 +166,6 @@ stores are independent. The files are reused across phase
 transitions, but no cluster-wide capacity check runs before the first write.
 Production deployments should monitor free space and remove orphaned job
 directories according to their retention policy.
-
-FSDP1 flat parameters and FSDP2/VeOmni DTensors are restored in place. verl
-writes each unique rank-local backing storage once, including shared flat-buffer
-storage, then resizes that same storage to zero. Onload expands and refills the
-same object, preserving Parameter identity, DTensor placements, and aliases.
 
 Gradient semantics
 ------------------

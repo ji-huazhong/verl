@@ -438,9 +438,6 @@ class DiskOffloadStore:
                     raise KeyError(f"Tensor {key!r} is missing from the {component} disk-offload state") from exc
             return resolved
 
-    def metadata(self, component: str, key: str) -> TensorDiskMetadata:
-        return self.metadata_many(component, (key,))[0]
-
     def close(self) -> None:
         with self._lock:
             if self._closed:
