@@ -39,7 +39,6 @@ from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.metric.utils import Metric
-from verl.utils.offload import aggregate_disk_offload_metrics
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
 from verl.utils.py_functional import append_to_dict
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
@@ -156,13 +155,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         self.loss_fn = None
 
-    def collect_disk_offload_metrics(self) -> dict[str, float]:
-        """Aggregate completed disk I/O across ranks and clear the local counters."""
-
-        if not self.engine.has_disk_offload_store:
-            return {}
-        return aggregate_disk_offload_metrics(self.engine.pop_disk_offload_stats(), self.device_name)
-
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
         """Manual control of load/offload"""
@@ -184,9 +176,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
         we initialize it. Otherwise, reload ckpt and reset states
         """
         self.engine.initialize()
-        if self.engine.has_disk_offload_store:
-            # Initialization precedes step metric collection.
-            self.engine.pop_disk_offload_stats()
 
     def _postprocess_output(self, output, *, global_token_num, delta_time, forward_only, images_seqlens):
         """
@@ -346,10 +335,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
             else:
                 output = None
-        disk_metrics = self.collect_disk_offload_metrics()
-        if output is not None:
-            output_metrics = tu.get(output, "metrics")
-            output_metrics.update({key: [value] for key, value in disk_metrics.items()})
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
@@ -383,7 +368,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
             # containing loss, model_output and metrics
             # for training, we only care about loss and metrics
         delta_time = timer.last
-        disk_metrics = self.collect_disk_offload_metrics() if not disable_auto_offload else {}
 
         update_lr_scheduler = tu.get(data, key="update_lr_scheduler", default=False)
         # update lr scheduler
@@ -404,7 +388,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 forward_only=False,
                 images_seqlens=images_seqlens,
             ).cpu()
-            tu.get(final_output, "metrics").update(disk_metrics)
         else:
             final_output = None
 
@@ -442,7 +425,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
             with adapter_ctx:
                 output = self.engine.infer_batch(data, loss_function=loss_function)
         delta_time = timer.last
-        disk_metrics = self.collect_disk_offload_metrics() if not disable_auto_offload else {}
 
         if self.engine.is_mp_src_rank_with_outputs():
             final_output = self._postprocess_output(
@@ -452,7 +434,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 forward_only=True,
                 images_seqlens=images_seqlens,
             ).cpu()
-            tu.get(final_output, "metrics").update(disk_metrics)
         else:
             final_output = None
 
@@ -460,19 +441,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
-        result = self.engine.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
-        if self.engine.has_disk_offload_store:
-            # Checkpoint timing already accounts for these transitions.
-            self.engine.pop_disk_offload_stats()
-        return result
+        return self.engine.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
-        result = self.engine.load_checkpoint(local_path, hdfs_path, del_local_after_load)
-        if self.engine.has_disk_offload_store:
-            # Checkpoint timing already accounts for these transitions.
-            self.engine.pop_disk_offload_stats()
-        return result
+        return self.engine.load_checkpoint(local_path, hdfs_path, del_local_after_load)
 
 
 class ActorRolloutRefWorker(Worker, DistProfilerExtension):
@@ -782,24 +755,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":
-            metrics = {}
             try:
                 if effective_mode == "delta_sharded":
                     # The delta engine owns seed and snapshot state, so it drives export itself.
-                    metrics = (
-                        await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps) or {}
-                    )
+                    metrics = await self.checkpoint_engine.send_weights(self.actor.engine, global_steps=global_steps)
                 else:
                     per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
-                    metrics = (
-                        await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps) or {}
-                    )
+                    metrics = await self.checkpoint_engine.send_weights(per_tensor_param, global_steps=global_steps)
+                return metrics or {}
             finally:
                 if self.actor.engine.is_param_offload_enabled:
                     self.actor.engine.offload_after_read()
-            disk_metrics = self.actor.collect_disk_offload_metrics()
-            metrics.update({f"update_weights/{key}": value for key, value in disk_metrics.items()})
-            return metrics
 
         set_expandable_segments(False)
         aggressive_empty_cache(force_sync=True)
@@ -854,8 +820,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         self.base_sync_done = True
         set_expandable_segments(True)
-        disk_metrics = self.actor.collect_disk_offload_metrics()
-        return {f"update_weights/{key}": value for key, value in disk_metrics.items()}
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):

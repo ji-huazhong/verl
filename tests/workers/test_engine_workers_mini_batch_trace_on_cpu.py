@@ -61,7 +61,6 @@ def _worker(engine):
         ),
         model_config={},
         loss_fn=lambda: None,
-        collect_disk_offload_metrics=lambda: {},
         profiler=MagicMock(),
     )
 

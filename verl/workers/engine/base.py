@@ -315,18 +315,6 @@ class BaseEngine:
 
         self.to(device=get_device_name(), model=model, optimizer=optimizer, grad=grad)
 
-    @property
-    def has_disk_offload_store(self) -> bool:
-        """Whether this engine owns a store that can report disk I/O statistics."""
-
-        return getattr(self, "_disk_store", None) is not None
-
-    def pop_disk_offload_stats(self):
-        """Return and clear rank-local disk I/O statistics."""
-
-        store = getattr(self, "_disk_store", None)
-        return store.pop_io_stats() if store is not None else {}
-
     def save_checkpoint(
         self,
         local_path: str,

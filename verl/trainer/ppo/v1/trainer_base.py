@@ -58,7 +58,6 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
-    extract_disk_offload_metrics,
     get_metric_data_with_optional_routed_experts,
     process_validation_metrics,
 )
@@ -1565,7 +1564,6 @@ class PPOTrainer(ABC):
         )
         output: KVBatchMeta = self.actor_rollout_wg.compute_log_prob(batch)
         assert len(output) == len(batch)
-        metrics.update(extract_disk_offload_metrics(output.extra_info.get("metrics", {}), "actor_infer"))
 
         fields = ["entropy", "log_probs", "response_mask"]
         if self.config.actor_rollout_ref.rollout.calculate_log_probs:
@@ -1617,7 +1615,6 @@ class PPOTrainer(ABC):
         else:
             output = self.ref_policy_wg.compute_ref_log_prob(batch)
         assert len(output) == len(batch)
-        metrics.update(extract_disk_offload_metrics(output.extra_info.get("metrics", {}), "ref"))
 
         # 2. write ref_log_prob and entropy back to TransferQueue
         data = tq.kv_batch_get(
@@ -1639,12 +1636,7 @@ class PPOTrainer(ABC):
         )
         output = self.critic_wg.infer_batch(batch)
         # TODO: DataProtoFuture support KVBatchMeta
-        resolved_outputs = ray.get(output.futures)
-        for resolved_output in resolved_outputs:
-            if isinstance(resolved_output, TensorDict):
-                metrics.update(
-                    extract_disk_offload_metrics(tu.get(resolved_output, "metrics", default={}), "critic_infer")
-                )
+        ray.get(output.futures)
 
         # 2. write value back to TransferQueue
         data = tq.kv_batch_get(

@@ -24,7 +24,6 @@ import os
 import re
 import shutil
 import threading
-import time
 import uuid
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -39,9 +38,7 @@ from verl.utils.device import get_device_name, get_torch_device, is_device_avail
 logger = logging.getLogger(__name__)
 
 _COMPONENTS = frozenset({"param", "grad", "optimizer"})
-_DIRECTIONS = ("offload", "onload")
 _ALIGNMENT = 4096
-_METRIC_DECIMAL_PLACES = 4
 
 
 def _safe_segment(value: str) -> str:
@@ -82,56 +79,11 @@ class TensorDiskMetadata:
 
 
 @dataclass
-class DiskOffloadIOStats:
-    """Accumulated wall time and payload bytes for one disk I/O operation type."""
-
-    seconds: float = 0.0
-    nbytes: int = 0
-
-
-@dataclass
 class _StagingSlot:
     tensor: torch.Tensor
     buffer: memoryview
     io_future: Future[None] | None = None
     copy_event: object | None = None
-
-
-def aggregate_disk_offload_metrics(
-    stats: dict[tuple[str, str], DiskOffloadIOStats], device: str | torch.device
-) -> dict[str, float]:
-    """Aggregate rank-local disk stats into phase-critical distributed metrics."""
-
-    shape = (len(_DIRECTIONS), len(_COMPONENTS))
-    seconds = torch.zeros(shape, dtype=torch.float32, device=device)
-    nbytes = torch.zeros(shape, dtype=torch.int64, device=device)
-    components = sorted(_COMPONENTS)
-    for direction_index, direction in enumerate(_DIRECTIONS):
-        for component_index, component in enumerate(components):
-            current = stats.get((direction, component))
-            if current is not None:
-                seconds[direction_index, component_index] = current.seconds
-                nbytes[direction_index, component_index] = current.nbytes
-
-    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
-        torch.distributed.all_reduce(seconds, op=torch.distributed.ReduceOp.MAX)
-        torch.distributed.all_reduce(nbytes, op=torch.distributed.ReduceOp.SUM)
-
-    metrics = {}
-    for direction_index, direction in enumerate(_DIRECTIONS):
-        for component_index, component in enumerate(components):
-            component_nbytes = nbytes[direction_index, component_index].item()
-            if component_nbytes <= 0:
-                continue
-            component_seconds = seconds[direction_index, component_index].item()
-            component_gib = component_nbytes / (1 << 30)
-            metrics[f"disk_{direction}_s/{component}"] = round(component_seconds, _METRIC_DECIMAL_PLACES)
-            metrics[f"disk_{direction}_gib/{component}"] = round(component_gib, _METRIC_DECIMAL_PLACES)
-            if component_seconds > 0:
-                metrics[f"disk_{direction}_gib_s/{component}"] = round(
-                    component_gib / component_seconds, _METRIC_DECIMAL_PLACES
-                )
-    return metrics
 
 
 class DiskOffloadStore:
@@ -166,7 +118,6 @@ class DiskOffloadStore:
         self._staging_slots: list[_StagingSlot] | None = None
         self._copy_stream = None
         self._io_executor: ThreadPoolExecutor | None = None
-        self._io_stats: dict[tuple[str, str], DiskOffloadIOStats] = {}
         self._owner_token = uuid.uuid4().hex
 
         job_segment = _safe_segment(job_id or _runtime_job_id())
@@ -439,9 +390,7 @@ class DiskOffloadStore:
     def write_tensors(self, component: str, tensors: Iterable[tuple[str, torch.Tensor]]) -> None:
         """Synchronously write a complete component generation."""
 
-        started = time.perf_counter()
         tensor_list = [(key, tensor) for key, tensor in tensors if tensor.numel() > 0]
-        total_nbytes = sum(self._tensor_nbytes(tensor) for _, tensor in tensor_list)
         keys = [key for key, _ in tensor_list]
         if len(keys) != len(set(keys)):
             raise ValueError(f"Duplicate tensor keys in {component} offload generation")
@@ -510,15 +459,10 @@ class DiskOffloadStore:
             generation_tmp.write_text(str(generation), encoding="utf-8")
             os.replace(generation_tmp, generation_path)
 
-        if total_nbytes > 0:
-            self._record_io("offload", component, time.perf_counter() - started, total_nbytes)
-
     def read_tensors(self, component: str, tensors: Iterable[tuple[str, torch.Tensor]]) -> None:
         """Synchronously restore tensors from the latest committed generation."""
 
-        started = time.perf_counter()
         tensor_list = [(key, tensor) for key, tensor in tensors if tensor.numel() > 0]
-        total_nbytes = sum(self._tensor_nbytes(tensor) for _, tensor in tensor_list)
         with self._lock:
             data_path, manifest_path, generation_path = self._paths(component)
             generation, layout = self._load_manifest(manifest_path)
@@ -542,23 +486,6 @@ class DiskOffloadStore:
                     self._read_tensors_pipelined(fd, restore_entries)
             finally:
                 os.close(fd)
-
-        if total_nbytes > 0:
-            self._record_io("onload", component, time.perf_counter() - started, total_nbytes)
-
-    def _record_io(self, direction: str, component: str, seconds: float, nbytes: int) -> None:
-        with self._lock:
-            stats = self._io_stats.setdefault((direction, component), DiskOffloadIOStats())
-            stats.seconds += seconds
-            stats.nbytes += nbytes
-
-    def pop_io_stats(self) -> dict[tuple[str, str], DiskOffloadIOStats]:
-        """Return and clear successful, non-empty disk I/O statistics."""
-
-        with self._lock:
-            stats = self._io_stats
-            self._io_stats = {}
-            return stats
 
     def metadata(self, component: str, key: str) -> TensorDiskMetadata:
         _, manifest_path, generation_path = self._paths(component)

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .disk import DiskOffloadIOStats, DiskOffloadStore, TensorDiskMetadata, aggregate_disk_offload_metrics
+from .disk import DiskOffloadStore, TensorDiskMetadata
 from .tensor import (
     StorageOffloadRef,
     local_tensor,
@@ -24,10 +24,8 @@ from .tensor import (
 
 __all__ = [
     "DiskOffloadStore",
-    "DiskOffloadIOStats",
     "StorageOffloadRef",
     "TensorDiskMetadata",
-    "aggregate_disk_offload_metrics",
     "local_tensor",
     "read_storage_refs",
     "release_storage_refs",

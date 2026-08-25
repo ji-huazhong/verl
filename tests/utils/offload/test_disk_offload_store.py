@@ -17,7 +17,7 @@ import json
 import pytest
 import torch
 
-from verl.utils.offload import DiskOffloadIOStats, DiskOffloadStore, aggregate_disk_offload_metrics
+from verl.utils.offload import DiskOffloadStore
 
 
 def _new_store(tmp_path, *, cleanup_on_exit=False):
@@ -117,39 +117,3 @@ def test_disk_store_isolates_store_instances(tmp_path):
     assert first.root != second.root
     assert first_target.item() == 1.0
     assert second_target.item() == 2.0
-
-
-def test_disk_store_reports_only_successful_nonempty_io(tmp_path):
-    store = _new_store(tmp_path)
-    param = torch.arange(8, dtype=torch.float32)
-    expected_nbytes = param.numel() * param.element_size()
-
-    with pytest.raises(RuntimeError, match="No committed optimizer"):
-        store.read_tensors("optimizer", [("state", torch.empty_like(param))])
-    store.write_tensors("param", [("weight", param)])
-    store.write_tensors("grad", [])
-    store.read_tensors("param", [("weight", param)])
-
-    stats = store.pop_io_stats()
-    assert set(stats) == {("offload", "param"), ("onload", "param")}
-    assert stats[("offload", "param")].nbytes == expected_nbytes
-    assert stats[("onload", "param")].nbytes == expected_nbytes
-    assert stats[("offload", "param")].seconds > 0
-    assert stats[("onload", "param")].seconds > 0
-    assert store.pop_io_stats() == {}
-
-
-def test_disk_store_formats_only_nonempty_component_metrics():
-    metrics = aggregate_disk_offload_metrics(
-        {
-            ("offload", "param"): DiskOffloadIOStats(seconds=3.333333, nbytes=1 << 30),
-            ("offload", "grad"): DiskOffloadIOStats(seconds=1.0, nbytes=0),
-        },
-        "cpu",
-    )
-
-    assert metrics == {
-        "disk_offload_s/param": 3.3333,
-        "disk_offload_gib/param": 1.0,
-        "disk_offload_gib_s/param": 0.3,
-    }

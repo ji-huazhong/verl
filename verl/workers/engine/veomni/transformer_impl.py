@@ -262,7 +262,7 @@ class VeOmniEngine(FSDPEngine):
         self.offload(
             model=self._is_offload_param,
             optimizer=self._is_offload_optimizer,
-            grad=self._is_offload_grad,
+            grad=self._is_offload_param,
             preserve_grad=False,
         )
 

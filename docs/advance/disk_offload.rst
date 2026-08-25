@@ -164,64 +164,6 @@ FSDP and VeOmni also reject combining disk targets with ``offload_policy`` and
 combinations follow verl's existing configuration style and are checked with
 ``assert``.
 
-Disk offload metrics
---------------------
-
-verl reports disk metrics only after a successful operation transfers a
-non-zero payload. Disabled targets, already-offloaded state, absent optimizer
-state, and discarded gradients therefore do not produce zero-valued metrics.
-For each component that performs I/O, the worker emits:
-
-.. code-block:: text
-
-   disk_offload_s/param
-   disk_offload_gib/param
-   disk_offload_gib_s/param
-   disk_onload_s/param
-   disk_onload_gib/param
-   disk_onload_gib_s/param
-
-``param`` may be replaced by ``grad`` or ``optimizer``. PPO trainers add the
-role or phase prefix, for example ``actor/disk_offload_s/param``,
-``ref/disk_onload_gib_s/param``, or
-``update_weights/disk_onload_s/param``.
-Checkpoint transitions are excluded from these component metrics because
-checkpoint latency is already reported by the trainer's checkpoint timing.
-
-Metrics describe synchronous store API calls, including the internally
-pipelined accelerator/CPU copies, staging, file I/O, and manifest handling.
-They do not include every surrounding backend action, such as tensor
-discovery, storage release, or allocator-cache cleanup. Across ranks, ``*_s``
-is the maximum rank-local elapsed time, ``*_gib`` is the sum of transferred
-bytes, and ``*_gib_s`` is the summed GiB divided by the maximum elapsed time.
-This models the phase boundary, which completes at the speed of its slowest
-rank.
-
-The implementation uses buffered file I/O. A completed write may still reside
-in the operating-system page cache, so ``*_gib_s`` is aggregate effective
-throughput across participating ranks, not sustained NVMe-device bandwidth. On
-multi-node jobs the value is aggregated across nodes and should not be compared
-directly with the specification of one device.
-Metric values are rounded to four decimal places before they are returned to
-the trainer; whether trailing zeros are displayed depends on the configured
-logger.
-
-Metric granularity follows actual disk operations rather than configuration
-granularity. FSDP and VeOmni couple gradient placement to parameters, but emit
-separate ``param`` and ``grad`` metrics when live gradients are actually
-serialized. The standard PPO/GRPO path clears gradients before offload, so it
-normally emits no ``grad`` disk metric.
-
-For disk-target parameters, read-only engine operations reuse a current
-generation. Reference forwards, actor old-log-prob computation, critic value
-inference, and rollout weight export restore parameters as needed, then release
-accelerator storage without rewriting unchanged parameters. Their normal phase
-metrics therefore report parameter onload but no parameter offload. Engines
-track the live parameter version against the committed generation; optimizer
-steps, checkpoint loads, and other weight replacements must mark parameters as
-updated. If the versions differ, the read-only offload path commits a new
-generation before releasing its resident copy.
-
 Disk layout and memory use
 --------------------------
 
@@ -245,6 +187,13 @@ are not made crash-durable. ``cleanup_on_exit`` uses a Python exit handler and
 removes only the exact store directory carrying the store's ownership marker.
 Cleanup is best effort: abrupt worker or node termination can leave scratch
 directories behind.
+
+For disk-target parameters, read-only engine operations reuse a current
+generation. Reference forwards, actor old-log-prob computation, critic value
+inference, and rollout weight export restore parameters as needed, then release
+accelerator storage without rewriting unchanged parameters. Optimizer steps,
+checkpoint loads, and other weight replacements invalidate this reuse by
+advancing the parameter version.
 
 Provision enough capacity for the rank-local state of every disk-target
 component and engine store on a node. Parameter, gradient, and optimizer files

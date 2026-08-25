@@ -29,14 +29,6 @@ class _FakeTrainerEngine:
         return iter(self.weights), None
 
 
-class _FakeActor:
-    def __init__(self):
-        self.engine = _FakeTrainerEngine()
-
-    def collect_disk_offload_metrics(self):
-        return {}
-
-
 class _FakeCheckpointEngine:
     def __init__(self):
         self.sent_global_steps = None
@@ -74,7 +66,7 @@ def test_actor_worker_passes_global_steps_to_checkpoint_engine_send():
             checkpoint_engine=SimpleNamespace(backend="modelexpress"),
         ),
     )
-    worker.actor = _FakeActor()
+    worker.actor = SimpleNamespace(engine=_FakeTrainerEngine())
     worker.checkpoint_engine = checkpoint_engine
 
     asyncio.run(

@@ -185,12 +185,9 @@ class FSDPEngine(BaseEngine):
         param_target = self.engine_config.get_offload_target("param")
         self._offload_targets = {
             "param": param_target,
-            # Preserve the backend's parameter-gradient placement coupling.
-            "grad": param_target,
             "optimizer": self.engine_config.get_offload_target("optimizer"),
         }
         self._is_offload_param = self._offload_targets["param"] != "none"
-        self._is_offload_grad = self._offload_targets["grad"] != "none"
         self._is_offload_optimizer = self._offload_targets["optimizer"] != "none"
         self._component_resident = {"param": True, "grad": True, "optimizer": True}
         self._grad_preserved = False
@@ -235,7 +232,7 @@ class FSDPEngine(BaseEngine):
         self.offload(
             model=self._is_offload_param,
             optimizer=self._is_offload_optimizer,
-            grad=self._is_offload_grad,
+            grad=self._is_offload_param,
             preserve_grad=False,
         )
 
@@ -447,7 +444,6 @@ class FSDPEngine(BaseEngine):
             if use_forward_cpu_offload:
                 cpu_offload = CPUOffload(offload_params=True)
                 self._is_offload_param = False
-                self._is_offload_grad = False
                 self._is_offload_optimizer = False
 
             module = FSDP(
@@ -474,7 +470,6 @@ class FSDPEngine(BaseEngine):
             offload_policy = None
             if self.engine_config.offload_policy or use_forward_cpu_offload:
                 self._is_offload_param = False
-                self._is_offload_grad = False
                 self._is_offload_optimizer = False
                 offload_policy = CPUOffloadPolicy(pin_memory=True)
                 self._uses_fsdp2_cpu_offload_policy = True
@@ -898,7 +893,7 @@ class FSDPEngine(BaseEngine):
 
         selected = {
             "param": model and self._is_offload_param and self._component_resident["param"],
-            "grad": grad and self._is_offload_grad and self._component_resident["grad"],
+            "grad": grad and self._is_offload_param and self._component_resident["grad"],
             "optimizer": (
                 optimizer
                 and self.optimizer is not None
@@ -909,7 +904,7 @@ class FSDPEngine(BaseEngine):
         assert not selected["grad"] or selected["param"], "FSDP gradient offload must be coupled with parameter offload"
 
         cpu_param = selected["param"] and self._offload_targets["param"] == "cpu"
-        cpu_grad = selected["grad"] and self._offload_targets["grad"] == "cpu"
+        cpu_grad = selected["grad"] and self._offload_targets["param"] == "cpu"
         if cpu_param:
             self.to(device="cpu", model=True, optimizer=False, grad=cpu_grad)
             self._component_resident["param"] = False
@@ -918,7 +913,7 @@ class FSDPEngine(BaseEngine):
                 self._grad_preserved = preserve_grad
 
         disk_param = selected["param"] and self._offload_targets["param"] == "disk"
-        disk_grad = selected["grad"] and self._offload_targets["grad"] == "disk"
+        disk_grad = selected["grad"] and self._offload_targets["param"] == "disk"
         if disk_param or disk_grad:
             refs = offload_fsdp_model_to_disk(
                 self.module,
@@ -968,7 +963,7 @@ class FSDPEngine(BaseEngine):
 
         selected = {
             "param": model and self._is_offload_param and not self._component_resident["param"],
-            "grad": grad and self._is_offload_grad and not self._component_resident["grad"],
+            "grad": grad and self._is_offload_param and not self._component_resident["grad"],
             "optimizer": (
                 optimizer
                 and self.optimizer is not None
@@ -979,7 +974,7 @@ class FSDPEngine(BaseEngine):
         assert not selected["grad"] or selected["param"], "FSDP gradient onload must be coupled with parameter onload"
 
         cpu_param = selected["param"] and self._offload_targets["param"] == "cpu"
-        cpu_grad = selected["grad"] and self._offload_targets["grad"] == "cpu"
+        cpu_grad = selected["grad"] and self._offload_targets["param"] == "cpu"
         if cpu_param:
             self.to(device=get_device_name(), model=True, optimizer=False, grad=cpu_grad)
             self._component_resident["param"] = True
@@ -987,7 +982,7 @@ class FSDPEngine(BaseEngine):
                 self._component_resident["grad"] = True
 
         disk_param = selected["param"] and self._offload_targets["param"] == "disk"
-        disk_grad = selected["grad"] and self._offload_targets["grad"] == "disk"
+        disk_grad = selected["grad"] and self._offload_targets["param"] == "disk"
         if disk_param or (disk_grad and self._grad_preserved):
             load_fsdp_model_from_disk(
                 self._require_disk_store(),
