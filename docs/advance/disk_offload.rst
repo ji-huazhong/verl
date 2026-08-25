@@ -143,8 +143,9 @@ Disk layout and memory use
 isolated scratch directory for every engine store, so colocated roles may share
 the same configured root without colliding. In a multi-node job, the same path
 must resolve to local storage on every node. For each component, a store uses
-one reusable flat data file plus a manifest and generation marker; it does not
-create one file per tensor.
+one reusable flat data file (for example, ``param.bin`` or ``optimizer.bin``)
+and keeps tensor layout metadata in worker memory; it does not create one file
+per tensor.
 
 Disk I/O is chunked and double-buffered. The public store call remains
 synchronous, but internally one pinned CPU buffer can perform file I/O while
@@ -154,8 +155,8 @@ buffer directly. ``chunk_size_mb`` bounds each buffer, so one active store can
 retain up to ``2 * chunk_size_mb`` of staging memory without retaining a full
 user-space copy of the component. Operating-system page cache remains outside
 this bound. Accelerator storage is released only after the complete disk
-generation has been written and published for the current process; the files
-are not made crash-durable. ``cleanup_on_exit`` uses a Python exit handler and
+write returns successfully. The files are not crash-durable or recoverable
+after worker exit. ``cleanup_on_exit`` uses a Python exit handler and
 removes only the exact store directory carrying the store's ownership marker.
 Cleanup is best effort: abrupt worker or node termination can leave scratch
 directories behind.

@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
-
 import pytest
 import torch
 
@@ -40,7 +38,7 @@ def test_disk_store_round_trip_and_layout_reuse(tmp_path):
     store.write_tensors("param", [("first", first), ("second", second)])
     first_metadata = store.metadata("param", "first")
     second_metadata = store.metadata("param", "second")
-    state_path = store.root / "param" / "state.bin"
+    state_path = store.root / "param.bin"
     initial_file_size = state_path.stat().st_size
 
     first.zero_()
@@ -64,13 +62,19 @@ def test_disk_store_rejects_layout_changes(tmp_path):
         store.write_tensors("optimizer", [("moment", torch.ones(9, dtype=torch.float32))])
 
 
-def test_disk_store_rejects_uncommitted_generation(tmp_path):
+def test_disk_store_does_not_publish_failed_write(tmp_path, monkeypatch):
     store = _new_store(tmp_path)
     tensor = torch.ones(8, dtype=torch.float32)
     store.write_tensors("grad", [("grad", tensor)])
-    (store.root / "grad" / "generation").unlink()
 
-    with pytest.raises(RuntimeError, match="No committed grad"):
+    def fail_write(*args, **kwargs):
+        raise OSError("write failed")
+
+    monkeypatch.setattr(store, "_write_tensors_pipelined", fail_write)
+    with pytest.raises(OSError, match="write failed"):
+        store.write_tensors("grad", [("grad", tensor)])
+
+    with pytest.raises(RuntimeError, match="No complete grad"):
         store.read_tensors("grad", [("grad", tensor)])
 
 
@@ -78,10 +82,8 @@ def test_disk_store_uses_one_data_file_per_component(tmp_path):
     store = _new_store(tmp_path)
     store.write_tensors("param", [(f"tensor-{index}", torch.ones(4)) for index in range(10)])
 
-    component_files = sorted(path.name for path in (store.root / "param").iterdir())
-    assert component_files == ["generation", "manifest.json", "state.bin"]
-    manifest = json.loads((store.root / "param" / "manifest.json").read_text(encoding="utf-8"))
-    assert len(manifest["entries"]) == 10
+    store_files = sorted(path.name for path in store.root.iterdir())
+    assert store_files == [".owner", "param.bin"]
 
 
 def test_disk_store_only_cleans_its_owned_directory(tmp_path):

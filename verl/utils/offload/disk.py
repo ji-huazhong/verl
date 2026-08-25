@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import atexit
 import errno
-import json
 import logging
 import os
 import re
@@ -27,7 +26,7 @@ import threading
 import uuid
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -67,12 +66,6 @@ class TensorDiskMetadata:
     dtype: str
     shape: tuple[int, ...]
 
-    @classmethod
-    def from_dict(cls, value: dict) -> TensorDiskMetadata:
-        value = dict(value)
-        value["shape"] = tuple(value["shape"])
-        return cls(**value)
-
 
 @dataclass
 class _StagingSlot:
@@ -87,10 +80,10 @@ class DiskOffloadStore:
 
     Calls remain synchronous at the API boundary, while two fixed-size CPU
     staging tensors pipeline accelerator copies with file I/O.  Disk offload
-    therefore does not create a full host-memory replica.  A generation marker
-    is removed before overwriting data and recreated only after the manifest is
-    committed.  Callers must release accelerator storage only after
-    :meth:`write_tensors` returns successfully.
+    therefore does not create a full host-memory replica.  Layout metadata is
+    process-local because offload files are disposable worker scratch data.
+    Callers must release accelerator storage only after :meth:`write_tensors`
+    returns successfully.
     """
 
     def __init__(
@@ -114,6 +107,7 @@ class DiskOffloadStore:
         self._staging_slots: list[_StagingSlot] | None = None
         self._copy_stream = None
         self._io_executor: ThreadPoolExecutor | None = None
+        self._layouts: dict[str, dict[str, TensorDiskMetadata]] = {}
         self._owner_token = uuid.uuid4().hex
 
         job_segment = _safe_segment(job_id or _runtime_job_id())
@@ -126,12 +120,10 @@ class DiskOffloadStore:
         if cleanup_on_exit:
             atexit.register(self.close)
 
-    def _paths(self, component: str) -> tuple[Path, Path, Path]:
+    def _data_path(self, component: str) -> Path:
         if component not in _COMPONENTS:
             raise ValueError(f"Unknown offload component: {component!r}")
-        component_dir = self.root / component
-        component_dir.mkdir(parents=True, exist_ok=True)
-        return component_dir / "state.bin", component_dir / "manifest.json", component_dir / "generation"
+        return self.root / f"{component}.bin"
 
     def _get_staging_slots(self) -> list[_StagingSlot]:
         if self._staging_slots is not None:
@@ -166,14 +158,6 @@ class DiskOffloadStore:
         if not tensor.is_contiguous():
             raise ValueError("disk offload requires contiguous tensors")
         return tensor.detach().view(torch.uint8).reshape(-1)
-
-    @staticmethod
-    def _load_manifest(path: Path) -> tuple[int, dict[str, TensorDiskMetadata]]:
-        if not path.exists():
-            return 0, {}
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        entries = {key: TensorDiskMetadata.from_dict(value) for key, value in payload["entries"].items()}
-        return int(payload["generation"]), entries
 
     @staticmethod
     def _reserve(fd: int, length: int) -> None:
@@ -384,16 +368,16 @@ class DiskOffloadStore:
             raise
 
     def write_tensors(self, component: str, tensors: Iterable[tuple[str, torch.Tensor]]) -> None:
-        """Synchronously write a complete component generation."""
+        """Synchronously write a complete component."""
 
         tensor_list = [(key, tensor) for key, tensor in tensors if tensor.numel() > 0]
         keys = [key for key, _ in tensor_list]
         if len(keys) != len(set(keys)):
-            raise ValueError(f"Duplicate tensor keys in {component} offload generation")
+            raise ValueError(f"Duplicate tensor keys in {component} offload state")
 
         with self._lock:
-            data_path, manifest_path, generation_path = self._paths(component)
-            previous_generation, layout = self._load_manifest(manifest_path)
+            data_path = self._data_path(component)
+            layout = dict(self._layouts.get(component, {}))
             next_offset = max((entry.offset + entry.nbytes for entry in layout.values()), default=0)
 
             for key, tensor in tensor_list:
@@ -419,8 +403,8 @@ class DiskOffloadStore:
                 )
                 next_offset += nbytes
 
-            generation = previous_generation + 1
-            generation_path.unlink(missing_ok=True)
+            # An interrupted overwrite may leave the existing data file partial.
+            self._layouts.pop(component, None)
             fd = os.open(data_path, os.O_CREAT | os.O_RDWR, 0o600)
             try:
                 self._reserve(fd, max((entry.offset + entry.nbytes for entry in layout.values()), default=0))
@@ -428,35 +412,23 @@ class DiskOffloadStore:
                     self._write_tensors_pipelined(fd, ((tensor, layout[key].offset) for key, tensor in tensor_list))
             finally:
                 os.close(fd)
-
-            payload = {
-                "version": 1,
-                "generation": generation,
-                "entries": {key: asdict(value) for key, value in layout.items()},
-            }
-            manifest_tmp = manifest_path.with_name(f".{manifest_path.name}.{os.getpid()}.tmp")
-            manifest_tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
-            os.replace(manifest_tmp, manifest_path)
-
-            generation_tmp = generation_path.with_name(f".{generation_path.name}.{os.getpid()}.tmp")
-            generation_tmp.write_text(str(generation), encoding="utf-8")
-            os.replace(generation_tmp, generation_path)
+            self._layouts[component] = layout
 
     def read_tensors(self, component: str, tensors: Iterable[tuple[str, torch.Tensor]]) -> None:
-        """Synchronously restore tensors from the latest committed generation."""
+        """Synchronously restore tensors from the latest complete write."""
 
         tensor_list = [(key, tensor) for key, tensor in tensors if tensor.numel() > 0]
         with self._lock:
-            data_path, manifest_path, generation_path = self._paths(component)
-            generation, layout = self._load_manifest(manifest_path)
-            if not generation_path.exists() or generation_path.read_text(encoding="utf-8") != str(generation):
-                raise RuntimeError(f"No committed {component} disk-offload generation under {self.root}")
+            data_path = self._data_path(component)
+            layout = self._layouts.get(component)
+            if layout is None:
+                raise RuntimeError(f"No complete {component} disk-offload state under {self.root}")
 
             restore_entries = []
             for key, tensor in tensor_list:
                 metadata = layout.get(key)
                 if metadata is None:
-                    raise KeyError(f"Tensor {key!r} is missing from the {component} disk manifest")
+                    raise KeyError(f"Tensor {key!r} is missing from the {component} disk-offload state")
                 current = (self._tensor_nbytes(tensor), tuple(tensor.shape), str(tensor.dtype))
                 expected = (metadata.nbytes, metadata.shape, metadata.dtype)
                 if current != expected:
@@ -471,19 +443,19 @@ class DiskOffloadStore:
                 os.close(fd)
 
     def metadata_many(self, component: str, keys: Iterable[str]) -> list[TensorDiskMetadata]:
-        """Resolve metadata for several tensors from one manifest read."""
+        """Resolve metadata for several tensors."""
 
         with self._lock:
-            _, manifest_path, generation_path = self._paths(component)
-            generation, layout = self._load_manifest(manifest_path)
-            if not generation_path.exists() or generation_path.read_text(encoding="utf-8") != str(generation):
-                raise RuntimeError(f"No committed {component} disk-offload generation under {self.root}")
+            self._data_path(component)
+            layout = self._layouts.get(component)
+            if layout is None:
+                raise RuntimeError(f"No complete {component} disk-offload state under {self.root}")
             resolved = []
             for key in keys:
                 try:
                     resolved.append(layout[key])
                 except KeyError as exc:
-                    raise KeyError(f"Tensor {key!r} is missing from the {component} disk manifest") from exc
+                    raise KeyError(f"Tensor {key!r} is missing from the {component} disk-offload state") from exc
             return resolved
 
     def metadata(self, component: str, key: str) -> TensorDiskMetadata:

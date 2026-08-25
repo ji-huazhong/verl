@@ -18,7 +18,7 @@ FSDP2 and VeOmni expose parameters as ``DTensor`` objects, while FSDP1
 exposes views into flat parameters.  Replacing ``tensor.data`` would destroy
 the former's placements and the latter's aliasing.  These helpers therefore
 persist each unique local storage once and resize that same storage to zero
-after the disk generation commits.  Restoring the storage in place keeps all
+after the disk write completes.  Restoring the storage in place keeps all
 Tensor/Parameter/DTensor objects and views valid.
 """
 
@@ -143,7 +143,7 @@ def write_storage_refs(
     component: str,
     tensors: Iterable[tuple[str, torch.Tensor]],
 ) -> list[StorageOffloadRef]:
-    """Commit a component generation, then release all referenced storages."""
+    """Write a component, then release all referenced storages."""
 
     refs = storage_offload_refs(tensors)
     store.write_tensors(component, ((ref.key, ref.tensor) for ref in refs))
@@ -166,8 +166,7 @@ def read_storage_refs(store: DiskOffloadStore, component: str, refs: Iterable[St
         return
     metadata = store.metadata_many(component, (ref.key for ref in refs))
     resolved = list(zip(refs, metadata, strict=True))
-    # Validate the complete generation before resizing any live storage. A
-    # stale/missing later entry must not leave earlier tensors half-restored.
+    # Validate all refs first so a later mismatch cannot leave earlier storages half-restored.
     for ref, metadata in resolved:
         ref.validate_restore(metadata)
     targets = [(ref.key, ref.prepare_restore(metadata)) for ref, metadata in resolved]
