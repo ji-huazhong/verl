@@ -15,7 +15,7 @@
 
 import logging
 from dataclasses import dataclass, field, fields
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Sequence
 
 import torch
 import torch.distributed as dist
@@ -516,45 +516,6 @@ class VeOmniEngine(FSDPEngine):
                 offload_veomni_optimizer(self.optimizer)
         else:
             raise ValueError(f"Invalid device type: {device}")
-
-    def save_checkpoint(
-        self,
-        local_path: str,
-        hdfs_path: Optional[str] = None,
-        global_step: int = 0,
-        max_ckpt_to_keep: Optional[int] = None,
-        **kwargs,
-    ) -> None:
-        """
-        Save VeOmni checkpoint, handling parameter offload as needed.
-        """
-        restore_disk_optimizer = (
-            self.optimizer is not None
-            and self._offload_targets["optimizer"] == "disk"
-            and self.checkpoint_manager.should_save_optimizer
-        )
-        with self._resident(model=True, optimizer=restore_disk_optimizer):
-            self.checkpoint_manager.save_checkpoint(
-                local_path=local_path,
-                hdfs_path=hdfs_path,
-                global_step=global_step,
-                max_ckpt_to_keep=max_ckpt_to_keep,
-            )
-            torch.distributed.barrier()
-
-    def load_checkpoint(
-        self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: int = True, **kwargs
-    ) -> None:
-        """
-        Load VeOmni checkpoint, restoring parameters and optimizer state.
-        """
-        with self._resident(model=True, optimizer=self.optimizer is not None):
-            self.checkpoint_manager.load_checkpoint(
-                local_path=local_path,
-                hdfs_path=hdfs_path,
-                del_local_after_load=del_local_after_load,
-            )
-            torch.distributed.barrier()
 
     def get_per_tensor_param_shard(self, **kwargs):
         """Yield each rank's *local* shard ``(name, local_shard, ShardSpec)`` -- the
