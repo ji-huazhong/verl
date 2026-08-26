@@ -22,7 +22,7 @@ import logging
 import os
 import warnings
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 import torch
 import torch.nn.functional as F
@@ -42,6 +42,7 @@ import verl.utils.megatron.tensor_parallel as tp_utils
 from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.fs import local_mkdir_safe
 from verl.utils.model import normalize_model_name
+from verl.utils.offload import DiskOffloadStore, StorageOffloadRef, read_storage_refs, write_storage_refs
 from verl.utils.torch_dtypes import PrecisionType
 from verl.workers.config import HFModelConfig, McoreEngineConfig
 
@@ -795,6 +796,115 @@ def load_megatron_model_to_gpu(models, load_grad=True, load_frozen_params=True):
                     param.grad = param.grad.to(device_id, non_blocking=True)
     gc.collect()
     get_torch_device().empty_cache()
+
+
+def _model_disk_entries(models) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield stable keys and tensors for Megatron parameter storage."""
+
+    for model_index, model_chunk in enumerate(models):
+        if isinstance(model_chunk, DDP):
+            buffer_groups = (
+                ("dense", model_chunk.buffers),
+                ("expert", model_chunk.expert_parallel_buffers),
+            )
+            for group_name, buffers in buffer_groups:
+                for buffer_index, buffer in enumerate(buffers):
+                    yield f"model.{model_index}.{group_name}.{buffer_index}.param", buffer.param_data
+            for name, param in model_chunk.module.named_parameters():
+                if not param.requires_grad:
+                    yield f"model.{model_index}.frozen.{name}", param
+        else:
+            for name, param in model_chunk.named_parameters():
+                kind = "param" if param.requires_grad else "frozen"
+                yield f"model.{model_index}.{kind}.{name}", param
+
+
+@torch.no_grad()
+def offload_megatron_model_to_disk(
+    models,
+    store: DiskOffloadStore,
+) -> list[StorageOffloadRef]:
+    """Persist selected model state and then release accelerator storage."""
+
+    refs = write_storage_refs(store, "param", _model_disk_entries(models))
+
+    for model_chunk in models:
+        if isinstance(model_chunk, DDP):
+            for buffers in (model_chunk.buffers, model_chunk.expert_parallel_buffers):
+                for buffer in buffers:
+                    if buffer.grad_data.storage().size() > 0:
+                        buffer.grad_data_size = buffer.grad_data.storage().size()
+                        buffer.grad_data.storage().resize_(0)
+        else:
+            for param in model_chunk.parameters():
+                param.grad = None
+
+        cleared = _clear_te_fp8_weight_workspaces(model_chunk)
+        if cleared:
+            logger.debug("Cleared %d TE FP8 weight workspaces on disk offload", cleared)
+
+    return refs
+
+
+@torch.no_grad()
+def load_megatron_model_from_disk(
+    store: DiskOffloadStore,
+    refs: list[StorageOffloadRef],
+) -> None:
+    """Restore selected Megatron model state from disk."""
+
+    read_storage_refs(store, "param", refs)
+
+
+def _iter_megatron_optimizer_tensors(optimizers) -> Iterator[tuple[str, torch.Tensor]]:
+    opts = optimizers.chained_optimizers if isinstance(optimizers, ChainedOptimizer) else [optimizers]
+
+    for optimizer_index, optimizer in enumerate(opts):
+        for group_index, group in enumerate(getattr(optimizer, "shard_fp32_from_float16_groups", [])):
+            for param_index, param in enumerate(group):
+                if param is not None:
+                    yield f"optimizer.{optimizer_index}.master.{group_index}.{param_index}", param
+
+        inner_optimizer = getattr(optimizer, "optimizer", None)
+        if inner_optimizer is None:
+            continue
+        state_sources = [
+            (f"sub.{sub_index}", sub_optimizer.state)
+            for sub_index, sub_optimizer in enumerate(getattr(inner_optimizer, "sub_optimizers", [inner_optimizer]))
+        ]
+        if hasattr(inner_optimizer, "sub_optimizers"):
+            # HybridDeviceOptimizer exposes additional non-aliased state here.
+            state_sources.append(("hybrid", inner_optimizer.state))
+        for source_name, state_mapping in state_sources:
+            for state_index, state in enumerate(state_mapping.values()):
+                for state_name in sorted(state, key=str):
+                    tensor = state[state_name]
+                    if isinstance(tensor, torch.Tensor):
+                        yield f"optimizer.{optimizer_index}.state.{source_name}.{state_index}.{state_name}", tensor
+
+
+@torch.no_grad()
+def offload_megatron_optimizer_to_disk(optimizers, store: DiskOffloadStore) -> list[StorageOffloadRef]:
+    """Persist Megatron optimizer tensors and release their resident storage."""
+
+    # Disk targets must not retain HybridDeviceOptimizer's native CPU state.
+    refs = write_storage_refs(store, "optimizer", _iter_megatron_optimizer_tensors(optimizers))
+
+    try:
+        from transformer_engine.pytorch.module.base import _dummy_wgrads
+
+        _dummy_wgrads.clear()
+    except ImportError:
+        pass
+    get_global_memory_buffer().buffer.clear()
+    return refs
+
+
+@torch.no_grad()
+def load_megatron_optimizer_from_disk(store: DiskOffloadStore, refs: list[StorageOffloadRef]) -> None:
+    """Restore Megatron optimizer tensors from disk."""
+
+    read_storage_refs(store, "optimizer", refs)
 
 
 @torch.no_grad()

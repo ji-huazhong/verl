@@ -250,6 +250,26 @@ class BaseEngine:
         if grad:
             assert model, "Gradient buffers must be moved to device along with model parameters"
 
+    def offload(
+        self,
+        *,
+        model: bool = True,
+        optimizer: bool = True,
+        grad: bool = True,
+    ) -> None:
+        """Move selected state to its configured offload target.
+
+        The base implementation preserves the legacy CPU behavior.  Backends
+        supporting non-device targets such as disk override this method.
+        """
+
+        self.to(device="cpu", model=model, optimizer=optimizer, grad=grad)
+
+    def onload(self, *, model: bool = True, optimizer: bool = True, grad: bool = True) -> None:
+        """Restore selected offloaded state to the active accelerator."""
+
+        self.to(device=get_device_name(), model=model, optimizer=optimizer, grad=grad)
+
     def save_checkpoint(
         self,
         local_path: str,
@@ -314,18 +334,24 @@ class BaseEngineCtx:
     def _context_switch(self, device):
         if self.disable_auto_offload:
             return
-        if device != "cpu":
-            if not self.engine.is_param_offload_enabled and not self.engine.is_optimizer_offload_enabled:
-                return
+        if not (self.engine.is_param_offload_enabled or self.engine.is_optimizer_offload_enabled):
+            return
+        is_onload = device != "cpu"
         if self.mode == "eval":
-            self.engine.to(device=device, model=self.engine.is_param_offload_enabled, optimizer=False, grad=False)
+            if is_onload:
+                self.engine.onload(model=self.engine.is_param_offload_enabled, optimizer=False, grad=False)
+            else:
+                self.engine.offload(model=self.engine.is_param_offload_enabled, optimizer=False, grad=False)
         elif self.mode == "train":
-            self.engine.to(
-                device=device,
-                model=self.engine.is_param_offload_enabled,
-                optimizer=self.engine.is_optimizer_offload_enabled,
-                grad=self.engine.is_param_offload_enabled,
-            )
+            kwargs = {
+                "model": self.engine.is_param_offload_enabled,
+                "optimizer": self.engine.is_optimizer_offload_enabled,
+                "grad": self.engine.is_param_offload_enabled,
+            }
+            if is_onload:
+                self.engine.onload(**kwargs)
+            else:
+                self.engine.offload(**kwargs)
 
     def __enter__(self):
         self.engine.mode = self.mode

@@ -15,7 +15,7 @@
 
 import logging
 from dataclasses import dataclass, field, fields
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Sequence
 
 import torch
 import torch.distributed as dist
@@ -178,8 +178,7 @@ class VeOmniEngine(FSDPEngine):
 
         self.use_remove_padding = self.model_config.use_remove_padding
 
-        self._is_offload_param = self.engine_config.param_offload
-        self._is_offload_optimizer = self.engine_config.optimizer_offload
+        self._init_offload_state()
         self._is_lora = self.model_config.lora_rank > 0
         # When VeOmni parallelizes with enable_fsdp_offload, FSDP2 uses CPUOffloadPolicy and
         # owns CPU<->accelerator placement. Manually calling model.to(device) then crashes
@@ -224,6 +223,7 @@ class VeOmniEngine(FSDPEngine):
         Applies device, dtype, and precision configurations, including mixed precision.
         Sets up checkpoint manager and FLOPs counter.
         """
+        self._reset_offload_residency()
         self._build_model_optimizer()
 
         if self.enable_routing_replay:
@@ -259,11 +259,10 @@ class VeOmniEngine(FSDPEngine):
             trust_remote_code=self.model_config.trust_remote_code,
         )
 
-        self.to(
-            device="cpu",
+        self.offload(
             model=self._is_offload_param,
             optimizer=self._is_offload_optimizer,
-            grad=self._is_offload_optimizer,
+            grad=self._is_offload_param,
         )
 
         log_gpu_memory_usage("After offload model/optimizer/grad during init", logger=logger)
@@ -518,51 +517,6 @@ class VeOmniEngine(FSDPEngine):
         else:
             raise ValueError(f"Invalid device type: {device}")
 
-    def save_checkpoint(
-        self,
-        local_path: str,
-        hdfs_path: Optional[str] = None,
-        global_step: int = 0,
-        max_ckpt_to_keep: Optional[int] = None,
-        **kwargs,
-    ) -> None:
-        """
-        Save VeOmni checkpoint, handling parameter offload as needed.
-        """
-        origin_module_device = next(self.module.parameters()).device.type
-        if (self._is_offload_param or origin_module_device == "cpu") and not getattr(
-            self, "_uses_fsdp2_cpu_offload_policy", False
-        ):
-            load_veomni_model_to_gpu(self.module)
-
-        self.checkpoint_manager.save_checkpoint(
-            local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
-        )
-
-        torch.distributed.barrier()
-        if self._is_offload_param:
-            offload_veomni_model_to_cpu(self.module)
-
-    def load_checkpoint(
-        self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: int = True, **kwargs
-    ) -> None:
-        """
-        Load VeOmni checkpoint, restoring parameters and optimizer state.
-        """
-        if self._is_offload_param and not getattr(self, "_uses_fsdp2_cpu_offload_policy", False):
-            load_veomni_model_to_gpu(self.module)
-
-        self.checkpoint_manager.load_checkpoint(
-            local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
-        )
-
-        torch.distributed.barrier()
-        if self._is_offload_param:
-            offload_veomni_model_to_cpu(self.module)
-
-        if self._is_offload_optimizer:
-            offload_veomni_optimizer(self.optimizer)
-
     def get_per_tensor_param_shard(self, **kwargs):
         """Yield each rank's *local* shard ``(name, local_shard, ShardSpec)`` -- the
         DTensor export plus veomni's EP declarations. The mechanics live in
@@ -574,16 +528,20 @@ class VeOmniEngine(FSDPEngine):
         from .utils import veomni_shard_export
 
         manual_offload = not getattr(self, "_uses_fsdp2_cpu_offload_policy", False)
-        if manual_offload:
+        offload_back = (
+            manual_offload and self._offload_targets["param"] == "cpu" and not self._component_resident["param"]
+        )
+        if manual_offload and self._is_offload_param:
+            self.onload(model=True, optimizer=False, grad=False)
+        elif manual_offload:
             load_veomni_model_to_gpu(self.module)
         gen, meta = veomni_shard_export(self.module)
 
         def _with_offload_back():
             yield from gen
-            if manual_offload and self._is_offload_param:
-                offload_veomni_model_to_cpu(self.module)
+            self.offload(model=True, optimizer=False, grad=False)
 
-        return _with_offload_back(), meta
+        return (_with_offload_back() if offload_back else gen), meta
 
     def _hf_delta_entry(self, name, spec, place, lidx, lval):
         """veomni's per-param entry builder: EP/converter specs (fused expert
@@ -608,7 +566,10 @@ class VeOmniEngine(FSDPEngine):
         # here leaves the module half-moved and crashes state_dict() below (#5995). The
         # per-DTensor .to(device).full_tensor() in param_generator() below stages each
         # shard instead, so the manual whole-model move is unnecessary under CPU offload.
-        if not getattr(self, "_uses_fsdp2_cpu_offload_policy", False):
+        manual_offload = not getattr(self, "_uses_fsdp2_cpu_offload_policy", False)
+        if manual_offload and self._is_offload_param:
+            self.onload(model=True, optimizer=False, grad=False)
+        elif manual_offload:
             load_veomni_model_to_gpu(self.module)
 
         # TODO: currently only for DeepseekV4, unify all models to export weights by converter.
@@ -619,8 +580,8 @@ class VeOmniEngine(FSDPEngine):
         params = self.module.state_dict()
         params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
 
-        if self._is_offload_param:
-            offload_veomni_model_to_cpu(self.module)
+        if self._offload_targets["param"] == "cpu":
+            self.offload(model=True, optimizer=False, grad=False)
 
         ps = parallel_state.get_parallel_state()
         model_type = getattr(self.module.config, "model_type", "default")

@@ -21,6 +21,7 @@ except ImportError:
     repatch = None
 
 from verl.trainer.config import CheckpointConfig
+from verl.utils.device import get_device_name
 from verl.workers.config import (
     HFModelConfig,
     McoreEngineConfig,
@@ -53,8 +54,49 @@ def _mindspeed_repatch(engine_config):
         repatch(repatch_config)
 
 
+class _MindspeedOffloadMixin:
+    def _reset_fp8_offload_state(self, device: str, *, model: bool, optimizer: bool, grad: bool) -> None:
+        model = model and self.is_param_offload_enabled
+        optimizer = optimizer and self.is_optimizer_offload_enabled
+        grad = grad and self.is_param_offload_enabled
+        if model or optimizer or grad:
+            reset_fp8_reuse_quantized_weight(self, device, model, optimizer, grad)
+
+    def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
+        """
+        Move model parameters, optimizer states, or both to the specified device.
+        Note that this function executes irrespective of offload config. It serves as manual control
+
+        Args:
+            device: Target device identifier.
+            model: If True, move the model.
+            optimizer: If True, move the optimizer states.
+        """
+        reset_fp8_reuse_quantized_weight(self, device, model, optimizer, grad)
+        super().to(device=device, model=model, optimizer=optimizer, grad=grad)
+
+    def offload(
+        self,
+        *,
+        model: bool = True,
+        optimizer: bool = True,
+        grad: bool = True,
+    ) -> None:
+        self._reset_fp8_offload_state("cpu", model=model, optimizer=optimizer, grad=grad)
+        super().offload(model=model, optimizer=optimizer, grad=grad)
+
+    def onload(self, *, model: bool = True, optimizer: bool = True, grad: bool = True, **kwargs) -> None:
+        self._reset_fp8_offload_state(
+            get_device_name(),
+            model=model,
+            optimizer=optimizer,
+            grad=grad,
+        )
+        super().onload(model=model, optimizer=optimizer, grad=grad, **kwargs)
+
+
 @EngineRegistry.register(model_type="language_model", backend="megatron", device="npu")
-class MindspeedEngineWithLMHead(MegatronEngineWithLMHead):
+class MindspeedEngineWithLMHead(_MindspeedOffloadMixin, MegatronEngineWithLMHead):
     def __init__(
         self,
         model_config: HFModelConfig,
@@ -73,22 +115,9 @@ class MindspeedEngineWithLMHead(MegatronEngineWithLMHead):
         _mindspeed_repatch(self.engine_config)
         super()._init_device_mesh()
 
-    def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
-        """
-        Move model parameters, optimizer states, or both to the specified device.
-        Note that this function executes irrespective of offload config. It serves as manual control
-
-        Args:
-            device: Target device identifier.
-            model: If True, move the model.
-            optimizer: If True, move the optimizer states.
-        """
-        reset_fp8_reuse_quantized_weight(self, device, model, optimizer, grad)
-        super().to(device=device, model=model, optimizer=optimizer, grad=grad)
-
 
 @EngineRegistry.register(model_type="value_model", backend="megatron", device="npu")
-class MindspeedEngineWithValueHead(MegatronEngineWithValueHead):
+class MindspeedEngineWithValueHead(_MindspeedOffloadMixin, MegatronEngineWithValueHead):
     def __init__(
         self,
         model_config: HFModelConfig,

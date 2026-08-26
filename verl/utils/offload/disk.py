@@ -1,0 +1,459 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Bounded-memory pipelined tensor storage for node-local disks."""
+
+from __future__ import annotations
+
+import atexit
+import errno
+import logging
+import os
+import shutil
+import tempfile
+import threading
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Iterator
+
+import torch
+
+from verl.utils.device import get_torch_device, is_device_available
+
+logger = logging.getLogger(__name__)
+
+# FSDP may persist live gradients as internal companion state for split training phases.
+_COMPONENTS = frozenset({"param", "grad", "optimizer"})
+_ALIGNMENT = 4096
+
+
+def _align(value: int, alignment: int = _ALIGNMENT) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+@dataclass(frozen=True)
+class TensorDiskMetadata:
+    key: str
+    offset: int
+    nbytes: int
+    dtype: str
+    shape: tuple[int, ...]
+
+
+@dataclass
+class _StagingSlot:
+    tensor: torch.Tensor
+    buffer: memoryview
+    io_future: Future[None] | None = None
+    copy_event: object | None = None
+
+
+class DiskOffloadStore:
+    """Store each component in one reusable flat file.
+
+    Calls remain synchronous at the API boundary, while two fixed-size CPU
+    staging tensors pipeline accelerator copies with file I/O.  Disk offload
+    therefore does not create a full host-memory replica.  Layout metadata is
+    process-local because offload files are disposable worker scratch data.
+    Callers must release accelerator storage only after :meth:`write_tensors`
+    returns successfully.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        rank: int,
+        chunk_size_mb: int = 64,
+        cleanup_on_exit: bool = True,
+    ) -> None:
+        if not path:
+            raise ValueError("disk offload path must not be empty")
+        if chunk_size_mb <= 0:
+            raise ValueError("disk offload chunk_size_mb must be positive")
+
+        self.chunk_size = chunk_size_mb << 20
+        self.cleanup_on_exit = cleanup_on_exit
+        self._lock = threading.RLock()
+        self._closed = False
+        self._staging_slots: list[_StagingSlot] | None = None
+        self._copy_stream = None
+        self._io_executor: ThreadPoolExecutor | None = None
+        self._layouts: dict[str, dict[str, TensorDiskMetadata]] = {}
+
+        base_path = Path(path).expanduser().resolve()
+        base_path.mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix=f"store_{rank}_", dir=base_path))
+        if cleanup_on_exit:
+            atexit.register(self.close)
+
+    def _data_path(self, component: str) -> Path:
+        if component not in _COMPONENTS:
+            raise ValueError(f"Unknown offload component: {component!r}")
+        return self.root / f"{component}.bin"
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("disk offload store is closed")
+
+    def _get_staging_slots(self) -> list[_StagingSlot]:
+        if self._staging_slots is not None:
+            return self._staging_slots
+        pin_memory = is_device_available()
+        try:
+            tensors = [
+                torch.empty(self.chunk_size, dtype=torch.uint8, device="cpu", pin_memory=pin_memory) for _ in range(2)
+            ]
+        except RuntimeError:
+            logger.warning("Pinned staging allocation failed; falling back to pageable host memory")
+            tensors = [torch.empty(self.chunk_size, dtype=torch.uint8, device="cpu") for _ in range(2)]
+        self._staging_slots = [_StagingSlot(tensor=tensor, buffer=memoryview(tensor.numpy())) for tensor in tensors]
+        return self._staging_slots
+
+    def _get_io_executor(self) -> ThreadPoolExecutor:
+        if self._io_executor is None:
+            self._io_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="verl-disk-offload")
+        return self._io_executor
+
+    def _get_copy_stream(self):
+        if self._copy_stream is None:
+            self._copy_stream = get_torch_device().Stream()
+        return self._copy_stream
+
+    @staticmethod
+    def _tensor_nbytes(tensor: torch.Tensor) -> int:
+        return tensor.numel() * tensor.element_size()
+
+    @staticmethod
+    def _byte_view(tensor: torch.Tensor) -> torch.Tensor:
+        if not tensor.is_contiguous():
+            raise ValueError("disk offload requires contiguous tensors")
+        return tensor.detach().view(torch.uint8).reshape(-1)
+
+    @staticmethod
+    def _reserve(fd: int, length: int) -> None:
+        if length <= 0:
+            return
+        try:
+            os.posix_fallocate(fd, 0, length)
+        except AttributeError:
+            os.ftruncate(fd, length)
+        except OSError as exc:
+            if exc.errno not in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP):
+                raise
+            os.ftruncate(fd, length)
+
+    @staticmethod
+    def _pwrite_all(fd: int, buffer: memoryview, file_offset: int, size: int) -> None:
+        written = 0
+        while written < size:
+            view = buffer[written:size]
+            count = (
+                os.pwritev(fd, [view], file_offset + written)
+                if hasattr(os, "pwritev")
+                else os.pwrite(fd, view, file_offset + written)
+            )
+            if count <= 0:
+                raise OSError("short write while offloading tensor")
+            written += count
+
+    @staticmethod
+    def _pread_all(fd: int, buffer: memoryview, file_offset: int, size: int, key: str) -> None:
+        read = 0
+        while read < size:
+            view = buffer[read:size]
+            if hasattr(os, "preadv"):
+                count = os.preadv(fd, [view], file_offset + read)
+            else:
+                data = os.pread(fd, size - read, file_offset + read)
+                count = len(data)
+                view[:count] = data
+            if count <= 0:
+                raise OSError(f"short read for {key!r}: expected {size} bytes, received {read}")
+            read += count
+
+    def _iter_write_chunks(
+        self, tensors: Iterable[tuple[torch.Tensor, int]]
+    ) -> Iterator[tuple[torch.Tensor, int, int]]:
+        for tensor, file_offset in tensors:
+            source = self._byte_view(tensor)
+            tensor_offset = 0
+            while tensor_offset < source.numel():
+                size = min(self.chunk_size, source.numel() - tensor_offset)
+                yield source[tensor_offset : tensor_offset + size], file_offset + tensor_offset, size
+                tensor_offset += size
+
+    def _iter_read_chunks(
+        self, tensors: Iterable[tuple[torch.Tensor, TensorDiskMetadata]]
+    ) -> Iterator[tuple[torch.Tensor, int, int, str]]:
+        for tensor, metadata in tensors:
+            target = self._byte_view(tensor)
+            tensor_offset = 0
+            while tensor_offset < metadata.nbytes:
+                size = min(self.chunk_size, metadata.nbytes - tensor_offset)
+                yield (
+                    target[tensor_offset : tensor_offset + size],
+                    metadata.offset + tensor_offset,
+                    size,
+                    metadata.key,
+                )
+                tensor_offset += size
+
+    @classmethod
+    def _write_after_copy(
+        cls,
+        copy_event,
+        fd: int,
+        buffer: memoryview,
+        file_offset: int,
+        size: int,
+    ) -> None:
+        if copy_event is not None:
+            copy_event.synchronize()
+        cls._pwrite_all(fd, buffer, file_offset, size)
+
+    @classmethod
+    def _read_after_copy(
+        cls,
+        copy_event,
+        fd: int,
+        buffer: memoryview,
+        file_offset: int,
+        size: int,
+        key: str,
+    ) -> None:
+        if copy_event is not None:
+            copy_event.synchronize()
+        cls._pread_all(fd, buffer, file_offset, size, key)
+
+    @staticmethod
+    def _drain_slots(slots: Iterable[_StagingSlot], *, suppress_errors: bool) -> None:
+        for slot in slots:
+            if slot.io_future is None:
+                continue
+            try:
+                slot.io_future.result()
+            except Exception:
+                if not suppress_errors:
+                    raise
+            finally:
+                slot.io_future = None
+
+    def _write_tensors_pipelined(self, fd: int, tensors: Iterable[tuple[torch.Tensor, int]]) -> None:
+        slots = self._get_staging_slots()
+        executor = self._get_io_executor()
+        copy_stream = None
+        try:
+            for chunk_index, (source, file_offset, size) in enumerate(self._iter_write_chunks(tensors)):
+                slot = slots[chunk_index % len(slots)]
+                if slot.io_future is not None:
+                    slot.io_future.result()
+                    slot.io_future = None
+
+                copy_event = None
+                if source.device.type == "cpu":
+                    slot.tensor[:size].copy_(source, non_blocking=False)
+                else:
+                    if copy_stream is None:
+                        copy_stream = self._get_copy_stream()
+                        copy_stream.wait_stream(get_torch_device().current_stream())
+                    with get_torch_device().stream(copy_stream):
+                        slot.tensor[:size].copy_(source, non_blocking=True)
+                        if slot.copy_event is None:
+                            slot.copy_event = get_torch_device().Event()
+                        slot.copy_event.record(copy_stream)
+                    copy_event = slot.copy_event
+
+                slot.io_future = executor.submit(
+                    self._write_after_copy,
+                    copy_event,
+                    fd,
+                    slot.buffer,
+                    file_offset,
+                    size,
+                )
+            self._drain_slots(slots, suppress_errors=False)
+        except BaseException:
+            self._drain_slots(slots, suppress_errors=True)
+            if copy_stream is not None:
+                copy_stream.synchronize()
+            raise
+
+    def _read_tensors_pipelined(self, fd: int, tensors: Iterable[tuple[torch.Tensor, TensorDiskMetadata]]) -> None:
+        slots = self._get_staging_slots()
+        executor = self._get_io_executor()
+        chunks = iter(self._iter_read_chunks(tensors))
+        pending = deque()
+        copy_stream = None
+
+        def submit_read(slot: _StagingSlot, chunk: tuple[torch.Tensor, int, int, str]) -> None:
+            target, file_offset, size, key = chunk
+            slot.io_future = executor.submit(
+                self._read_after_copy,
+                slot.copy_event,
+                fd,
+                slot.buffer,
+                file_offset,
+                size,
+                key,
+            )
+            pending.append((slot, target, size))
+
+        try:
+            for slot in slots:
+                try:
+                    submit_read(slot, next(chunks))
+                except StopIteration:
+                    break
+
+            while pending:
+                slot, target, size = pending.popleft()
+                assert slot.io_future is not None
+                slot.io_future.result()
+                slot.io_future = None
+
+                if target.device.type == "cpu":
+                    target.copy_(slot.tensor[:size], non_blocking=False)
+                    slot.copy_event = None
+                else:
+                    if copy_stream is None:
+                        copy_stream = self._get_copy_stream()
+                        copy_stream.wait_stream(get_torch_device().current_stream())
+                    with get_torch_device().stream(copy_stream):
+                        target.copy_(slot.tensor[:size], non_blocking=True)
+                        if slot.copy_event is None:
+                            slot.copy_event = get_torch_device().Event()
+                        slot.copy_event.record(copy_stream)
+
+                try:
+                    submit_read(slot, next(chunks))
+                except StopIteration:
+                    pass
+
+            if copy_stream is not None:
+                copy_stream.synchronize()
+        except BaseException:
+            self._drain_slots(slots, suppress_errors=True)
+            if copy_stream is not None:
+                copy_stream.synchronize()
+            raise
+
+    def write_tensors(self, component: str, tensors: Iterable[tuple[str, torch.Tensor]]) -> None:
+        """Synchronously write a complete component."""
+
+        tensor_list = [(key, tensor) for key, tensor in tensors if tensor.numel() > 0]
+        keys = [key for key, _ in tensor_list]
+        if len(keys) != len(set(keys)):
+            raise ValueError(f"Duplicate tensor keys in {component} offload state")
+
+        with self._lock:
+            self._ensure_open()
+            data_path = self._data_path(component)
+            layout = dict(self._layouts.get(component, {}))
+            next_offset = max((entry.offset + entry.nbytes for entry in layout.values()), default=0)
+
+            for key, tensor in tensor_list:
+                nbytes = self._tensor_nbytes(tensor)
+                shape = tuple(tensor.shape)
+                dtype = str(tensor.dtype)
+                existing = layout.get(key)
+                if existing is not None:
+                    if (existing.nbytes, existing.shape, existing.dtype) != (nbytes, shape, dtype):
+                        raise ValueError(
+                            f"Tensor layout changed for {key!r}: "
+                            f"disk={(existing.shape, existing.dtype, existing.nbytes)}, "
+                            f"current={(shape, dtype, nbytes)}"
+                        )
+                    continue
+                next_offset = _align(next_offset)
+                layout[key] = TensorDiskMetadata(
+                    key=key,
+                    offset=next_offset,
+                    nbytes=nbytes,
+                    dtype=dtype,
+                    shape=shape,
+                )
+                next_offset += nbytes
+
+            # An interrupted overwrite may leave the existing data file partial.
+            self._layouts.pop(component, None)
+            fd = os.open(data_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                self._reserve(fd, max((entry.offset + entry.nbytes for entry in layout.values()), default=0))
+                if tensor_list:
+                    self._write_tensors_pipelined(fd, ((tensor, layout[key].offset) for key, tensor in tensor_list))
+            finally:
+                os.close(fd)
+            self._layouts[component] = layout
+
+    def read_tensors(self, component: str, tensors: Iterable[tuple[str, torch.Tensor]]) -> None:
+        """Synchronously restore tensors from the latest complete write."""
+
+        tensor_list = [(key, tensor) for key, tensor in tensors if tensor.numel() > 0]
+        with self._lock:
+            self._ensure_open()
+            data_path = self._data_path(component)
+            layout = self._layouts.get(component)
+            if layout is None:
+                raise RuntimeError(f"No complete {component} disk-offload state under {self.root}")
+
+            restore_entries = []
+            for key, tensor in tensor_list:
+                metadata = layout.get(key)
+                if metadata is None:
+                    raise KeyError(f"Tensor {key!r} is missing from the {component} disk-offload state")
+                current = (self._tensor_nbytes(tensor), tuple(tensor.shape), str(tensor.dtype))
+                expected = (metadata.nbytes, metadata.shape, metadata.dtype)
+                if current != expected:
+                    raise ValueError(f"Restore target mismatch for {key!r}: expected {expected}, got {current}")
+                restore_entries.append((tensor, metadata))
+
+            fd = os.open(data_path, os.O_RDONLY)
+            try:
+                if restore_entries:
+                    self._read_tensors_pipelined(fd, restore_entries)
+            finally:
+                os.close(fd)
+
+    def metadata_many(self, component: str, keys: Iterable[str]) -> list[TensorDiskMetadata]:
+        """Resolve metadata for several tensors."""
+
+        with self._lock:
+            self._ensure_open()
+            self._data_path(component)
+            layout = self._layouts.get(component)
+            if layout is None:
+                raise RuntimeError(f"No complete {component} disk-offload state under {self.root}")
+            resolved = []
+            for key in keys:
+                try:
+                    resolved.append(layout[key])
+                except KeyError as exc:
+                    raise KeyError(f"Tensor {key!r} is missing from the {component} disk-offload state") from exc
+            return resolved
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._io_executor is not None:
+                self._io_executor.shutdown(wait=True)
+                self._io_executor = None
+            self._staging_slots = None
+            self._copy_stream = None
+            if self.cleanup_on_exit:
+                shutil.rmtree(self.root, ignore_errors=True)

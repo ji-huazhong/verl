@@ -20,6 +20,8 @@ from verl.workers.engine_workers import ActorRolloutRefWorker
 
 
 class _FakeTrainerEngine:
+    is_param_offload_enabled = False
+
     def __init__(self):
         self.weights = [("w", object())]
 
