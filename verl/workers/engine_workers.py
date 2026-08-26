@@ -159,34 +159,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
     def to(self, device, model=True, optimizer=True, grad=True):
         """Manual control of load/offload"""
         assert device in ["cpu", "device"]
-        assert not grad or model, "Gradient buffers must be moved together with model parameters"
 
-        managed_model = model and self.engine_config.get_offload_target("param") != "none"
-        managed_optimizer = optimizer and self.engine_config.get_offload_target("optimizer") != "none"
-        if managed_model or managed_optimizer:
-            if device == "device":
-                self.engine.onload(
-                    model=managed_model,
-                    optimizer=managed_optimizer,
-                    grad=grad and managed_model,
-                )
-            else:
-                self.engine.offload(
-                    model=managed_model,
-                    optimizer=managed_optimizer,
-                    grad=grad and managed_model,
-                )
+        if device == "device":
+            device = get_device_name()
 
-        manual_model = model and not managed_model
-        manual_optimizer = optimizer and not managed_optimizer
-        if manual_model or manual_optimizer:
-            target = get_device_name() if device == "device" else "cpu"
-            self.engine.to(
-                device=target,
-                model=manual_model,
-                optimizer=manual_optimizer,
-                grad=grad and manual_model,
-            )
+        self.engine.to(device=device, model=model, optimizer=optimizer, grad=grad)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_loss_fn(self, loss_fn):
