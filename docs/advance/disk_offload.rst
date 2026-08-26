@@ -26,22 +26,18 @@ continue to grow, provisioning DRAM at the same rate also becomes increasingly
 expensive, making this constraint more common.
 
 Disk offload adds node-local NVMe as a capacity tier for this case. It avoids
-retaining a full user-space CPU copy of a component by moving state through a
-pair of reusable staging buffers. ``chunk_size_mb`` controls the size of each
-buffer. An engine store allocates these buffers lazily when disk I/O first
-occurs and can then retain up to ``2 * chunk_size_mb`` of staging memory.
-Operating-system page cache is additional and is not bounded by this setting.
-The trade-off is additional latency at phase transitions and additional
-storage traffic.
+retaining a full user-space CPU copy of a component by moving state through
+bounded staging buffers. The trade-off is additional latency at phase
+transitions and additional storage traffic.
 
 Disk offload configuration
 --------------------------
 
 Disk offload is configured per role and for each state type exposed by that
 backend. Optimizer state is typically the best candidate because it is large
-and inactive outside the optimizer step. The following example moves actor
-parameters to CPU and Megatron optimizer state to disk. Gradient storage
-follows the parameter target.
+and is not needed during rollout or reference evaluation. The following
+example moves actor parameters to CPU and Megatron optimizer state to disk.
+Gradient storage follows the parameter target.
 
 .. code-block:: yaml
 
@@ -187,6 +183,9 @@ Disk offload limitations
   media before accelerator storage is released.
 * Store calls wait for all staged copies and file I/O to complete. Cross-phase
   asynchronous offload and prefetch are not implemented.
+* Manual engine ``to()`` calls retain their direct CPU/device semantics and do
+  not restore disk-resident state; configured trainer lifecycles use
+  ``offload()`` and ``onload()`` instead.
 * Configuration validation uses ``assert`` to match existing verl engine
   configuration style and is disabled when Python runs with ``-O``.
 * Use local NVMe.  Shared filesystems can create severe rank-wide tail latency.

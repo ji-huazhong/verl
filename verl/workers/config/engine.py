@@ -187,7 +187,7 @@ class EngineConfig(BaseConfig):
         # TODO: Remove this guard after AutoModel, TorchTitan, and FSDP-Turbo add
         # backend-specific disk serialization and restoration for both state types.
         assert not disk_components or self.strategy in (None, "megatron", "fsdp", "fsdp2", "veomni"), (
-            "Disk offload targets are supported only by Megatron, FSDP1/FSDP2, and VeOmni; "
+            "Disk offload targets are supported only by Megatron/MindSpeed, FSDP1/FSDP2, and VeOmni; "
             f"strategy={self.strategy!r}, components={', '.join(disk_components)}"
         )
         # TODO: turn on this check after we reorg config

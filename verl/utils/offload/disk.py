@@ -105,6 +105,10 @@ class DiskOffloadStore:
             raise ValueError(f"Unknown offload component: {component!r}")
         return self.root / f"{component}.bin"
 
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("disk offload store is closed")
+
     def _get_staging_slots(self) -> list[_StagingSlot]:
         if self._staging_slots is not None:
             return self._staging_slots
@@ -356,6 +360,7 @@ class DiskOffloadStore:
             raise ValueError(f"Duplicate tensor keys in {component} offload state")
 
         with self._lock:
+            self._ensure_open()
             data_path = self._data_path(component)
             layout = dict(self._layouts.get(component, {}))
             next_offset = max((entry.offset + entry.nbytes for entry in layout.values()), default=0)
@@ -399,6 +404,7 @@ class DiskOffloadStore:
 
         tensor_list = [(key, tensor) for key, tensor in tensors if tensor.numel() > 0]
         with self._lock:
+            self._ensure_open()
             data_path = self._data_path(component)
             layout = self._layouts.get(component)
             if layout is None:
@@ -426,6 +432,7 @@ class DiskOffloadStore:
         """Resolve metadata for several tensors."""
 
         with self._lock:
+            self._ensure_open()
             self._data_path(component)
             layout = self._layouts.get(component)
             if layout is None:

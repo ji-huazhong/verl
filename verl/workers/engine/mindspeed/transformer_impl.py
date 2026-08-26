@@ -55,7 +55,7 @@ def _mindspeed_repatch(engine_config):
 
 
 class _MindspeedOffloadMixin:
-    def _reset_offload_state(self, device: str, *, model: bool, optimizer: bool, grad: bool) -> None:
+    def _reset_fp8_offload_state(self, device: str, *, model: bool, optimizer: bool, grad: bool) -> None:
         model = model and self.is_param_offload_enabled
         optimizer = optimizer and self.is_optimizer_offload_enabled
         grad = grad and self.is_param_offload_enabled
@@ -82,11 +82,11 @@ class _MindspeedOffloadMixin:
         optimizer: bool = True,
         grad: bool = True,
     ) -> None:
-        self._reset_offload_state("cpu", model=model, optimizer=optimizer, grad=grad)
+        self._reset_fp8_offload_state("cpu", model=model, optimizer=optimizer, grad=grad)
         super().offload(model=model, optimizer=optimizer, grad=grad)
 
     def onload(self, *, model: bool = True, optimizer: bool = True, grad: bool = True, **kwargs) -> None:
-        self._reset_offload_state(
+        self._reset_fp8_offload_state(
             get_device_name(),
             model=model,
             optimizer=optimizer,

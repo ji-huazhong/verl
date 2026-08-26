@@ -863,7 +863,7 @@ class MegatronEngine(BaseEngine):
             self._component_resident["optimizer"] = True
 
     @contextmanager
-    def resident(self, *, model: bool = False, optimizer: bool = False):
+    def _resident(self, *, model: bool = False, optimizer: bool = False):
         """Temporarily make selected state resident and restore its prior placement."""
 
         requested = {"param": model, "optimizer": optimizer}
@@ -922,7 +922,12 @@ class MegatronEngine(BaseEngine):
         # Some checkpoint callers leave modules on CPU without enabling offload.
         if not self._is_offload_param and get_megatron_module_device(self.module) == "cpu":
             load_megatron_model_to_gpu(self.module, load_grad=True)
-        with self.resident(model=True, optimizer=self.optimizer is not None):
+        restore_disk_optimizer = (
+            self.optimizer is not None
+            and self._offload_targets["optimizer"] == "disk"
+            and self.checkpoint_mananager.should_save_optimizer
+        )
+        with self._resident(model=True, optimizer=restore_disk_optimizer):
             self.checkpoint_mananager.save_checkpoint(
                 local_path=local_path,
                 hdfs_path=hdfs_path,
@@ -942,7 +947,7 @@ class MegatronEngine(BaseEngine):
             hdfs_path: Optional HDFS path where checkpoint is stored.
             del_local_after_load: Whether to delete local copy after loading.
         """
-        with self.resident(model=True, optimizer=self.optimizer is not None):
+        with self._resident(model=True, optimizer=self.optimizer is not None):
             self.checkpoint_mananager.load_checkpoint(
                 local_path=local_path,
                 hdfs_path=hdfs_path,

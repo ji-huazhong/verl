@@ -105,6 +105,14 @@ def test_disk_store_only_cleans_its_owned_directory(tmp_path):
     assert sibling.exists()
 
 
+def test_disk_store_rejects_operations_after_close(tmp_path):
+    store = _new_store(tmp_path)
+    store.close()
+
+    with pytest.raises(RuntimeError, match="store is closed"):
+        store.write_tensors("param", [("weight", torch.ones(1))])
+
+
 def test_disk_store_isolates_store_instances(tmp_path):
     first = _new_store(tmp_path)
     second = DiskOffloadStore(

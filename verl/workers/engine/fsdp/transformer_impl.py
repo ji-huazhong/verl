@@ -947,7 +947,7 @@ class FSDPEngine(BaseEngine):
             self._component_resident["optimizer"] = True
 
     @contextmanager
-    def resident(self, *, model: bool = False, optimizer: bool = False):
+    def _resident(self, *, model: bool = False, optimizer: bool = False):
         """Temporarily make selected state resident and restore its prior placement."""
 
         requested = {"param": model, "optimizer": optimizer}
@@ -973,7 +973,12 @@ class FSDPEngine(BaseEngine):
         """
         Save FSDP checkpoint, handling parameter offload as needed.
         """
-        with self.resident(model=True, optimizer=self.optimizer is not None):
+        restore_disk_optimizer = (
+            self.optimizer is not None
+            and self._offload_targets["optimizer"] == "disk"
+            and self.checkpoint_manager.should_save_optimizer
+        )
+        with self._resident(model=True, optimizer=restore_disk_optimizer):
             self.checkpoint_manager.save_checkpoint(
                 local_path=local_path,
                 hdfs_path=hdfs_path,
@@ -988,7 +993,7 @@ class FSDPEngine(BaseEngine):
         """
         Load FSDP checkpoint, restoring parameters and optimizer state.
         """
-        with self.resident(model=True, optimizer=self.optimizer is not None):
+        with self._resident(model=True, optimizer=self.optimizer is not None):
             self.checkpoint_manager.load_checkpoint(
                 local_path=local_path,
                 hdfs_path=hdfs_path,

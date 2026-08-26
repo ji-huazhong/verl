@@ -528,7 +528,12 @@ class VeOmniEngine(FSDPEngine):
         """
         Save VeOmni checkpoint, handling parameter offload as needed.
         """
-        with self.resident(model=True, optimizer=self.optimizer is not None):
+        restore_disk_optimizer = (
+            self.optimizer is not None
+            and self._offload_targets["optimizer"] == "disk"
+            and self.checkpoint_manager.should_save_optimizer
+        )
+        with self._resident(model=True, optimizer=restore_disk_optimizer):
             self.checkpoint_manager.save_checkpoint(
                 local_path=local_path,
                 hdfs_path=hdfs_path,
@@ -543,7 +548,7 @@ class VeOmniEngine(FSDPEngine):
         """
         Load VeOmni checkpoint, restoring parameters and optimizer state.
         """
-        with self.resident(model=True, optimizer=self.optimizer is not None):
+        with self._resident(model=True, optimizer=self.optimizer is not None):
             self.checkpoint_manager.load_checkpoint(
                 local_path=local_path,
                 hdfs_path=hdfs_path,
