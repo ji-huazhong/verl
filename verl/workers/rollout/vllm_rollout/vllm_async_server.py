@@ -1053,9 +1053,12 @@ class vLLMHttpServer:
                 apply_modelopt_nvfp4_patches()
                 quantization = "modelopt"
             elif quant_method == "compressed-tensors":
-                from verl.utils.qat import apply_qat_patches
+                if qat_config.format == "nvfp4":
+                    from verl.utils.qat import apply_qat_patches
 
-                apply_qat_patches()
+                    apply_qat_patches()
+                elif qat_config.format != "int4":
+                    raise ValueError(f"Unsupported compressed-tensors QAT format: {qat_config.format}")
                 quantization = "compressed-tensors"
             else:
                 raise ValueError(f"Unsupported quant_method: {quant_method}")

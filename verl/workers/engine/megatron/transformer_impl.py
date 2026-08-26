@@ -210,13 +210,24 @@ class MegatronEngine(BaseEngine):
         # QAT configuration
         self._qat_config = getattr(self.engine_config, "qat", None)
         self._qat_enabled = self._qat_config is not None and getattr(self._qat_config, "enable", False)
+        self._qat_format = getattr(self._qat_config, "format", "nvfp4").lower() if self._qat_enabled else None
         if self._qat_enabled:
-            if self.engine_config.vanilla_mbridge:
+            if self._qat_format == "nvfp4" and self.engine_config.vanilla_mbridge:
                 raise ValueError(
-                    "QAT requires non-vanilla Megatron bridge. "
+                    "NVFP4 QAT requires non-vanilla Megatron bridge. "
                     "Please set 'use_mbridge=True' and 'vanilla_mbridge=False'."
                 )
-            logger.info(f"QAT enabled in MegatronEngine: mode={self._qat_config.mode}")
+            if self._qat_format == "int4":
+                if self.model_config.mtp.enable:
+                    raise ValueError("Integer INT4 QAT does not yet support MTP training or drafter weight sync.")
+                lora_config = self.model_config.get("lora", {}) or {}
+                if self.model_config.lora_rank > 0 or lora_config.get("rank", 0) > 0:
+                    raise ValueError("Integer INT4 QAT currently supports full-parameter training only, not LoRA.")
+            logger.info(
+                "QAT enabled in MegatronEngine: format=%s, mode=%s",
+                self._qat_format,
+                self._qat_config.mode,
+            )
 
         # Router replay configuration for MoE models
         self.enable_routing_replay = self.engine_config.router_replay.mode != "disabled"
@@ -390,7 +401,7 @@ class MegatronEngine(BaseEngine):
                 else:
                     provider_overrides["enable_routing_replay"] = True
 
-            if self._qat_enabled:
+            if self._qat_enabled and self._qat_format == "nvfp4":
                 from megatron.bridge.models.gpt_provider import modelopt_transformer_layer_spec
 
                 provider.transformer_layer_spec = modelopt_transformer_layer_spec
@@ -582,9 +593,14 @@ class MegatronEngine(BaseEngine):
         self.module = self._build_megatron_module()
 
         if self._qat_enabled and not self.engine_config.forward_only:
-            from verl.utils.modelopt import apply_qat_to_modules
+            if self._qat_format == "int4":
+                from verl.utils.qat.int4 import apply_int4_qat_to_modules
 
-            self.module = apply_qat_to_modules(self.module, self._qat_config)
+                self.module = apply_int4_qat_to_modules(self.module, self._qat_config)
+            else:
+                from verl.utils.modelopt import apply_qat_to_modules
+
+                self.module = apply_qat_to_modules(self.module, self._qat_config)
 
         self._maybe_enable_fused_kernels()
 
@@ -1048,9 +1064,24 @@ class MegatronEngine(BaseEngine):
 
         # QAT: process weights through QATWeightExporter for quantized weight sync to vLLM
         if self._qat_enabled:
-            from verl.utils.modelopt import export_qat_weights
+            if self._qat_format == "int4":
+                from verl.utils.qat.int4 import Int4WeightExporter
 
-            per_tensor_param = export_qat_weights(per_tensor_param, self.module, self._qat_config.mode, self.bridge)
+                exporter = Int4WeightExporter(
+                    group_size=self._qat_config.group_size,
+                    scale_dtype=self._qat_config.scale_dtype,
+                    scope=self._qat_config.scope,
+                )
+                per_tensor_param = exporter.process_weights_iterator(per_tensor_param)
+            else:
+                from verl.utils.modelopt import export_qat_weights
+
+                per_tensor_param = export_qat_weights(
+                    per_tensor_param,
+                    self.module,
+                    self._qat_config.mode,
+                    self.bridge,
+                )
 
         return per_tensor_param, peft_config
 

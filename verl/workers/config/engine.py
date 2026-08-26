@@ -130,19 +130,46 @@ class QATEngineConfig(BaseConfig):
 
     Args:
         enable (bool): Whether to enable QAT, default False
+        format (str): Weight format, "nvfp4" or "int4", default "nvfp4"
         mode (str): Quantization mode, "w4a16" or "w4a4", default "w4a16"
         group_size (int): Group size for blockwise quantization, default 16
+        scope (str): Module scope. Integer INT4 currently requires "routed_experts".
+        symmetric (bool): Whether integer quantization is symmetric.
+        scale_dtype (str): Stored scale dtype for integer INT4.
         ignore_patterns (list[str]): Module name patterns to exclude from quantization
         activation_observer (str): Observer strategy for activation global_scale (W4A4 only)
         quantization_config_path (Optional[str]): Path to quantization config JSON for vLLM
     """
 
     enable: bool = False
+    format: str = "nvfp4"
     mode: str = "w4a16"
     group_size: int = 16
+    scope: str = "all_linear"
+    symmetric: bool = True
+    scale_dtype: str = "bfloat16"
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     quantization_config_path: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "format", self.format.lower())
+        object.__setattr__(self, "mode", self.mode.lower())
+        if self.format not in {"nvfp4", "int4"}:
+            raise ValueError(f"Unsupported QAT format: {self.format!r}. Expected 'nvfp4' or 'int4'.")
+        if self.mode not in {"w4a16", "w4a4"}:
+            raise ValueError(f"Unsupported QAT mode: {self.mode!r}. Expected 'w4a16' or 'w4a4'.")
+        if self.format == "int4":
+            if self.mode != "w4a16":
+                raise ValueError("Integer INT4 QAT currently supports only mode='w4a16'.")
+            if self.scope != "routed_experts":
+                raise ValueError("Integer INT4 QAT currently supports only scope='routed_experts'.")
+            if not self.symmetric:
+                raise ValueError("Integer INT4 QAT currently supports only symmetric quantization.")
+            if self.group_size not in {32, 64, 128}:
+                raise ValueError("Integer INT4 group_size must be one of 32, 64, or 128 for vLLM WNA16.")
+            if self.scale_dtype not in {"bfloat16", "float16"}:
+                raise ValueError("Integer INT4 scale_dtype must be 'bfloat16' or 'float16'.")
 
 
 @dataclass

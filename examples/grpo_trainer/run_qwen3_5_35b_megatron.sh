@@ -98,9 +98,12 @@ project_name='verl_grpo_qwen3_5_35b_geo3k'
 exp_name='qwen3_5_35b_megatron'
 adv_estimator=grpo
 
-HF_MODEL_PATH=${HF_MODEL_PATH:-"Qwen3.5-35B-A3B"}
+HF_MODEL_PATH=${HF_MODEL_PATH:-"Qwen/Qwen3.5-35B-A3B"}
 train_path=${train_path:-$HOME/data/geo3k/train.parquet}
 test_path=${test_path:-$HOME/data/geo3k/test.parquet}
+INT4_QAT=${INT4_QAT:-False}
+INT4_QAT_CONFIG=${INT4_QAT_CONFIG:-"examples/qat/config/int4_w4a16_qwen3_5_moe.json"}
+VANILLA_MBRIDGE=${VANILLA_MBRIDGE:-True}
 # ---- end user-adjustable ----
 
 # ---- no user adjustment needed below ----
@@ -133,7 +136,7 @@ ACTOR=(
     actor_rollout_ref.actor.kl_loss_type=low_var_kl
     actor_rollout_ref.actor.entropy_coeff=0
     actor_rollout_ref.actor.megatron.use_mbridge=True
-    actor_rollout_ref.actor.megatron.vanilla_mbridge=True
+    actor_rollout_ref.actor.megatron.vanilla_mbridge=${VANILLA_MBRIDGE}
     actor_rollout_ref.actor.megatron.use_remove_padding=False
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${TP}
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${PP}
@@ -203,6 +206,19 @@ TRAINER=(
 EXTRA=(
     model_engine=megatron
 )
+
+if [ "${INT4_QAT}" = "True" ]; then
+    ACTOR+=(
+        actor_rollout_ref.actor.megatron.qat.enable=True
+        actor_rollout_ref.actor.megatron.qat.format=int4
+        actor_rollout_ref.actor.megatron.qat.mode=w4a16
+        actor_rollout_ref.actor.megatron.qat.group_size=32
+        actor_rollout_ref.actor.megatron.qat.scope=routed_experts
+        actor_rollout_ref.actor.megatron.qat.symmetric=True
+        actor_rollout_ref.actor.megatron.qat.scale_dtype=bfloat16
+        actor_rollout_ref.actor.megatron.qat.quantization_config_path=${INT4_QAT_CONFIG}
+    )
+fi
 
 case "${DEVICE}" in
     gpu)

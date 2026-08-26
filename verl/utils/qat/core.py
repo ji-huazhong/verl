@@ -32,11 +32,19 @@ class QATConfig(BaseConfig):
     """Unified configuration for QAT (Quantization-Aware Training)."""
 
     enable: bool = False
+    format: str = "nvfp4"
     mode: str = "w4a16"
     group_size: int = 16
+    scope: str = "all_linear"
+    symmetric: bool = True
+    scale_dtype: str = "bfloat16"
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     quantization_config_path: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "format", self.format.lower())
+        object.__setattr__(self, "mode", self.mode.lower())
 
 
 def load_quantization_config(qat_config: QATConfig) -> dict[str, Any]:
@@ -55,8 +63,37 @@ def load_quantization_config(qat_config: QATConfig) -> dict[str, Any]:
         if original_ignore != qat_config.ignore_patterns:
             logger.info(f"Overriding JSON 'ignore' field: {original_ignore} -> {qat_config.ignore_patterns}")
 
+    if qat_config.format == "int4":
+        _validate_int4_quantization_config(quant_config, qat_config)
+
     logger.info("Successfully loaded QAT quantization config")
     return quant_config
+
+
+def _validate_int4_quantization_config(quant_config: dict[str, Any], qat_config: QATConfig) -> None:
+    """Fail fast when trainer/exporter and vLLM INT4 contracts disagree."""
+    if quant_config.get("quant_method") != "compressed-tensors":
+        raise ValueError("Integer INT4 QAT requires quant_method='compressed-tensors'.")
+    if quant_config.get("format") != "pack-quantized":
+        raise ValueError("Integer INT4 QAT requires compressed-tensors format='pack-quantized'.")
+
+    groups = quant_config.get("config_groups") or {}
+    if not groups:
+        raise ValueError("Integer INT4 QAT quantization config must contain config_groups.")
+    for name, group in groups.items():
+        weights = group.get("weights") or {}
+        expected = {
+            "type": "int",
+            "num_bits": 4,
+            "strategy": "group",
+            "symmetric": True,
+            "group_size": qat_config.group_size,
+        }
+        mismatches = {key: (weights.get(key), value) for key, value in expected.items() if weights.get(key) != value}
+        if mismatches:
+            raise ValueError(f"Integer INT4 QAT config group {name!r} does not match trainer settings: {mismatches}")
+        if group.get("input_activations") is not None:
+            raise ValueError("Integer INT4 W4A16 requires input_activations=null.")
 
 
 def _should_quantize(name: str, module: nn.Module, config: QATConfig) -> bool:
@@ -97,6 +134,9 @@ def apply_qat(
     if not config.enable:
         logger.info("QAT is disabled, returning original model")
         return model
+
+    if config.format != "nvfp4":
+        raise ValueError("verl.utils.qat.apply_qat currently supports NVFP4/FSDP only; use Megatron for INT4 QAT.")
 
     mode = QATMode(config.mode.lower())
     logger.info(f"Applying QAT with mode={mode.value}, group_size={config.group_size}")

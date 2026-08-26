@@ -1,0 +1,225 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+import json
+
+import pytest
+import torch
+
+from verl.utils.qat.core import QATConfig, load_quantization_config
+from verl.utils.qat.int4 import (
+    Int4WeightExporter,
+    apply_int4_qat_to_modules,
+    dequantize_int4_levels,
+    fake_quant_int4_ste,
+    pack_int4_levels,
+    quantize_int4_levels,
+    unpack_int4_levels,
+)
+from verl.utils.qat.int4_vllm import expand_qwen3_5_fused_int4_weights, is_int4_wna16_quant_config
+
+
+def _write_int4_config(tmp_path, group_size=32):
+    path = tmp_path / "int4.json"
+    path.write_text(
+        json.dumps(
+            {
+                "quant_method": "compressed-tensors",
+                "format": "pack-quantized",
+                "config_groups": {
+                    "experts": {
+                        "targets": ["re:.*experts.*"],
+                        "weights": {
+                            "type": "int",
+                            "num_bits": 4,
+                            "strategy": "group",
+                            "symmetric": True,
+                            "group_size": group_size,
+                        },
+                        "input_activations": None,
+                    }
+                },
+            }
+        )
+    )
+    return path
+
+
+def test_int4_json_contract_matches_trainer_config(tmp_path):
+    path = _write_int4_config(tmp_path)
+    config = QATConfig(
+        enable=True,
+        format="INT4",
+        group_size=32,
+        scope="routed_experts",
+        quantization_config_path=str(path),
+    )
+
+    loaded = load_quantization_config(config)
+
+    assert config.format == "int4"
+    assert loaded["config_groups"]["experts"]["weights"]["group_size"] == 32
+
+
+def test_int4_json_contract_rejects_group_size_mismatch(tmp_path):
+    path = _write_int4_config(tmp_path, group_size=128)
+    config = QATConfig(
+        enable=True,
+        format="int4",
+        group_size=32,
+        scope="routed_experts",
+        quantization_config_path=str(path),
+    )
+
+    with pytest.raises(ValueError, match="does not match trainer settings"):
+        load_quantization_config(config)
+
+
+def test_int4_pack_round_trip_uses_uint4b8_bias():
+    levels = torch.tensor([[-7, -6, -1, 0, 1, 6, 7, 0]], dtype=torch.int8)
+
+    packed = pack_int4_levels(levels)
+
+    assert packed.dtype == torch.int32
+    assert packed.shape == (1, 1)
+    assert torch.equal(unpack_int4_levels(packed), levels)
+    assert (int(packed.item()) & 0xF) == 1  # -7 + bias 8
+    assert ((int(packed.item()) >> 12) & 0xF) == 8  # zero + bias 8
+
+
+def test_fake_quant_and_export_share_stored_bf16_scale():
+    weight = torch.linspace(-1.0, 1.0, 256, dtype=torch.float32).reshape(2, 128)
+    levels, scale = quantize_int4_levels(weight, group_size=128, scale_dtype="bfloat16")
+    expected = dequantize_int4_levels(levels, scale, 128, weight.dtype)
+
+    actual = fake_quant_int4_ste(weight, group_size=128, scale_dtype="bfloat16")
+
+    assert scale.dtype == torch.bfloat16
+    assert torch.equal(actual, expected)
+
+
+def test_fake_quant_uses_identity_ste():
+    weight = torch.randn(2, 128, requires_grad=True)
+
+    fake_quant_int4_ste(weight, group_size=128).sum().backward()
+
+    assert torch.equal(weight.grad, torch.ones_like(weight))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Triton")
+def test_cuda_fake_quant_and_packer_match_cpu_reference():
+    cpu_weight = torch.randn(4, 256, dtype=torch.bfloat16)
+    cuda_weight = cpu_weight.cuda()
+
+    expected_levels, expected_scale = quantize_int4_levels(cpu_weight, 32, "bfloat16")
+    expected_fake = dequantize_int4_levels(expected_levels, expected_scale, 32, torch.bfloat16)
+    actual_fake = fake_quant_int4_ste(cuda_weight, 32, "bfloat16").cpu()
+
+    exporter = Int4WeightExporter(group_size=32)
+    exported = dict(exporter.process_weights_iterator([("model.layers.0.mlp.experts.0.gate_proj.weight", cuda_weight)]))
+
+    assert torch.equal(actual_fake, expected_fake)
+    assert torch.equal(
+        unpack_int4_levels(exported["model.layers.0.mlp.experts.0.gate_proj.weight_packed"]).cpu(),
+        expected_levels,
+    )
+    assert torch.equal(
+        exported["model.layers.0.mlp.experts.0.gate_proj.weight_scale"].cpu(),
+        expected_scale,
+    )
+
+
+def test_exporter_quantizes_only_compact_fused_routed_experts():
+    gate_up = torch.randn(3, 16, 128, dtype=torch.bfloat16)
+    attention = torch.randn(8, 128, dtype=torch.bfloat16)
+    exporter = Int4WeightExporter(group_size=32)
+
+    exported = dict(
+        exporter.process_weights_iterator(
+            [
+                ("model.layers.0.mlp.experts.gate_up_proj", gate_up),
+                ("model.layers.0.self_attn.q_proj.weight", attention),
+            ]
+        )
+    )
+
+    assert exported["model.layers.0.mlp.experts.gate_up_proj.weight_packed"].shape == (3, 16, 16)
+    assert exported["model.layers.0.mlp.experts.gate_up_proj.weight_scale"].shape == (3, 16, 4)
+    assert "model.layers.0.mlp.experts.gate_up_proj.weight_shape" not in exported
+    assert exported["model.layers.0.self_attn.q_proj.weight"] is attention
+
+
+def test_qwen3_5_fused_int4_expansion_happens_after_ipc():
+    packed = torch.arange(2 * 12 * 4, dtype=torch.int32).reshape(2, 12, 4)
+    name = "model.language_model.layers.0.mlp.experts.gate_up_proj.weight_packed"
+
+    expanded = list(expand_qwen3_5_fused_int4_weights([(name, packed)]))
+
+    assert [item[0] for item in expanded] == [
+        "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_packed",
+        "model.language_model.layers.0.mlp.experts.0.up_proj.weight_packed",
+        "model.language_model.layers.0.mlp.experts.1.gate_proj.weight_packed",
+        "model.language_model.layers.0.mlp.experts.1.up_proj.weight_packed",
+    ]
+    assert all(tensor.shape == (6, 4) for _, tensor in expanded)
+
+
+def test_wna16_detection_is_semantic_not_class_name_based():
+    config = {
+        "quant_format": "pack-quantized",
+        "target_scheme_map": {
+            "Linear": {
+                "weights": {"num_bits": 4, "type": "int", "strategy": "group"},
+                "input_activations": None,
+            }
+        },
+    }
+
+    assert is_int4_wna16_quant_config(config)
+    config["target_scheme_map"]["Linear"]["input_activations"] = {"num_bits": 8}
+    assert not is_int4_wna16_quant_config(config)
+
+
+class _FakeGroupedLinear(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(2, 128))
+
+    def _get_weight_tensors(self):
+        return [self.weight]
+
+
+class _FakeExperts(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear_fc1 = _FakeGroupedLinear()
+        self.linear_fc2 = _FakeGroupedLinear()
+
+
+class _FakeMLP(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.experts = _FakeExperts()
+
+
+class _FakeModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mlp = _FakeMLP()
+
+
+def test_megatron_hook_patches_only_routed_expert_grouped_linears():
+    model = _FakeModel()
+    config = type("Config", (), {"group_size": 128, "scale_dtype": "bfloat16"})()
+
+    apply_int4_qat_to_modules([model], config)
+    quantized_weight = model.mlp.experts.linear_fc1._get_weight_tensors()[0]
+
+    assert not torch.equal(quantized_weight, model.mlp.experts.linear_fc1.weight)
+    quantized_weight.sum().backward()
+    assert torch.equal(model.mlp.experts.linear_fc1.weight.grad, torch.ones_like(quantized_weight))

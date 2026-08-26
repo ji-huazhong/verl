@@ -146,10 +146,17 @@ qat:
   _target_: verl.workers.config.QATEngineConfig
   # Whether to enable QAT
   enable: false
+  # Weight format: "nvfp4" (existing path) or "int4" (integer W4A16)
+  format: "nvfp4"
   # Quantization mode: "w4a16" (weight-only FP4) or "w4a4" (weight + activation FP4)
   mode: "w4a16"
   # Group size for blockwise quantization (NVFP4 requires 16)
   group_size: 16
+  # Quantized module scope. Integer INT4 currently supports routed experts only.
+  scope: "all_linear"
+  # Integer INT4 options; ignored by NVFP4.
+  symmetric: true
+  scale_dtype: "bfloat16"
   # Module name patterns to exclude from quantization (fnmatch style for Megatron)
   ignore_patterns:
     - "lm_head"

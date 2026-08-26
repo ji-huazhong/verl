@@ -161,15 +161,20 @@ class vLLMColocateWorkerExtension:
         # fp8 from the HF config rather than an explicit rollout quantization arg.
         if os.environ.get("VERL_VLLM_FP8_QUANT_ENABLED", "0") == "1" or is_fp8_model(vllm_config):
             apply_vllm_quant_patches()
-        # 3. patch QAT (compressed-tensors NVFP4) for dynamic weight loading
+        # 3. Configure QAT dynamic weight loading.
         quant_config = getattr(vllm_config, "quant_config", None) if vllm_config else None
-        _is_qat_model = getattr(quant_config, "quant_format", None) == "nvfp4-pack-quantized"
+        _is_nvfp4_qat_model = getattr(quant_config, "quant_format", None) == "nvfp4-pack-quantized"
+        from verl.utils.qat.int4_vllm import is_int4_wna16_quant_config
+
+        _is_int4_qat_model = is_int4_wna16_quant_config(quant_config)
         _is_modelopt_qat = type(quant_config).__name__ == "ModelOptNvFp4Config"
-        if _is_qat_model:
+        if _is_nvfp4_qat_model:
             from verl.utils.qat import apply_qat_patches
 
             apply_qat_patches()
-            logger.info("Applied QAT (compressed-tensors) patches in vLLM worker subprocess")
+            logger.info("Applied NVFP4 QAT (compressed-tensors) patches in vLLM worker subprocess")
+        elif _is_int4_qat_model:
+            logger.info("Detected integer INT4 WNA16 QAT model; using vLLM native layerwise reload")
         elif _is_modelopt_qat:
             from verl.utils.modelopt import apply_modelopt_nvfp4_patches
 
@@ -185,7 +190,8 @@ class vLLMColocateWorkerExtension:
                     os.environ[k] = VLLM_ASCEND_REQUIRED_ENV_VARS[k]
 
         instance = super().__new__(cls)
-        instance._is_qat_model = _is_qat_model
+        instance._is_qat_model = _is_nvfp4_qat_model
+        instance._is_int4_qat_model = _is_int4_qat_model
         instance._is_modelopt_qat = _is_modelopt_qat
         return instance
 
@@ -228,6 +234,11 @@ class vLLMColocateWorkerExtension:
             monkey_patch_compute_logits(model, vocab_size, banned_token_ids)
             # patch weight loader to support MoE model
             patch_vllm_moe_model_weight_loader(model)
+            if self._is_int4_qat_model:
+                from verl.utils.qat.int4_vllm import patch_qwen3_5_fused_int4_loader
+
+                for candidate in model.modules():
+                    patch_qwen3_5_fused_int4_loader(candidate)
 
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Update the weights of the rollout model."""
@@ -250,7 +261,13 @@ class vLLMColocateWorkerExtension:
             for model in self._iter_all_models():
                 restore_moe_expert_maps(model)
 
-        if self._is_qat_model:
+        if self._is_int4_qat_model:
+            from verl.utils.qat.int4_vllm import prepare_int4_for_weight_reload
+
+            for model in self._iter_all_models():
+                prepare_int4_for_weight_reload(model)
+            logger.info("Integer INT4 QAT: vLLM layerwise reload prepared")
+        elif self._is_qat_model:
             # QAT (compressed-tensors): Prepare for weight loading BEFORE receiving any buckets
             from verl.utils.qat import prepare_qat_for_load_weights
 
@@ -310,7 +327,13 @@ class vLLMColocateWorkerExtension:
         receiver.receive_weights(on_bucket_received=on_bucket_received)
 
         # =========================== step 3: process weights after loading ===========================
-        if self._is_qat_model:
+        if self._is_int4_qat_model:
+            from verl.utils.qat.int4_vllm import finalize_int4_weight_reload
+
+            for model, model_config in self._iter_all_models_with_config():
+                finalize_int4_weight_reload(model, model_config)
+            logger.info("Integer INT4 QAT: WNA16 layerwise reload finalized")
+        elif self._is_qat_model:
             # QAT (compressed-tensors): call process_weights_after_loading AFTER all buckets are received
             from verl.utils.qat import manual_process_weights_after_loading
 

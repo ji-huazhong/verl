@@ -156,8 +156,12 @@ actor_rollout_ref:
           strict: ${oc.select:global_profiler.global_tool_config.precision_debugger.strict,False}
     qat:
       enable: false
+      format: nvfp4
       mode: w4a16
       group_size: 16
+      scope: all_linear
+      symmetric: true
+      scale_dtype: bfloat16
       ignore_patterns:
       - lm_head
       - embed_tokens
