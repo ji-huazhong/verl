@@ -19,6 +19,7 @@ from omegaconf import OmegaConf
 
 from verl.base_config import BaseConfig
 from verl.utils import omega_conf_to_dataclass
+from verl.utils.config import validate_config
 
 
 @dataclass
@@ -69,6 +70,21 @@ class TestConfigOnCPU(unittest.TestCase):
         self.assertEqual(cfg.model.activation, "relu")
         assert isinstance(cfg, TestTrainConfig)
         assert isinstance(cfg.model, TestDataclass)
+
+    def test_balance_by_flops_requires_dynamic_batching_and_dp_balancing(self):
+        config = OmegaConf.create(
+            {
+                "actor_rollout_ref": {"actor": {"balance_by_flops": True, "use_dynamic_bsz": False}},
+                "trainer": {"balance_batch": True},
+            }
+        )
+        with self.assertRaisesRegex(AssertionError, "balance_by_flops requires.*use_dynamic_bsz=True"):
+            validate_config(config, use_reference_policy=False, use_critic=False)
+
+        config.actor_rollout_ref.actor.use_dynamic_bsz = True
+        config.trainer.balance_batch = False
+        with self.assertRaisesRegex(AssertionError, "balance_by_flops requires trainer.balance_batch=True"):
+            validate_config(config, use_reference_policy=False, use_critic=False)
 
 
 class TestPrintCfgCommand(unittest.TestCase):

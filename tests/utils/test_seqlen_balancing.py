@@ -121,6 +121,15 @@ def test_calculate_workload_uses_nested_text_config():
     ]
 
 
+def test_calculate_workload_falls_back_to_fixed_proxy_for_unsupported_model():
+    seqlens = torch.tensor([4, 6], dtype=torch.int64)
+    config = SimpleNamespace(model_type="unsupported")
+
+    workloads = calculate_workload(seqlens, model_config=config)
+
+    assert torch.equal(workloads, 24576 * seqlens + seqlens**2)
+
+
 def test_balance_by_flops_requires_model_config():
     batch = _batch_with_lengths([4, 4])
 

@@ -83,6 +83,14 @@ def validate_config(
         use_reference_policy (bool): is ref policy needed
         use_critic (bool): is critic needed
     """
+    if config.actor_rollout_ref.actor.get("balance_by_flops", False):
+        assert config.actor_rollout_ref.actor.use_dynamic_bsz, (
+            "actor_rollout_ref.actor.balance_by_flops requires actor_rollout_ref.actor.use_dynamic_bsz=True"
+        )
+        assert config.trainer.balance_batch, (
+            "actor_rollout_ref.actor.balance_by_flops requires trainer.balance_batch=True"
+        )
+
     # number of GPUs total
     n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 

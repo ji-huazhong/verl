@@ -47,9 +47,9 @@ def calculate_fwd_flops(seqlen_list: list[int], model_config: Any) -> int:
 def calculate_workload(seqlen_list: torch.Tensor, model_config: Any | None = None) -> torch.Tensor:
     """Calculate per-sequence transformer workload.
 
-    When ``model_config`` is provided, returns model-aware forward FLOPs. When
-    omitted, preserves the historical 7B-calibrated relative workload proxy:
-    ``24576 * seqlen + seqlen²``.
+    When ``model_config`` has a registered estimator, returns model-aware
+    forward FLOPs. Otherwise, preserves the historical 7B-calibrated relative
+    workload proxy: ``24576 * seqlen + seqlen²``.
 
     The model-aware values are estimates rather than measured wall time;
     communication, padding, kernel efficiency, and MoE routing skew are not
@@ -62,7 +62,7 @@ def calculate_workload(seqlen_list: torch.Tensor, model_config: Any | None = Non
     Returns:
         torch.Tensor: Per-sequence workload values.
     """
-    if model_config is not None:
+    if model_config is not None and model_config.model_type in ESTIMATE_FUNC:
         workloads = [calculate_fwd_flops([int(seqlen)], model_config) for seqlen in seqlen_list]
         return torch.tensor(workloads, dtype=torch.int64, device=seqlen_list.device)
     return 24576 * seqlen_list + seqlen_list**2
