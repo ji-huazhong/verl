@@ -27,11 +27,10 @@ ppo_micro_batch_size_per_gpu: null
 # oc.select: the default val for ref.log_prob_use_dynamic_bsz
 use_dynamic_bsz: false
 
-# Balance DP ranks and dynamic micro-batches with model-aware forward FLOPs.
-# Requires use_dynamic_bsz=true and trainer.balance_batch=true. Unsupported
-# model types fall back to the fixed workload proxy used by balance_batch.
-# This does not enforce ppo_max_token_len_per_gpu as a hard per-micro-batch cap;
-# leave memory headroom because a FLOPs-balanced micro-batch can exceed it.
+# Use model-aware forward FLOPs for DP-rank and dynamic micro-batch balancing.
+# Requires use_dynamic_bsz=true and trainer.balance_batch=true. When false or
+# unsupported, use the fixed proxy. The token limit stays a soft target, so
+# leave memory headroom.
 balance_by_flops: false
 
 # Max tokens per GPU in one PPO batch; affects gradient accumulation

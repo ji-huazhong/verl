@@ -19,6 +19,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from verl import DataProto
+from verl.utils import seqlen_balancing
 from verl.utils.device import get_device_name, get_nccl_backend, get_torch_device
 from verl.utils.model import create_random_mask
 from verl.utils.seqlen_balancing import (
@@ -128,6 +129,23 @@ def test_calculate_workload_falls_back_to_fixed_proxy_for_unsupported_model():
     workloads = calculate_workload(seqlens, model_config=config)
 
     assert torch.equal(workloads, 24576 * seqlens + seqlens**2)
+
+
+def test_rearrange_micro_batches_uses_fixed_proxy_when_flops_disabled(monkeypatch):
+    batch = _batch_with_lengths([4, 6, 8])
+
+    def fail_if_called(*args, **kwargs):
+        pytest.fail("FLOPs estimator must not run when balance_by_flops=False")
+
+    monkeypatch.setattr(seqlen_balancing, "calculate_fwd_flops", fail_if_called)
+    _, micro_batch_indices = rearrange_micro_batches(
+        batch,
+        max_token_len=10,
+        balance_by_flops=False,
+        model_config=_small_dense_config(),
+    )
+
+    assert sorted(index for micro_batch in micro_batch_indices for index in micro_batch) == [0, 1, 2]
 
 
 def test_balance_by_flops_requires_model_config():

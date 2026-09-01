@@ -63,7 +63,8 @@ def calculate_workload(seqlen_list: torch.Tensor, model_config: Any | None = Non
         torch.Tensor: Per-sequence workload values.
     """
     if model_config is not None and model_config.model_type in ESTIMATE_FUNC:
-        workloads = [calculate_fwd_flops([int(seqlen)], model_config) for seqlen in seqlen_list]
+        seqlens = seqlen_list.cpu().tolist()
+        workloads = [calculate_fwd_flops([seqlen], model_config) for seqlen in seqlens]
         return torch.tensor(workloads, dtype=torch.int64, device=seqlen_list.device)
     return 24576 * seqlen_list + seqlen_list**2
 
@@ -632,13 +633,8 @@ def get_group_balanced_partitions(
     )
 
     # Calculate workload for each group (as integers for partitioning)
-    group_workloads = []
-    for indices, total_seqlen in groups:
-        # Use sum of individual workloads for more accurate estimation
-        workload = sum(
-            int(calculate_workload(torch.tensor([seqlen_list[i]]), model_config=model_config).item()) for i in indices
-        )
-        group_workloads.append(workload)
+    sample_workloads = calculate_workload(torch.tensor(seqlen_list), model_config=model_config).tolist()
+    group_workloads = [sum(sample_workloads[i] for i in indices) for indices, _ in groups]
 
     # Use Karmarkar-Karp to partition groups
     # equal_size=True ensures each partition gets the same number of groups,
