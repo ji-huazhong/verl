@@ -189,19 +189,29 @@ def finalize_int4_weight_reload(model: torch.nn.Module, model_config: Any) -> No
     finalize_layerwise_reload(model, model_config)
     if os.environ.get("VERL_INT4_QAT_RELOAD_DIAGNOSTICS", "0") == "1":
         scale_tensors = [
-            parameter.detach()
+            (name, parameter.detach())
             for name, parameter in model.named_parameters()
             if name.endswith(("w13_weight_scale", "w2_weight_scale"))
         ]
-        nonfinite = sum(int((~torch.isfinite(scale)).sum().item()) for scale in scale_tensors)
-        scale_min = min((float(scale.min().item()) for scale in scale_tensors), default=float("nan"))
-        scale_max = max((float(scale.max().item()) for scale in scale_tensors), default=float("nan"))
+        invalid_by_name = []
+        scale_min = float("inf")
+        scale_max = float("-inf")
+        for name, scale in scale_tensors:
+            invalid = (~torch.isfinite(scale)) | (scale <= 0)
+            invalid_count = int(invalid.sum().item())
+            if invalid_count:
+                invalid_by_name.append((name, invalid_count, scale.numel()))
+            finite_positive = scale[~invalid]
+            if finite_positive.numel() > 0:
+                scale_min = min(scale_min, float(finite_positive.min().item()))
+                scale_max = max(scale_max, float(finite_positive.max().item()))
         logger.warning(
-            "Integer INT4 reload diagnostics: scale_tensors=%d nonfinite=%d min=%g max=%g",
+            "Integer INT4 reload diagnostics: scale_tensors=%d invalid=%d min=%g max=%g invalid_by_name=%s",
             len(scale_tensors),
-            nonfinite,
+            sum(item[1] for item in invalid_by_name),
             scale_min,
             scale_max,
+            invalid_by_name,
         )
 
 

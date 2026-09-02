@@ -20,6 +20,7 @@ INT32. Activations and master weights remain BF16/FP16.
 """
 
 import logging
+import os
 import re
 from collections.abc import Iterable, Iterator
 from types import MethodType
@@ -206,6 +207,11 @@ class Int4WeightExporter:
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterator[tuple[str, torch.Tensor]]:
         quantized = 0
+        diagnostic_scale_tensors = 0
+        diagnostic_invalid_scales = 0
+        diagnostic_scale_min = float("inf")
+        diagnostic_scale_max = float("-inf")
+        diagnostics_enabled = os.environ.get("VERL_INT4_QAT_RELOAD_DIAGNOSTICS", "0") == "1"
         for name, weight in weights:
             if not is_routed_expert_weight(name, weight):
                 yield name, weight
@@ -213,6 +219,14 @@ class Int4WeightExporter:
 
             base_name = name.removesuffix(".weight")
             packed, scale = quantize_int4_weight(weight, self.group_size, self.scale_dtype)
+            if diagnostics_enabled:
+                invalid = (~torch.isfinite(scale)) | (scale <= 0)
+                diagnostic_scale_tensors += 1
+                diagnostic_invalid_scales += int(invalid.sum().item())
+                finite_positive = scale[~invalid]
+                if finite_positive.numel() > 0:
+                    diagnostic_scale_min = min(diagnostic_scale_min, float(finite_positive.min().item()))
+                    diagnostic_scale_max = max(diagnostic_scale_max, float(finite_positive.max().item()))
             yield f"{base_name}.weight_packed", packed
             yield f"{base_name}.weight_scale", scale
 
@@ -229,6 +243,14 @@ class Int4WeightExporter:
         if self.require_match and quantized == 0:
             raise RuntimeError(
                 "Integer INT4 QAT did not find routed expert weights in the Megatron-to-HF export stream."
+            )
+        if diagnostics_enabled:
+            logger.warning(
+                "Integer INT4 export diagnostics: scale_tensors=%d invalid=%d min=%g max=%g",
+                diagnostic_scale_tensors,
+                diagnostic_invalid_scales,
+                diagnostic_scale_min,
+                diagnostic_scale_max,
             )
         logger.info("Integer INT4 exporter quantized %d routed expert tensors", quantized)
 
