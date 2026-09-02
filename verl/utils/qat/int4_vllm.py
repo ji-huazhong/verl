@@ -25,6 +25,16 @@ logger = logging.getLogger(__name__)
 
 _FUSED_GATE_UP_SUFFIXES = (".mlp.experts.gate_up_proj.weight_packed", ".mlp.experts.gate_up_proj.weight_scale")
 _FUSED_DOWN_SUFFIXES = (".mlp.experts.down_proj.weight_packed", ".mlp.experts.down_proj.weight_scale")
+_WNA16_DERIVED_RELOAD_TENSORS = frozenset(
+    {
+        "w13_weight_shape",
+        "w2_weight_shape",
+        "w13_weight_g_idx",
+        "w2_weight_g_idx",
+        "w13_g_idx_sort_indices",
+        "w2_g_idx_sort_indices",
+    }
+)
 
 
 def _field(value: Any, name: str, default=None):
@@ -111,6 +121,29 @@ def patch_qwen3_5_fused_int4_loader(model: torch.nn.Module) -> bool:
     return True
 
 
+def configure_int4_layerwise_reload(skip_tensors: set[str] | None = None) -> None:
+    """Keep WNA16 metadata/indices resident across online weight reloads.
+
+    These tensors are derived from static model geometry. Group/sort indices
+    are absent from the actor's online stream, while per-expert shape tensors
+    may be redundantly streamed many times into one fused parameter. None of
+    them should gate reload completion. Counting them as reloadable prevents
+    vLLM from finalizing each ``RoutedExperts`` layer until the end of the full
+    model sync, which retains every layer's temporary packed weights on device.
+
+    This must run before vLLM constructs the model and records its layerwise
+    reload metadata. ``skip_tensors`` is injectable for dependency-free tests.
+    """
+    if skip_tensors is None:
+        try:
+            from vllm.model_executor.model_loader.reload.meta import SKIP_TENSORS
+        except ImportError as exc:
+            raise RuntimeError("Integer INT4 RL reload requires vLLM's layerwise reload API (vLLM 0.24+).") from exc
+
+        skip_tensors = SKIP_TENSORS
+    skip_tensors.update(_WNA16_DERIVED_RELOAD_TENSORS)
+
+
 def prepare_int4_for_weight_reload(model: torch.nn.Module) -> None:
     """Restore checkpoint-layout tensors and wrap loaders before bucketed sync."""
     try:
@@ -132,6 +165,7 @@ def finalize_int4_weight_reload(model: torch.nn.Module, model_config: Any) -> No
 
 
 __all__ = [
+    "configure_int4_layerwise_reload",
     "expand_qwen3_5_fused_int4_weights",
     "finalize_int4_weight_reload",
     "is_int4_wna16_quant_config",

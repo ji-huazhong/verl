@@ -7,7 +7,6 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 
 import json
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -18,12 +17,15 @@ from verl.utils.qat.int4 import (
     apply_int4_qat_to_modules,
     dequantize_int4_levels,
     fake_quant_int4_ste,
-    order_mbridge_tasks_by_layer,
     pack_int4_levels,
     quantize_int4_levels,
     unpack_int4_levels,
 )
-from verl.utils.qat.int4_vllm import expand_qwen3_5_fused_int4_weights, is_int4_wna16_quant_config
+from verl.utils.qat.int4_vllm import (
+    configure_int4_layerwise_reload,
+    expand_qwen3_5_fused_int4_weights,
+    is_int4_wna16_quant_config,
+)
 
 
 def _write_int4_config(tmp_path, group_size=32):
@@ -189,27 +191,63 @@ def test_wna16_detection_is_semantic_not_class_name_based():
     assert not is_int4_wna16_quant_config(config)
 
 
-def test_mbridge_int4_export_tasks_are_stably_layer_major():
-    names = [
-        "embedding.word_embeddings.weight",
-        "decoder.layers.10.mlp.experts.linear_fc1.weight0",
-        "decoder.layers.2.mlp.experts.linear_fc1.weight0",
-        "decoder.layers.10.mlp.experts.linear_fc2.weight0",
-        "decoder.layers.2.mlp.experts.linear_fc2.weight0",
-        "output_layer.weight",
-    ]
-    tasks = [SimpleNamespace(global_param_name=name) for name in names]
+def test_int4_layerwise_reload_preserves_wna16_derived_tensors():
+    skip_tensors = {"_expert_map"}
 
-    ordered = order_mbridge_tasks_by_layer(tasks)
+    configure_int4_layerwise_reload(skip_tensors)
 
-    assert [task.global_param_name for task in ordered] == [
-        "embedding.word_embeddings.weight",
-        "output_layer.weight",
-        "decoder.layers.2.mlp.experts.linear_fc1.weight0",
-        "decoder.layers.2.mlp.experts.linear_fc2.weight0",
-        "decoder.layers.10.mlp.experts.linear_fc1.weight0",
-        "decoder.layers.10.mlp.experts.linear_fc2.weight0",
-    ]
+    assert skip_tensors == {
+        "_expert_map",
+        "w13_weight_shape",
+        "w2_weight_shape",
+        "w13_weight_g_idx",
+        "w2_weight_g_idx",
+        "w13_g_idx_sort_indices",
+        "w2_g_idx_sort_indices",
+    }
+
+
+def test_vllm_layerwise_reload_completes_without_derived_wna16_updates():
+    reload_api = pytest.importorskip("vllm.model_executor.model_loader.reload")
+    layerwise_reload = pytest.importorskip("vllm.model_executor.model_loader.reload.layerwise")
+
+    configure_int4_layerwise_reload()
+
+    class _FakeWNA16Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            for name, size in {
+                "w13_weight_packed": 4,
+                "w2_weight_packed": 4,
+                "w13_weight_scale": 2,
+                "w2_weight_scale": 2,
+                "w13_weight_shape": 2,
+                "w2_weight_shape": 2,
+                "w13_weight_g_idx": 3,
+                "w2_weight_g_idx": 3,
+                "w13_g_idx_sort_indices": 3,
+                "w2_g_idx_sort_indices": 3,
+            }.items():
+                self.register_parameter(name, torch.nn.Parameter(torch.zeros(size), requires_grad=False))
+
+    layer = _FakeWNA16Layer()
+    derived_before = {
+        name: parameter.clone()
+        for name, parameter in layer.named_parameters()
+        if name.endswith(("weight_shape", "weight_g_idx", "g_idx_sort_indices"))
+    }
+    reload_api.record_metadata_for_reloading(layer)
+    reload_api.initialize_layerwise_reload(layer)
+
+    info = layerwise_reload.get_layerwise_info(layer)
+    assert info.load_numel_total == 12
+    for name in ("w13_weight_packed", "w2_weight_packed", "w13_weight_scale", "w2_weight_scale"):
+        parameter = getattr(layer, name)
+        loaded_weight = torch.ones(parameter.shape, dtype=parameter.dtype, device="cpu")
+        parameter.weight_loader(parameter, loaded_weight)
+
+    assert info.load_numel == 0
+    assert all(torch.equal(getattr(layer, name), value) for name, value in derived_before.items())
 
 
 class _FakeGroupedLinear(torch.nn.Module):
