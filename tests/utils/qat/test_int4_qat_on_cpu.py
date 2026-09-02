@@ -7,6 +7,7 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -17,6 +18,7 @@ from verl.utils.qat.int4 import (
     apply_int4_qat_to_modules,
     dequantize_int4_levels,
     fake_quant_int4_ste,
+    order_mbridge_tasks_by_layer,
     pack_int4_levels,
     quantize_int4_levels,
     unpack_int4_levels,
@@ -185,6 +187,29 @@ def test_wna16_detection_is_semantic_not_class_name_based():
     assert is_int4_wna16_quant_config(config)
     config["target_scheme_map"]["Linear"]["input_activations"] = {"num_bits": 8}
     assert not is_int4_wna16_quant_config(config)
+
+
+def test_mbridge_int4_export_tasks_are_stably_layer_major():
+    names = [
+        "embedding.word_embeddings.weight",
+        "decoder.layers.10.mlp.experts.linear_fc1.weight0",
+        "decoder.layers.2.mlp.experts.linear_fc1.weight0",
+        "decoder.layers.10.mlp.experts.linear_fc2.weight0",
+        "decoder.layers.2.mlp.experts.linear_fc2.weight0",
+        "output_layer.weight",
+    ]
+    tasks = [SimpleNamespace(global_param_name=name) for name in names]
+
+    ordered = order_mbridge_tasks_by_layer(tasks)
+
+    assert [task.global_param_name for task in ordered] == [
+        "embedding.word_embeddings.weight",
+        "output_layer.weight",
+        "decoder.layers.2.mlp.experts.linear_fc1.weight0",
+        "decoder.layers.2.mlp.experts.linear_fc2.weight0",
+        "decoder.layers.10.mlp.experts.linear_fc1.weight0",
+        "decoder.layers.10.mlp.experts.linear_fc2.weight0",
+    ]
 
 
 class _FakeGroupedLinear(torch.nn.Module):

@@ -1036,6 +1036,11 @@ class MegatronEngine(BaseEngine):
             return None
         if self._hf_export_tasks is None:
             self._hf_export_tasks = self.bridge.get_conversion_tasks(self.module)
+            if self._qat_enabled and self._qat_format == "int4":
+                from verl.utils.qat.int4 import order_mbridge_tasks_by_layer
+
+                self._hf_export_tasks = order_mbridge_tasks_by_layer(self._hf_export_tasks)
+                logger.info("Integer INT4 QAT: ordered Megatron Bridge export tasks by transformer layer")
         return self._hf_export_tasks
 
     def get_per_tensor_param(self, base_sync_done=False, **kwargs):

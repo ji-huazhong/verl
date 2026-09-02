@@ -44,6 +44,7 @@ _MCORE_EXPERT_SUFFIXES = (
     "mlp.experts.linear_fc1",
     "mlp.experts.linear_fc2",
 )
+_MCORE_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
 
 
 def _resolve_scale_dtype(scale_dtype: str | torch.dtype) -> torch.dtype:
@@ -185,6 +186,31 @@ def is_routed_expert_weight(name: str, weight: torch.Tensor) -> bool:
     return weight.ndim == 2 and _INDIVIDUAL_EXPERT_WEIGHT_RE.search(name) is not None
 
 
+def order_mbridge_tasks_by_layer(tasks: Iterable[Any]) -> list[Any]:
+    """Return a stable layer-major order for Megatron Bridge export tasks.
+
+    Megatron Bridge normally follows checkpoint/mapping order, which may emit
+    one projection for every transformer layer before returning to the next
+    projection. vLLM's layerwise reload then has to retain one incomplete
+    ``RoutedExperts`` buffer per layer. Grouping tasks by the numeric layer in
+    ``global_param_name`` lets vLLM finalize each parent layer immediately.
+
+    Non-layer tasks stay stable and are emitted first. The key depends only on
+    the global task directory, so every model-parallel rank keeps the same
+    collective order.
+    """
+    indexed_tasks = list(enumerate(tasks))
+
+    def _key(indexed_task: tuple[int, Any]) -> tuple[int, int, int]:
+        index, task = indexed_task
+        match = _MCORE_LAYER_RE.search(str(getattr(task, "global_param_name", "")))
+        if match is None:
+            return (0, 0, index)
+        return (1, int(match.group(1)), index)
+
+    return [task for _, task in sorted(indexed_tasks, key=_key)]
+
+
 class Int4WeightExporter:
     """Stream BF16 HF weights as compressed-tensors integer INT4 tensors."""
 
@@ -280,6 +306,7 @@ __all__ = [
     "dequantize_int4_levels",
     "fake_quant_int4_ste",
     "is_routed_expert_weight",
+    "order_mbridge_tasks_by_layer",
     "pack_int4_levels",
     "quantize_int4_levels",
     "quantize_int4_weight",
