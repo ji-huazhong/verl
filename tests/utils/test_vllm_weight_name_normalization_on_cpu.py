@@ -755,6 +755,7 @@ def test_update_weights_from_ipc_int4_owns_reused_bucket_tensors(monkeypatch):
 
     monkeypatch.setattr(int4_vllm, "prepare_int4_for_weight_reload", lambda _model: None)
     monkeypatch.setattr(int4_vllm, "finalize_int4_weight_reload", lambda _model, _config: None)
+    monkeypatch.setattr(int4_vllm, "supports_int4_selective_reload_ownership", lambda: False)
 
     model = _FakeModel({"first.weight": torch.empty(0), "second.weight": torch.empty(0)})
     retained = []

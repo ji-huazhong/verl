@@ -27,6 +27,7 @@ from verl.utils.qat.int4_vllm import (
     configure_int4_vllm_backend,
     expand_qwen3_5_fused_int4_weights,
     is_int4_wna16_quant_config,
+    own_pending_int4_reload_views,
 )
 
 
@@ -125,10 +126,10 @@ def test_fake_quant_uses_identity_ste():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Triton")
-@pytest.mark.parametrize("shape", [(768, 2048), (2048, 768)])
+@pytest.mark.parametrize("shape", [(768, 2048), (2048, 768), (3, 16, 128)])
 @pytest.mark.parametrize("group_size", [32, 128])
 def test_cuda_fake_quant_and_packer_match_cpu_reference(shape, group_size):
-    """Cover Qwen3-30B gate/up and down expert matrix dimensions."""
+    """Cover Qwen3 individual and Qwen3.5-style fused expert tensors."""
     cpu_weight = torch.randn(*shape, dtype=torch.bfloat16)
     cuda_weight = cpu_weight.cuda()
 
@@ -136,16 +137,22 @@ def test_cuda_fake_quant_and_packer_match_cpu_reference(shape, group_size):
     expected_fake = dequantize_int4_levels(expected_levels, expected_scale, group_size, torch.bfloat16)
     actual_fake = fake_quant_int4_ste(cuda_weight, group_size, "bfloat16").cpu()
 
+    input_name = (
+        "model.layers.0.mlp.experts.0.gate_proj.weight"
+        if len(shape) == 2
+        else "model.layers.0.mlp.experts.gate_up_proj"
+    )
+    base_name = input_name.removesuffix(".weight")
     exporter = Int4WeightExporter(group_size=group_size)
-    exported = dict(exporter.process_weights_iterator([("model.layers.0.mlp.experts.0.gate_proj.weight", cuda_weight)]))
+    exported = dict(exporter.process_weights_iterator([(input_name, cuda_weight)]))
 
     assert torch.equal(actual_fake, expected_fake)
     assert torch.equal(
-        unpack_int4_levels(exported["model.layers.0.mlp.experts.0.gate_proj.weight_packed"]).cpu(),
+        unpack_int4_levels(exported[f"{base_name}.weight_packed"]).cpu(),
         expected_levels,
     )
     assert torch.equal(
-        exported["model.layers.0.mlp.experts.0.gate_proj.weight_scale"].cpu(),
+        exported[f"{base_name}.weight_scale"].cpu(),
         expected_scale,
     )
 
@@ -223,6 +230,32 @@ def test_int4_vllm_backend_can_force_generic_method(monkeypatch):
 
     assert configure_int4_vllm_backend(moe_module=module)
     assert not module.check_moe_marlin_supports_layer(object(), 128)
+
+
+def test_int4_reload_owns_only_the_layerwise_views_still_pending():
+    """Completed layers do not need an extra IPC-buffer clone."""
+    source = torch.ones(4)
+    retained = source.view_as(source)
+    unrelated = torch.zeros(4)
+    retained_info = SimpleNamespace(
+        loaded_weights=[("weight", SimpleNamespace(arguments={"loaded_weight": retained, "param": unrelated}))]
+    )
+    complete_info = SimpleNamespace(loaded_weights=[])
+    model = torch.nn.Sequential(torch.nn.Identity(), torch.nn.Identity())
+    infos = {module: (retained_info if index == 1 else complete_info) for index, module in enumerate(model.modules())}
+
+    tensors, byte_count = own_pending_int4_reload_views(
+        [model],
+        [("source.weight", source)],
+        get_layerwise_info=infos.__getitem__,
+    )
+
+    assert tensors == 1
+    assert byte_count == retained.nbytes
+    owned = retained_info.loaded_weights[0][1].arguments["loaded_weight"]
+    assert owned.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
+    source.zero_()
+    torch.testing.assert_close(owned, torch.ones(4))
 
 
 def test_vllm_layerwise_reload_completes_without_derived_wna16_updates():

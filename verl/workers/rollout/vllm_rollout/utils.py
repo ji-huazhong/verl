@@ -18,6 +18,7 @@ import os
 import platform
 import signal
 import threading
+import time
 from collections.abc import Mapping
 from types import MethodType
 from typing import Any, Literal, Optional, get_args
@@ -33,6 +34,19 @@ from verl.workers.rollout.vllm_rollout.weight_update_utils import apply_buffer_u
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _log_int4_reload_profile(message: str, *args: Any) -> None:
+    """Emit reload profiling at WARNING only when explicitly requested.
+
+    vLLM workers normally configure this module at WARNING, which would hide
+    routine INFO timings in Ray logs. The switch leaves default production
+    logging unchanged but makes the breakdown observable in a benchmark.
+    """
+    if os.environ.get("VERL_INT4_QAT_RELOAD_PROFILE", "0") == "1":
+        logger.warning(message, *args)
+    else:
+        logger.info(message, *args)
 
 # magic numbers that ensure we are using the same LoRA adapter during the rollout and training process
 VLLM_LORA_INT_ID = 123
@@ -308,13 +322,56 @@ class vLLMColocateWorkerExtension:
         # the bucketed transport may split one across buckets. Accumulate and
         # apply only after ``is_last``; standard base weights load per bucket.
         lora_weights: dict[str, torch.Tensor] | None = {} if (peft_config and base_sync_done) else None
+        int4_reload_started_at = time.perf_counter() if self._is_int4_qat_model else None
+        int4_received_tensors = 0
+        int4_received_bytes = 0
+        int4_vllm_load_seconds = 0.0
+        int4_ownership_copy_seconds = 0.0
+        int4_owned_tensors = 0
+        int4_owned_bytes = 0
+        int4_full_bucket_clone_fallback = False
+
+        if self._is_int4_qat_model:
+            from verl.utils.qat.int4_vllm import supports_int4_selective_reload_ownership
+
+            int4_selective_ownership = supports_int4_selective_reload_ownership()
+        else:
+            int4_selective_ownership = False
 
         def on_bucket_received(weights: list[tuple[str, torch.Tensor]], is_last: bool) -> None:
+            nonlocal int4_received_tensors, int4_received_bytes, int4_vllm_load_seconds
+            nonlocal int4_ownership_copy_seconds, int4_owned_tensors, int4_owned_bytes
+            nonlocal int4_full_bucket_clone_fallback
             if self._is_int4_qat_model:
                 # vLLM's layerwise reload defers attention processing until the
                 # complete sync and may retain an incomplete MoE layer across a
                 # bucket boundary. The receiver reuses its IPC buffer after this
-                # callback, so those deferred tensor views must own their storage.
+                # callback, so only those deferred tensor views must own their
+                # storage. Completed layers have already copied their tensors;
+                # cloning an entire bucket doubled update-weight traffic.
+                if int4_selective_ownership:
+                    int4_received_tensors += len(weights)
+                    int4_received_bytes += sum(tensor.nbytes for _, tensor in weights)
+                    int4_load_started_at = time.perf_counter()
+                    self._update_weights(
+                        weights,
+                        peft_config=peft_config,
+                        base_sync_done=base_sync_done,
+                    )
+                    int4_vllm_load_seconds += time.perf_counter() - int4_load_started_at
+                    from verl.utils.qat.int4_vllm import own_pending_int4_reload_views
+
+                    int4_copy_started_at = time.perf_counter()
+                    tensors, byte_count = own_pending_int4_reload_views(self._iter_all_models(), weights)
+                    int4_ownership_copy_seconds += time.perf_counter() - int4_copy_started_at
+                    int4_owned_tensors += tensors
+                    int4_owned_bytes += byte_count
+                    return
+
+                # vLLM versions without the layerwise ownership API retain the
+                # previous correctness behavior rather than risking IPC-view
+                # corruption. This path is not expected on vLLM 0.24+.
+                int4_full_bucket_clone_fallback = True
                 weights = [(name, tensor.clone()) for name, tensor in weights]
             if lora_weights is not None:
                 # Clone: add_lora keeps these past the callback (reused IPC buffer, #6454).
@@ -336,13 +393,32 @@ class vLLMColocateWorkerExtension:
 
         receiver.receive_weights(on_bucket_received=on_bucket_received)
 
+        if self._is_int4_qat_model:
+            _log_int4_reload_profile(
+                "Integer INT4 QAT reload receive/load: %.3fs; vLLM load=%.3fs; ownership-copy=%.3fs; "
+                "input=%d tensors (%.2f GiB); retained IPC copies=%d (%.2f GiB); full-bucket fallback=%s",
+                time.perf_counter() - int4_reload_started_at,
+                int4_vllm_load_seconds,
+                int4_ownership_copy_seconds,
+                int4_received_tensors,
+                int4_received_bytes / (1 << 30),
+                int4_owned_tensors,
+                int4_owned_bytes / (1 << 30),
+                int4_full_bucket_clone_fallback,
+            )
+
         # =========================== step 3: process weights after loading ===========================
         if self._is_int4_qat_model:
             from verl.utils.qat.int4_vllm import finalize_int4_weight_reload
 
+            int4_finalize_started_at = time.perf_counter()
             for model, model_config in self._iter_all_models_with_config():
                 finalize_int4_weight_reload(model, model_config)
-            logger.info("Integer INT4 QAT: WNA16 layerwise reload finalized")
+            _log_int4_reload_profile(
+                "Integer INT4 QAT: WNA16 layerwise reload finalized in %.3fs (total %.3fs)",
+                time.perf_counter() - int4_finalize_started_at,
+                time.perf_counter() - int4_reload_started_at,
+            )
         elif self._is_qat_model:
             # QAT (compressed-tensors): call process_weights_after_loading AFTER all buckets are received
             from verl.utils.qat import manual_process_weights_after_loading
