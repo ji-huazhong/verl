@@ -174,9 +174,10 @@ class vLLMColocateWorkerExtension:
             apply_qat_patches()
             logger.info("Applied NVFP4 QAT (compressed-tensors) patches in vLLM worker subprocess")
         elif _is_int4_qat_model:
-            from verl.utils.qat.int4_vllm import configure_int4_layerwise_reload
+            from verl.utils.qat.int4_vllm import configure_int4_layerwise_reload, configure_int4_vllm_backend
 
             configure_int4_layerwise_reload()
+            configure_int4_vllm_backend()
             logger.info("Detected integer INT4 WNA16 QAT model; using vLLM native layerwise reload")
         elif _is_modelopt_qat:
             from verl.utils.modelopt import apply_modelopt_nvfp4_patches

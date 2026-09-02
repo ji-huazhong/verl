@@ -7,6 +7,7 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -23,6 +24,7 @@ from verl.utils.qat.int4 import (
 )
 from verl.utils.qat.int4_vllm import (
     configure_int4_layerwise_reload,
+    configure_int4_vllm_backend,
     expand_qwen3_5_fused_int4_weights,
     is_int4_wna16_quant_config,
 )
@@ -205,6 +207,14 @@ def test_int4_layerwise_reload_preserves_wna16_derived_tensors():
         "w13_g_idx_sort_indices",
         "w2_g_idx_sort_indices",
     }
+
+
+def test_int4_vllm_backend_can_force_generic_method(monkeypatch):
+    module = SimpleNamespace(check_moe_marlin_supports_layer=lambda *_args, **_kwargs: True)
+    monkeypatch.setenv("VERL_INT4_QAT_FORCE_GENERIC_WNA16", "1")
+
+    assert configure_int4_vllm_backend(moe_module=module)
+    assert not module.check_moe_marlin_supports_layer(object(), 128)
 
 
 def test_vllm_layerwise_reload_completes_without_derived_wna16_updates():
