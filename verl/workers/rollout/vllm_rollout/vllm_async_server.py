@@ -16,6 +16,7 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import os
 import uuid
 from pprint import pprint
@@ -672,7 +673,18 @@ class vLLMHttpServer:
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
         if sampling_params.logprobs is not None:
-            log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+            log_probs = [
+                logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)
+            ]
+            if os.environ.get("VERL_INT4_QAT_RELOAD_DIAGNOSTICS", "0") == "1":
+                finite_log_probs = [value for value in log_probs if math.isfinite(value)]
+                logger.warning(
+                    "Rollout log-prob diagnostics: tokens=%d nonfinite=%d finite_min=%s finite_max=%s",
+                    len(log_probs),
+                    len(log_probs) - len(finite_log_probs),
+                    min(finite_log_probs) if finite_log_probs else None,
+                    max(finite_log_probs) if finite_log_probs else None,
+                )
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:

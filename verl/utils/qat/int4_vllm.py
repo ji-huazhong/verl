@@ -187,6 +187,22 @@ def finalize_int4_weight_reload(model: torch.nn.Module, model_config: Any) -> No
         raise RuntimeError("Integer INT4 RL reload requires vLLM's layerwise reload API (vLLM 0.24+).") from exc
 
     finalize_layerwise_reload(model, model_config)
+    if os.environ.get("VERL_INT4_QAT_RELOAD_DIAGNOSTICS", "0") == "1":
+        scale_tensors = [
+            parameter.detach()
+            for name, parameter in model.named_parameters()
+            if name.endswith(("w13_weight_scale", "w2_weight_scale"))
+        ]
+        nonfinite = sum(int((~torch.isfinite(scale)).sum().item()) for scale in scale_tensors)
+        scale_min = min((float(scale.min().item()) for scale in scale_tensors), default=float("nan"))
+        scale_max = max((float(scale.max().item()) for scale in scale_tensors), default=float("nan"))
+        logger.warning(
+            "Integer INT4 reload diagnostics: scale_tensors=%d nonfinite=%d min=%g max=%g",
+            len(scale_tensors),
+            nonfinite,
+            scale_min,
+            scale_max,
+        )
 
 
 __all__ = [
