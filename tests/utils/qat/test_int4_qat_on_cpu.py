@@ -112,8 +112,10 @@ def test_fake_quant_uses_identity_ste():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Triton")
-def test_cuda_fake_quant_and_packer_match_cpu_reference():
-    cpu_weight = torch.randn(4, 256, dtype=torch.bfloat16)
+@pytest.mark.parametrize("shape", [(768, 2048), (2048, 768)])
+def test_cuda_fake_quant_and_packer_match_cpu_reference(shape):
+    """Cover Qwen3-30B gate/up and down expert matrix dimensions."""
+    cpu_weight = torch.randn(*shape, dtype=torch.bfloat16)
     cuda_weight = cpu_weight.cuda()
 
     expected_levels, expected_scale = quantize_int4_levels(cpu_weight, 32, "bfloat16")
@@ -223,3 +225,32 @@ def test_megatron_hook_patches_only_routed_expert_grouped_linears():
     assert not torch.equal(quantized_weight, model.mlp.experts.linear_fc1.weight)
     quantized_weight.sum().backward()
     assert torch.equal(model.mlp.experts.linear_fc1.weight.grad, torch.ones_like(quantized_weight))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Transformer Engine")
+def test_megatron_hook_runs_real_te_grouped_linear_forward_backward():
+    """Exercise the exact Transformer Engine hook used by Qwen3 routed experts."""
+    from transformer_engine.pytorch import GroupedLinear
+
+    model = torch.nn.Module()
+    model.mlp = torch.nn.Module()
+    model.mlp.experts = torch.nn.Module()
+    model.mlp.experts.linear_fc1 = GroupedLinear(
+        num_gemms=2,
+        in_features=128,
+        out_features=64,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        device="cuda",
+    )
+    config = type("Config", (), {"group_size": 32, "scale_dtype": "bfloat16"})()
+    apply_int4_qat_to_modules([model], config)
+
+    inp = torch.randn(5, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    output = model.mlp.experts.linear_fc1(inp, m_splits=[2, 3])
+    output.float().square().mean().backward()
+
+    assert output.shape == (5, 64)
+    assert inp.grad is not None
+    original_weights = model.mlp.experts.linear_fc1._verl_int4_original_get_weight_tensors()
+    assert all(weight.grad is not None for weight in original_weights)

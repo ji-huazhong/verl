@@ -5,6 +5,8 @@
 # Knobs:
 #   INFER_BACKEND          rollout backend: vllm | sglang | trtllm   (default: vllm)
 #   ROLLOUT_QUANTIZATION   fp8 to enable TRT-LLM FP8 rollout         (default: unset)
+#   INT4_QAT               True to enable routed-expert INT4 W4A16 QAT
+#   INT4_QAT_CONFIG        compressed-tensors config used by vLLM
 #
 # Ascend NPU users: see examples/ascend_extras/grpo_trainer/run_qwen3_30b_a3b_megatron.sh.
 
@@ -14,6 +16,8 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 ########################### user-adjustable ###########################
 INFER_BACKEND=${INFER_BACKEND:-vllm}
 ROLLOUT_QUANTIZATION=${ROLLOUT_QUANTIZATION:-}
+INT4_QAT=${INT4_QAT:-False}
+INT4_QAT_CONFIG=${INT4_QAT_CONFIG:-"examples/qat/config/int4_w4a16_qwen3_moe.json"}
 
 DATA_DIR=${DATA_DIR:-"$PWD"}
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-30B-A3B-Base}
@@ -226,6 +230,23 @@ EXTRA=(
     +actor_rollout_ref.rollout.moe_tensor_parallel_size=${gen_moe_tp}
     actor_rollout_ref.rollout.expert_parallel_size=${gen_moe_ep}
 )
+
+if [ "${INT4_QAT}" = True ]; then
+    if [ "${INFER_BACKEND}" != vllm ]; then
+        echo "Integer INT4 QAT currently requires INFER_BACKEND=vllm, got: ${INFER_BACKEND}" >&2
+        exit 1
+    fi
+    ACTOR+=(
+        actor_rollout_ref.actor.megatron.qat.enable=True
+        actor_rollout_ref.actor.megatron.qat.format=int4
+        actor_rollout_ref.actor.megatron.qat.mode=w4a16
+        actor_rollout_ref.actor.megatron.qat.group_size=32
+        actor_rollout_ref.actor.megatron.qat.scope=routed_experts
+        actor_rollout_ref.actor.megatron.qat.symmetric=True
+        actor_rollout_ref.actor.megatron.qat.scale_dtype=bfloat16
+        actor_rollout_ref.actor.megatron.qat.quantization_config_path=${INT4_QAT_CONFIG}
+    )
+fi
 
 if [ "${INFER_BACKEND}" = trtllm ]; then
     EXTRA+=(
