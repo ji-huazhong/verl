@@ -7,6 +7,7 @@
 #   ROLLOUT_QUANTIZATION   fp8 to enable TRT-LLM FP8 rollout         (default: unset)
 #   INT4_QAT               True to enable routed-expert INT4 W4A16 QAT
 #   INT4_QAT_CONFIG        compressed-tensors config used by vLLM
+#   CPU_OPTIMIZER_OFFLOAD  keep Adam states on CPU                    (default: False)
 #
 # Ascend NPU users: see examples/ascend_extras/grpo_trainer/run_qwen3_30b_a3b_megatron.sh.
 
@@ -18,6 +19,7 @@ INFER_BACKEND=${INFER_BACKEND:-vllm}
 ROLLOUT_QUANTIZATION=${ROLLOUT_QUANTIZATION:-}
 INT4_QAT=${INT4_QAT:-False}
 INT4_QAT_CONFIG=${INT4_QAT_CONFIG:-"examples/qat/config/int4_w4a16_qwen3_moe.json"}
+CPU_OPTIMIZER_OFFLOAD=${CPU_OPTIMIZER_OFFLOAD:-False}
 
 DATA_DIR=${DATA_DIR:-"$PWD"}
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-30B-A3B-Base}
@@ -45,18 +47,20 @@ actor_tp=${ACTOR_TP:-4}
 actor_pp=${ACTOR_PP:-2}
 actor_vpp=${ACTOR_VPP:-2}
 actor_ep=${ACTOR_EP:-2}
+actor_etp=${ACTOR_ETP:-1}
 actor_cp=${ACTOR_CP:-1}
 ref_tp=${REF_TP:-${actor_tp}}
 ref_pp=${REF_PP:-${actor_pp}}
 ref_vpp=${REF_VPP:-2}
 ref_ep=${REF_EP:-${actor_ep}}
+ref_etp=${REF_ETP:-${actor_etp}}
 ref_cp=${REF_CP:-1}
 all_offload=${ALL_OFFLOAD:-True}
 
 rollout_tp=${ROLLOUT_TP:-4}
 infer_tp=${INFER_TP:-${rollout_tp}}
-gen_moe_tp=${GEN_MOE_TP:-2}
-gen_moe_ep=${GEN_MOE_EP:-2}
+gen_moe_tp=${GEN_MOE_TP:-1}
+gen_moe_ep=${GEN_MOE_EP:-${infer_tp}}
 rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.6}
 rollout_n=${ROLLOUT_N:-8}
 rollout_max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-10240}
@@ -153,6 +157,7 @@ ACTOR=(
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${actor_pp}
     actor_rollout_ref.actor.megatron.virtual_pipeline_model_parallel_size=${actor_vpp_override}
     actor_rollout_ref.actor.megatron.expert_model_parallel_size=${actor_ep}
+    actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=${actor_etp}
     actor_rollout_ref.actor.megatron.context_parallel_size=${actor_cp}
     actor_rollout_ref.actor.megatron.param_offload=${all_offload}
     actor_rollout_ref.actor.megatron.optimizer_offload=${all_offload}
@@ -203,6 +208,7 @@ REF=(
     actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${ref_pp}
     actor_rollout_ref.ref.megatron.virtual_pipeline_model_parallel_size=${ref_vpp_override}
     actor_rollout_ref.ref.megatron.expert_model_parallel_size=${ref_ep}
+    actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=${ref_etp}
     actor_rollout_ref.ref.megatron.context_parallel_size=${ref_cp}
     actor_rollout_ref.ref.megatron.param_offload=${all_offload}
     actor_rollout_ref.ref.megatron.use_mbridge=True
@@ -230,6 +236,15 @@ EXTRA=(
     +actor_rollout_ref.rollout.moe_tensor_parallel_size=${gen_moe_tp}
     actor_rollout_ref.rollout.expert_parallel_size=${gen_moe_ep}
 )
+
+if [ "${CPU_OPTIMIZER_OFFLOAD}" = True ]; then
+    ACTOR+=(
+        +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=1
+        +actor_rollout_ref.actor.optim.override_optimizer_config.overlap_cpu_optimizer_d2h_h2d=True
+        +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True
+        +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=True
+    )
+fi
 
 if [ "${INT4_QAT}" = True ]; then
     if [ "${INFER_BACKEND}" != vllm ]; then
