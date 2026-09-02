@@ -37,13 +37,16 @@ def _int4_fake_quant_kernel(
     values = tl.load(input_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
 
     amax = tl.max(tl.abs(values), axis=0)
-    scale = tl.maximum(amax / 7.0, 1e-5)
+    # Keep division IEEE round-to-nearest. Triton's default floating-point
+    # division may use an approximate reciprocal, which can move exact .5
+    # quantization ties across the boundary for large BF16 expert matrices.
+    scale = tl.maximum(tl.div_rn(amax, 7.0), 1e-5)
     if SCALE_BF16:
         scale = scale.to(tl.bfloat16).to(tl.float32)
     else:
         scale = scale.to(tl.float16).to(tl.float32)
 
-    scaled = values / scale
+    scaled = tl.div_rn(values, scale)
     # Explicit round-to-nearest-even to match torch.round/rintf, including
     # negative ties, without relying on backend-specific libdevice symbols.
     rounded = _round_to_nearest_even(scaled)
@@ -69,7 +72,7 @@ def _int4_quantize_pack_kernel(
     values = tl.load(input_ptr + input_offsets, mask=input_mask, other=0.0).to(tl.float32)
 
     amax = tl.max(tl.abs(values), axis=0)
-    scale = tl.maximum(amax / 7.0, 1e-5)
+    scale = tl.maximum(tl.div_rn(amax, 7.0), 1e-5)
     if SCALE_BF16:
         scale = scale.to(tl.bfloat16).to(tl.float32)
     else:
@@ -82,7 +85,7 @@ def _int4_quantize_pack_kernel(
     for nibble in tl.static_range(0, 8):
         value_offsets = group_id * GROUP_SIZE + packed_local * 8 + nibble
         current = tl.load(input_ptr + value_offsets, mask=packed_mask, other=0.0).to(tl.float32)
-        rounded = _round_to_nearest_even(current / scale)
+        rounded = _round_to_nearest_even(tl.div_rn(current, scale))
         quantized = tl.minimum(tl.maximum(rounded, -7.0), 7.0).to(tl.int32) + 8
         packed = packed | (quantized << (nibble * 4))
 
