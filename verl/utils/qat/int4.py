@@ -208,9 +208,9 @@ class Int4WeightExporter:
     ) -> Iterator[tuple[str, torch.Tensor]]:
         quantized = 0
         diagnostic_scale_tensors = 0
-        diagnostic_invalid_scales = 0
-        diagnostic_scale_min = float("inf")
-        diagnostic_scale_max = float("-inf")
+        diagnostic_invalid_scales: torch.Tensor | None = None
+        diagnostic_scale_min: torch.Tensor | None = None
+        diagnostic_scale_max: torch.Tensor | None = None
         diagnostics_enabled = os.environ.get("VERL_INT4_QAT_RELOAD_DIAGNOSTICS", "0") == "1"
         for name, weight in weights:
             if not is_routed_expert_weight(name, weight):
@@ -221,23 +221,28 @@ class Int4WeightExporter:
             packed, scale = quantize_int4_weight(weight, self.group_size, self.scale_dtype)
             if diagnostics_enabled:
                 invalid = (~torch.isfinite(scale)) | (scale <= 0)
+                scale_fp32 = scale.float()
+                invalid_count = invalid.sum(dtype=torch.int64)
+                scale_min = torch.where(invalid, torch.inf, scale_fp32).amin()
+                scale_max = torch.where(invalid, -torch.inf, scale_fp32).amax()
                 diagnostic_scale_tensors += 1
-                diagnostic_invalid_scales += int(invalid.sum().item())
-                finite_positive = scale[~invalid]
-                if finite_positive.numel() > 0:
-                    diagnostic_scale_min = min(diagnostic_scale_min, float(finite_positive.min().item()))
-                    diagnostic_scale_max = max(diagnostic_scale_max, float(finite_positive.max().item()))
+                if diagnostic_invalid_scales is None:
+                    diagnostic_invalid_scales = invalid_count
+                    diagnostic_scale_min = scale_min
+                    diagnostic_scale_max = scale_max
+                else:
+                    assert diagnostic_scale_min is not None and diagnostic_scale_max is not None
+                    diagnostic_invalid_scales.add_(invalid_count)
+                    torch.minimum(diagnostic_scale_min, scale_min, out=diagnostic_scale_min)
+                    torch.maximum(diagnostic_scale_max, scale_max, out=diagnostic_scale_max)
             yield f"{base_name}.weight_packed", packed
             yield f"{base_name}.weight_scale", scale
 
-            # Qwen3.5's fused expert loader in vLLM 0.24 does not dispatch a
-            # fused weight_shape suffix. The parameter is metadata-only and is
-            # not read by WNA16 post-processing, so online sync intentionally
-            # leaves its dummy-initialized value in place. Individual expert
-            # layouts retain the standard compressed-tensors tensor.
-            if weight.ndim == 2:
-                shape = torch.tensor(weight.shape, dtype=torch.int64, device=weight.device)
-                yield f"{base_name}.weight_shape", shape
+            # ``weight_shape`` describes static model geometry. vLLM creates
+            # it while constructing the WNA16 layer and verl excludes it from
+            # layerwise reload completion, so re-sending one copy for every
+            # individual expert projection only adds Python/loader dispatch.
+            # Keep the resident value for both individual and fused layouts.
             quantized += 1
 
         if self.require_match and quantized == 0:
@@ -245,12 +250,15 @@ class Int4WeightExporter:
                 "Integer INT4 QAT did not find routed expert weights in the Megatron-to-HF export stream."
             )
         if diagnostics_enabled:
+            invalid_scale_count = int(diagnostic_invalid_scales.item()) if diagnostic_invalid_scales is not None else 0
+            scale_min_value = float(diagnostic_scale_min.item()) if diagnostic_scale_min is not None else float("inf")
+            scale_max_value = float(diagnostic_scale_max.item()) if diagnostic_scale_max is not None else float("-inf")
             logger.warning(
                 "Integer INT4 export diagnostics: scale_tensors=%d invalid=%d min=%g max=%g",
                 diagnostic_scale_tensors,
-                diagnostic_invalid_scales,
-                diagnostic_scale_min,
-                diagnostic_scale_max,
+                invalid_scale_count,
+                scale_min_value,
+                scale_max_value,
             )
         logger.info("Integer INT4 exporter quantized %d routed expert tensors", quantized)
 

@@ -7,6 +7,7 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 
 import json
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -155,6 +156,33 @@ def test_cuda_fake_quant_and_packer_match_cpu_reference(shape, group_size):
         exported[f"{base_name}.weight_scale"].cpu(),
         expected_scale,
     )
+    assert f"{base_name}.weight_shape" not in exported
+
+
+def test_exporter_keeps_individual_expert_weight_shape_resident():
+    weight = torch.randn(16, 128, dtype=torch.bfloat16)
+    base_name = "model.layers.0.mlp.experts.0.gate_proj"
+
+    exported = dict(
+        Int4WeightExporter(group_size=32).process_weights_iterator([(f"{base_name}.weight", weight)])
+    )
+
+    assert f"{base_name}.weight_packed" in exported
+    assert f"{base_name}.weight_scale" in exported
+    assert f"{base_name}.weight_shape" not in exported
+
+
+def test_exporter_diagnostics_aggregate_without_per_tensor_host_reads(monkeypatch, caplog):
+    monkeypatch.setenv("VERL_INT4_QAT_RELOAD_DIAGNOSTICS", "1")
+    weights = [
+        (f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight", torch.ones(2, 128))
+        for expert_id in range(2)
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        list(Int4WeightExporter(group_size=32).process_weights_iterator(weights))
+
+    assert "scale_tensors=2 invalid=0" in caplog.text
 
 
 def test_exporter_quantizes_only_compact_fused_routed_experts():

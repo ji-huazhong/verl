@@ -125,10 +125,9 @@ def patch_qwen3_5_fused_int4_loader(model: torch.nn.Module) -> bool:
 def configure_int4_layerwise_reload(skip_tensors: set[str] | None = None) -> None:
     """Keep WNA16 metadata/indices resident across online weight reloads.
 
-    These tensors are derived from static model geometry. Group/sort indices
-    are absent from the actor's online stream, while per-expert shape tensors
-    may be redundantly streamed many times into one fused parameter. None of
-    them should gate reload completion. Counting them as reloadable prevents
+    These tensors are derived from static model geometry and are absent from
+    the actor's online stream. None of them should gate reload completion.
+    Counting them as reloadable prevents
     vLLM from finalizing each ``RoutedExperts`` layer until the end of the full
     model sync, which retains every layer's temporary packed weights on device.
 
