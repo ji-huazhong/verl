@@ -105,7 +105,7 @@ Before on-policy training, force the same prompt/response tokens through trainer
 
 ## H20 validation snapshot
 
-The four-GPU Qwen3-30B-A3B smoke used GSM8K, GRPO, batch size 8, two samples per prompt, a 1,024-token response limit, actor/reference TP2/EP2, rollout TP2 with MoE TP1/EP2, and the Megatron CPU optimizer path. The three-step Marlin run observed:
+The four-GPU Qwen3-30B-A3B smoke used GSM8K, GRPO, batch size 8, two samples per prompt, a 1,024-token response limit, actor/reference TP2/EP2, rollout TP2 with MoE TP1/EP2, and the Megatron CPU optimizer path. The original three-step Marlin correctness run observed:
 
 - valid exported and reloaded scales at every initial and post-step sync;
 - finite rollout/training probability differences with Pearson correlation 0.9865–0.9893 and KL 0.00270–0.00361;
@@ -113,13 +113,16 @@ The four-GPU Qwen3-30B-A3B smoke used GSM8K, GRPO, batch size 8, two samples per
 - nonzero gradient norms 0.3504 and 0.3267 on steps two and three;
 - weight-update times 41.27, 38.10, and 26.43 seconds.
 
-A matched three-step BF16 control also completed with finite metrics. Its weight updates took 5.75–7.27 seconds, so the current INT4 implementation is a correctness baseline rather than a synchronization-performance result. A later fixed-512-token profile attributes the dominant gap to training-side online quantization/export plus IPC arrival: ownership copies and WNA16 repacking are necessary but measured as minor costs in this topology. Three GSM8K steps are not evidence of convergence parity.
+A matched three-step BF16 control also completed with finite metrics and weight-update times of 5.75/7.21/7.27s (mean 6.743s). After selective IPC ownership and generic metadata elision, a new matched 1,024-response INT4 run took 13.909/13.321/13.241s (mean 13.490s, population standard deviation 0.298s), exactly 2.00 times the BF16 mean. The corresponding 512-response INT4 mean was 13.610s, only 0.9% slower, confirming that response length does not explain the synchronization gap. The current dominant cost is tensor dispatch and vLLM loading; ownership copies and WNA16 repacking are minor in this topology. Three GSM8K steps are not evidence of convergence parity.
 
 ## Current boundaries
 
 - Supported model/export layout: Qwen3 and Qwen3.5 fused or individual routed experts.
 - Supported training backend: Megatron with TE `GroupedLinear` experts.
 - Supported rollout backend: vLLM 0.24 compressed-tensors WNA16.
+- Validated deployment topology: colocated 4×H20 with actor/reference TP2/EP2 and rollout TP2/MoE-TP1/EP2. Different training/rollout TP, PP, or EP layouts and cross-node execution are not yet validated.
+- The HF-named INT4 stream and static-metadata elision are transport-independent. Cross-node deployments must use a distributed checkpoint engine such as NCCL or NIXL; the final checkpoint-engine-to-vLLM CUDA IPC hop remains node-local.
+- MBridge full-HF export followed by vLLM-local sharding makes different training and rollout layouts architecturally possible, but each rollout shard must align with the INT4 group size and pack factor. Validate PP layer filtering, EP expert ownership, per-rank tensor coverage, repeated reloads, and numerical agreement before treating a topology as supported.
 - Quantized tensors: routed expert gate/up/down weights only. Router, attention, GDN, shared experts, embeddings, norms, and LM head remain BF16.
 - Supported quantizer: symmetric INT4 with vLLM-compatible group size 32, 64, or 128. The Qwen3-30B recipe uses 128 to match MILES; the Qwen3.5 TP-sharded recipe uses 32. There is no zero-point or activation quantization.
 - The initial implementation targets full-parameter RL. LoRA, MTP drafter sync, dense INT4, SGLang, NPU, and vLLM-Ascend require separate validation or adapters.
