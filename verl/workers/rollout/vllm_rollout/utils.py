@@ -310,6 +310,12 @@ class vLLMColocateWorkerExtension:
         lora_weights: dict[str, torch.Tensor] | None = {} if (peft_config and base_sync_done) else None
 
         def on_bucket_received(weights: list[tuple[str, torch.Tensor]], is_last: bool) -> None:
+            if self._is_int4_qat_model:
+                # vLLM's layerwise reload defers attention processing until the
+                # complete sync and may retain an incomplete MoE layer across a
+                # bucket boundary. The receiver reuses its IPC buffer after this
+                # callback, so those deferred tensor views must own their storage.
+                weights = [(name, tensor.clone()) for name, tensor in weights]
             if lora_weights is not None:
                 # Clone: add_lora keeps these past the callback (reused IPC buffer, #6454).
                 lora_weights.update((name, tensor.clone()) for name, tensor in weights)

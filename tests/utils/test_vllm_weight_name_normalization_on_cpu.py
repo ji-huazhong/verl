@@ -237,6 +237,9 @@ class _FakeVllmConfig:
 def _make_worker(model):
     worker = object.__new__(vLLMColocateWorkerExtension)
     worker.model_runner = types.SimpleNamespace(model=model, vllm_config=_FakeVllmConfig(), drafter=None)
+    worker._is_qat_model = False
+    worker._is_int4_qat_model = False
+    worker._is_modelopt_qat = False
     return worker
 
 
@@ -730,3 +733,41 @@ def test_update_weights_from_ipc_standard_loads_per_bucket(monkeypatch):
     worker.update_weights_from_ipc(peft_config=None, base_sync_done=False)
 
     assert loaded == ["q.weight", "k.weight"]
+
+
+def test_update_weights_from_ipc_int4_owns_reused_bucket_tensors(monkeypatch):
+    """INT4 layerwise reload may retain weights after the IPC callback returns."""
+    pytest.importorskip("vllm")
+    import verl.workers.rollout.vllm_rollout.bucketed_weight_transfer as bwt
+
+    class _ReusingBucketReceiver:
+        def __init__(self, *_args, **_kwargs):
+            self.buffer = torch.ones(1)
+
+        def receive_weights(self, on_bucket_received):
+            on_bucket_received([("first.weight", self.buffer)], False)
+            self.buffer.zero_()
+            on_bucket_received([("second.weight", self.buffer)], True)
+
+    monkeypatch.setattr(bwt, "BucketedWeightReceiver", _ReusingBucketReceiver)
+
+    import verl.utils.qat.int4_vllm as int4_vllm
+
+    monkeypatch.setattr(int4_vllm, "prepare_int4_for_weight_reload", lambda _model: None)
+    monkeypatch.setattr(int4_vllm, "finalize_int4_weight_reload", lambda _model, _config: None)
+
+    model = _FakeModel({"first.weight": torch.empty(0), "second.weight": torch.empty(0)})
+    retained = []
+    worker = _make_worker(model)
+    worker.device = torch.device("cpu")
+    worker.local_rank = 0
+    worker._is_qat_model = False
+    worker._is_int4_qat_model = True
+    worker._is_modelopt_qat = False
+    worker._get_zmq_handle = lambda: "ipc:///tmp/test-bucketed-int4.sock"
+    worker._update_weights = lambda weights, **_kwargs: retained.extend(tensor for _, tensor in weights)
+
+    worker.update_weights_from_ipc(peft_config=None, base_sync_done=False)
+
+    torch.testing.assert_close(retained[0], torch.ones(1))
+    assert retained[0].untyped_storage().data_ptr() != retained[1].untyped_storage().data_ptr()
