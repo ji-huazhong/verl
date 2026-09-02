@@ -98,6 +98,13 @@ def test_int4_pack_round_trip_uses_uint4b8_bias():
     assert ((int(packed.item()) >> 12) & 0xF) == 8  # zero + bias 8
 
 
+def test_int4_pack_matches_compressed_tensors_format():
+    helpers = pytest.importorskip("compressed_tensors.compressors.pack_quantized.helpers")
+    levels = torch.arange(-7, 8, dtype=torch.int8).repeat(2, 9)[:, :128]
+
+    assert torch.equal(pack_int4_levels(levels), helpers.pack_to_int32(levels, num_bits=4))
+
+
 def test_fake_quant_and_export_share_stored_bf16_scale():
     weight = torch.linspace(-1.0, 1.0, 256, dtype=torch.float32).reshape(2, 128)
     levels, scale = quantize_int4_levels(weight, group_size=128, scale_dtype="bfloat16")
@@ -119,16 +126,17 @@ def test_fake_quant_uses_identity_ste():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Triton")
 @pytest.mark.parametrize("shape", [(768, 2048), (2048, 768)])
-def test_cuda_fake_quant_and_packer_match_cpu_reference(shape):
+@pytest.mark.parametrize("group_size", [32, 128])
+def test_cuda_fake_quant_and_packer_match_cpu_reference(shape, group_size):
     """Cover Qwen3-30B gate/up and down expert matrix dimensions."""
     cpu_weight = torch.randn(*shape, dtype=torch.bfloat16)
     cuda_weight = cpu_weight.cuda()
 
-    expected_levels, expected_scale = quantize_int4_levels(cpu_weight, 32, "bfloat16")
-    expected_fake = dequantize_int4_levels(expected_levels, expected_scale, 32, torch.bfloat16)
-    actual_fake = fake_quant_int4_ste(cuda_weight, 32, "bfloat16").cpu()
+    expected_levels, expected_scale = quantize_int4_levels(cpu_weight, group_size, "bfloat16")
+    expected_fake = dequantize_int4_levels(expected_levels, expected_scale, group_size, torch.bfloat16)
+    actual_fake = fake_quant_int4_ste(cuda_weight, group_size, "bfloat16").cpu()
 
-    exporter = Int4WeightExporter(group_size=32)
+    exporter = Int4WeightExporter(group_size=group_size)
     exported = dict(exporter.process_weights_iterator([("model.layers.0.mlp.experts.0.gate_proj.weight", cuda_weight)]))
 
     assert torch.equal(actual_fake, expected_fake)
