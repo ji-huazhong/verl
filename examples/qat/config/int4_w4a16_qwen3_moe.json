@@ -10,7 +10,7 @@
         "actorder": null,
         "block_structure": null,
         "dynamic": false,
-        "group_size": 32,
+        "group_size": 128,
         "num_bits": 4,
         "observer": "minmax",
         "observer_kwargs": {},

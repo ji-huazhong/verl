@@ -6,6 +6,7 @@ set -euo pipefail
 
 export INT4_QAT=True
 export INT4_QAT_CONFIG=${INT4_QAT_CONFIG:-"examples/qat/config/int4_w4a16_qwen3_moe.json"}
+export INT4_GROUP_SIZE=${INT4_GROUP_SIZE:-128}
 export CPU_OPTIMIZER_OFFLOAD=${CPU_OPTIMIZER_OFFLOAD:-True}
 
 # Single-node 8-GPU topology: one dense and one expert model replica.

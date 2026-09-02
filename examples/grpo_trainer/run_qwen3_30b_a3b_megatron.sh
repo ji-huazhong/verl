@@ -7,6 +7,7 @@
 #   ROLLOUT_QUANTIZATION   fp8 to enable TRT-LLM FP8 rollout         (default: unset)
 #   INT4_QAT               True to enable routed-expert INT4 W4A16 QAT
 #   INT4_QAT_CONFIG        compressed-tensors config used by vLLM
+#   INT4_GROUP_SIZE        routed-expert quantization group size     (default: 128)
 #   CPU_OPTIMIZER_OFFLOAD  keep Adam states on CPU                    (default: False)
 #
 # Ascend NPU users: see examples/ascend_extras/grpo_trainer/run_qwen3_30b_a3b_megatron.sh.
@@ -19,6 +20,7 @@ INFER_BACKEND=${INFER_BACKEND:-vllm}
 ROLLOUT_QUANTIZATION=${ROLLOUT_QUANTIZATION:-}
 INT4_QAT=${INT4_QAT:-False}
 INT4_QAT_CONFIG=${INT4_QAT_CONFIG:-"examples/qat/config/int4_w4a16_qwen3_moe.json"}
+INT4_GROUP_SIZE=${INT4_GROUP_SIZE:-128}
 CPU_OPTIMIZER_OFFLOAD=${CPU_OPTIMIZER_OFFLOAD:-False}
 
 DATA_DIR=${DATA_DIR:-"$PWD"}
@@ -255,7 +257,7 @@ if [ "${INT4_QAT}" = True ]; then
         actor_rollout_ref.actor.megatron.qat.enable=True
         actor_rollout_ref.actor.megatron.qat.format=int4
         actor_rollout_ref.actor.megatron.qat.mode=w4a16
-        actor_rollout_ref.actor.megatron.qat.group_size=32
+        actor_rollout_ref.actor.megatron.qat.group_size=${INT4_GROUP_SIZE}
         actor_rollout_ref.actor.megatron.qat.scope=routed_experts
         actor_rollout_ref.actor.megatron.qat.symmetric=True
         actor_rollout_ref.actor.megatron.qat.scale_dtype=bfloat16
