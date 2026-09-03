@@ -136,6 +136,8 @@ class QATEngineConfig(BaseConfig):
         scope (str): Module scope. Integer INT4 currently requires "routed_experts".
         symmetric (bool): Whether integer quantization is symmetric.
         scale_dtype (str): Stored scale dtype for integer INT4.
+        fake_quant (bool): Insert QDQ+STE in the training forward. Set False for
+            the BF16-train/INT4-rollout PTQ control while retaining real INT4 export.
         ignore_patterns (list[str]): Module name patterns to exclude from quantization
         activation_observer (str): Observer strategy for activation global_scale (W4A4 only)
         quantization_config_path (Optional[str]): Path to quantization config JSON for vLLM
@@ -148,6 +150,7 @@ class QATEngineConfig(BaseConfig):
     scope: str = "all_linear"
     symmetric: bool = True
     scale_dtype: str = "bfloat16"
+    fake_quant: bool = True
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     quantization_config_path: Optional[str] = None

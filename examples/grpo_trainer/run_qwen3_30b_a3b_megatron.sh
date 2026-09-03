@@ -6,6 +6,7 @@
 #   INFER_BACKEND          rollout backend: vllm | sglang | trtllm   (default: vllm)
 #   ROLLOUT_QUANTIZATION   fp8 to enable TRT-LLM FP8 rollout         (default: unset)
 #   INT4_QAT               True to enable routed-expert INT4 W4A16 QAT
+#   INT4_FAKE_QAT          False for BF16-train / real-INT4-rollout PTQ control
 #   INT4_QAT_CONFIG        compressed-tensors config used by vLLM
 #   INT4_GROUP_SIZE        routed-expert quantization group size     (default: 128)
 #   CPU_OPTIMIZER_OFFLOAD  keep Adam states on CPU                    (default: False)
@@ -19,6 +20,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 INFER_BACKEND=${INFER_BACKEND:-vllm}
 ROLLOUT_QUANTIZATION=${ROLLOUT_QUANTIZATION:-}
 INT4_QAT=${INT4_QAT:-False}
+INT4_FAKE_QAT=${INT4_FAKE_QAT:-True}
 INT4_QAT_CONFIG=${INT4_QAT_CONFIG:-"examples/qat/config/int4_w4a16_qwen3_moe.json"}
 INT4_GROUP_SIZE=${INT4_GROUP_SIZE:-128}
 CPU_OPTIMIZER_OFFLOAD=${CPU_OPTIMIZER_OFFLOAD:-False}
@@ -261,6 +263,7 @@ if [ "${INT4_QAT}" = True ]; then
         actor_rollout_ref.actor.megatron.qat.scope=routed_experts
         actor_rollout_ref.actor.megatron.qat.symmetric=True
         actor_rollout_ref.actor.megatron.qat.scale_dtype=bfloat16
+        actor_rollout_ref.actor.megatron.qat.fake_quant=${INT4_FAKE_QAT}
         actor_rollout_ref.actor.megatron.qat.quantization_config_path=${INT4_QAT_CONFIG}
     )
 fi

@@ -594,9 +594,15 @@ class MegatronEngine(BaseEngine):
 
         if self._qat_enabled and not self.engine_config.forward_only:
             if self._qat_format == "int4":
-                from verl.utils.qat.int4 import apply_int4_qat_to_modules
+                if getattr(self._qat_config, "fake_quant", True):
+                    from verl.utils.qat.int4 import apply_int4_qat_to_modules
 
-                self.module = apply_int4_qat_to_modules(self.module, self._qat_config)
+                    self.module = apply_int4_qat_to_modules(self.module, self._qat_config)
+                else:
+                    logger.info(
+                        "Integer INT4 PTQ control: leaving actor routed-expert forwards in BF16; "
+                        "online exporter still emits real W4A16 weights for vLLM rollout"
+                    )
             else:
                 from verl.utils.modelopt import apply_qat_to_modules
 

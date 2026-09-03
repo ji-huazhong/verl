@@ -157,6 +157,8 @@ qat:
   # Integer INT4 options; ignored by NVFP4.
   symmetric: true
   scale_dtype: "bfloat16"
+  # Set false for the BF16-train / real-INT4-rollout PTQ control.
+  fake_quant: true
   # Module name patterns to exclude from quantization (fnmatch style for Megatron)
   ignore_patterns:
     - "lm_head"

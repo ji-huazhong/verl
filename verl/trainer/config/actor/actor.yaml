@@ -343,6 +343,8 @@ qat:
 
   # Integer INT4 options; ignored by NVFP4.
   symmetric: true
+  # Set false for the BF16-train / real-INT4-rollout PTQ control.
+  fake_quant: true
   scale_dtype: "bfloat16"
 
   # Patterns to ignore (e.g., lm_head, embed_tokens)

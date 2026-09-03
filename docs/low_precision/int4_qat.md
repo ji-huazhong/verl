@@ -81,10 +81,59 @@ actor_rollout_ref:
         scope: routed_experts
         symmetric: true
         scale_dtype: bfloat16
+        fake_quant: true
         quantization_config_path: examples/qat/config/int4_w4a16_qwen3_moe.json
 ```
 
 The trainer and JSON configuration are validated together. A mismatch in format, bit width, group size, symmetry, strategy, or activation quantization fails before vLLM launch.
+
+### BF16 / PTQ-INT4 / QAT-INT4 comparison
+
+Use the dedicated PTQ control to train the actor in BF16 while exporting the
+same routed-expert weights to real INT4 W4A16 for rollout:
+
+```bash
+bash examples/grpo_trainer/run_qwen3_30b_a3b_megatron_int4_ptq.sh
+```
+
+It sets `qat.enable=true` and `qat.fake_quant=false`. The first setting is
+intentional: it injects the same compressed-tensors WNA16 configuration and
+online real-INT4 exporter used by QAT. The second prevents the training actor
+from inserting fake QDQ/STE. This is the RL form of the PTQ baseline: the
+latest BF16 actor weights are dynamically quantized after every update, rather
+than using one frozen pre-RL INT4 checkpoint.
+
+For a matched three-way study keep the seed, data order, topology, group size,
+prompt/response lengths, reward, optimizer, and evaluation cadence fixed:
+
+| Run | `qat.enable` | `qat.fake_quant` | rollout expert weights |
+|---|---:|---:|---|
+| BF16 | false | n/a | BF16 |
+| PTQ-INT4 | true | false | real INT4 W4A16 |
+| QAT-INT4 | true | true | real INT4 W4A16 |
+
+All three runs log `critic/rewards/mean`,
+`val-core/math_dapo/acc/mean@1` at the configured validation cadence, and
+`rollout_corr/log_ppl_abs_diff`. The latter is the mean absolute difference
+between actor and rollout *per-sequence mean token log probabilities*, and is
+the common train--rollout log-probability-gap curve for this implementation.
+
+After all three runs have reached the same final step, validate and export the
+matched curves (the tool handles resumed TensorBoard event files by taking the
+latest wall-time value for duplicate steps):
+
+```bash
+python examples/qat/export_int4_qat_three_way_curves.py \
+  --bf16-dir /path/to/bf16/tensorboard \
+  --ptq-int4-dir /path/to/ptq_int4/tensorboard \
+  --qat-int4-dir /path/to/qat_int4/tensorboard \
+  --output-dir /path/to/three_way_report \
+  --total-steps 100
+```
+
+It writes JSON, CSV, and a three-panel PNG. It fails if any run lacks a common
+metric or ends before the requested final step; use `--allow-incomplete` only
+for progress inspection, never for a reported comparison.
 
 ## Recommended experiment
 

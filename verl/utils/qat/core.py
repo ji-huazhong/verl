@@ -38,6 +38,10 @@ class QATConfig(BaseConfig):
     scope: str = "all_linear"
     symmetric: bool = True
     scale_dtype: str = "bfloat16"
+    # False selects the BF16-train/real-INT4-rollout PTQ control.  The field is
+    # also propagated to vLLM through rollout.qat, where it is intentionally a
+    # no-op because vLLM must always consume the real compressed INT4 stream.
+    fake_quant: bool = True
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     quantization_config_path: Optional[str] = None

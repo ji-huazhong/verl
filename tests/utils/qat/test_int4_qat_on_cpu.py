@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from verl.utils.qat.core import QATConfig, load_quantization_config
+from verl.workers.config.engine import QATEngineConfig
 from verl.utils.qat.int4 import (
     Int4WeightExporter,
     apply_int4_qat_to_modules,
@@ -86,6 +87,31 @@ def test_int4_json_contract_rejects_group_size_mismatch(tmp_path):
 
     with pytest.raises(ValueError, match="does not match trainer settings"):
         load_quantization_config(config)
+
+
+def test_int4_ptq_control_keeps_real_export_contract_without_fake_quant(tmp_path):
+    path = _write_int4_config(tmp_path)
+    trainer_config = QATEngineConfig(
+        enable=True,
+        format="int4",
+        mode="w4a16",
+        group_size=32,
+        scope="routed_experts",
+        fake_quant=False,
+    )
+    rollout_config = QATConfig(
+        enable=True,
+        format="int4",
+        mode="w4a16",
+        group_size=32,
+        scope="routed_experts",
+        fake_quant=False,
+        quantization_config_path=str(path),
+    )
+
+    assert trainer_config.fake_quant is False
+    assert rollout_config.fake_quant is False
+    assert load_quantization_config(rollout_config)["quant_method"] == "compressed-tensors"
 
 
 def test_int4_pack_round_trip_uses_uint4b8_bias():
