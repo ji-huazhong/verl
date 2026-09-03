@@ -149,10 +149,15 @@ class TorchMemoryToolConfig(BaseConfig):
     Args:
         trace_alloc_max_entries (int): Maximum number of memory allocation entries to track.
         stack_depth (int): Stack trace depth for memory allocations.
+        dump_on_oom (bool): Dump an allocator snapshot immediately when CUDA reports an OOM.
+        memory_snapshot_num_steps (int): Number of profiled RL steps to retain before
+            dumping a memory snapshot.
     """
 
     trace_alloc_max_entries: int = 100_000
     stack_depth: int = 32
+    dump_on_oom: bool = True
+    memory_snapshot_num_steps: int = 1
     name: str = "torch_memory"
 
     def __post_init__(self) -> None:
@@ -165,6 +170,15 @@ class TorchMemoryToolConfig(BaseConfig):
             f"trace_alloc_max_entries must be positive, got {self.trace_alloc_max_entries}"
         )
         assert self.stack_depth > 0, f"stack_depth must be positive, got {self.stack_depth}"
+        assert isinstance(self.dump_on_oom, bool), f"dump_on_oom must be bool, got {type(self.dump_on_oom)}"
+        assert isinstance(self.memory_snapshot_num_steps, int), (
+            "memory_snapshot_num_steps must be int, "
+            f"got {type(self.memory_snapshot_num_steps)}"
+        )
+        assert self.memory_snapshot_num_steps > 0, (
+            "memory_snapshot_num_steps must be positive, "
+            f"got {self.memory_snapshot_num_steps}"
+        )
 
 
 @dataclass

@@ -296,6 +296,12 @@ profiler:
       # Stack trace depth for memory allocations
       stack_depth: ${oc.select:global_profiler.global_tool_config.torch_memory.stack_depth,32}
 
+      # Dump an allocator snapshot immediately when CUDA reports an out-of-memory error.
+      dump_on_oom: ${oc.select:global_profiler.global_tool_config.torch_memory.dump_on_oom,true}
+
+      # Number of profiled RL steps to retain before dumping a memory snapshot.
+      memory_snapshot_num_steps: ${oc.select:global_profiler.global_tool_config.torch_memory.memory_snapshot_num_steps,1}
+
     # msprobe precision debugger config
     precision_debugger:
 
