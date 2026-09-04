@@ -17,7 +17,7 @@ import importlib.util
 import sys
 from datetime import timedelta
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -82,6 +82,90 @@ def test_effective_config_and_disabled_path():
     model = torch.nn.Linear(2, 2)
     assert runtime_module.install_chunked_ep_overlap(model, _engine(chunked_ep_overlap={"enabled": False})) is model
     runtime_module.validate_chunked_ep_config(_engine(override_transformer_config={"recompute_granularity": "full"}))
+
+
+@pytest.mark.parametrize("vp_size", [2, 4])
+def test_vpp_with_full_recompute(vp_size):
+    engine = _engine(
+        pipeline_model_parallel_size=2,
+        virtual_pipeline_model_parallel_size=vp_size,
+        override_transformer_config={"recompute_granularity": "full"},
+    )
+    effective = SimpleNamespace(
+        pipeline_model_parallel_size=2,
+        virtual_pipeline_model_parallel_size=vp_size,
+        recompute_granularity="full",
+    )
+    runtime_module.validate_chunked_ep_config(engine, transformer_config=effective)
+    # VPP does not change the conflict with Core's separate combined-1F1B path.
+    effective.overlap_moe_expert_parallel_comm = True
+    with pytest.raises(ValueError, match="overlap_moe_expert_parallel_comm"):
+        runtime_module.validate_chunked_ep_config(engine, transformer_config=effective)
+
+
+@pytest.mark.parametrize("container", ["single", "list", "tuple"])
+def test_install_on_virtual_model_chunks(monkeypatch, container):
+    """Check the per-chunk installer contract with Core class stubs, without CUDA kernels."""
+
+    class BaseMoELayer(torch.nn.Module):
+        pass
+
+    class TEGroupedMLP(torch.nn.Linear):
+        activation_recompute = False
+
+    class MoEAlltoAllTokenDispatcher:
+        pass
+
+    config = SimpleNamespace(moe_permute_fusion=False, recompute_granularity="full")
+
+    class MoELayer(BaseMoELayer):
+        def __init__(self):
+            super().__init__()
+            self.config = config
+            self.experts = TEGroupedMLP(2, 2)
+            self.token_dispatcher = MoEAlltoAllTokenDispatcher()
+            self.is_mtp_layer = False
+            self.ep_group = None
+
+        def forward(self, hidden_states, **kwargs):
+            return hidden_states, None
+
+    for name, attributes in {
+        "megatron.core.package_info": {"__version__": "0.18.0"},
+        "megatron.core.transformer.moe.moe_layer": {"BaseMoELayer": BaseMoELayer, "MoELayer": MoELayer},
+        "megatron.core.transformer.moe.experts": {"TEGroupedMLP": TEGroupedMLP},
+        "megatron.core.transformer.moe.token_dispatcher": {"MoEAlltoAllTokenDispatcher": MoEAlltoAllTokenDispatcher},
+    }.items():
+        module = ModuleType(name)
+        module.__dict__.update(attributes)
+        monkeypatch.setitem(sys.modules, name, module)
+    # Stream creation is lazy: installation only checks hardware availability.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "8")
+    engine = _engine(pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=4)
+    model_chunks, snapshots = [], []
+    for vp_stage, has_moe in enumerate([False, True, True, False]):
+        model = torch.nn.Module()
+        model.config, model.vp_stage = config, vp_stage
+        model.layer = MoELayer() if has_moe else torch.nn.Linear(2, 2)
+        model_chunks.append(model)
+        snapshots.append(({name: id(p) for name, p in model.named_parameters()}, set(model.state_dict())))
+    targets = model_chunks if container == "single" else [tuple(model_chunks) if container == "tuple" else model_chunks]
+    for target in targets:
+        assert runtime_module.install_chunked_ep_overlap(target, engine) is target
+        assert runtime_module.install_chunked_ep_overlap(target, engine) is target
+    runtimes = []
+    for model, (names_and_ids, keys) in zip(model_chunks, snapshots, strict=True):
+        assert {name: id(p) for name, p in model.named_parameters()} == names_and_ids
+        assert set(model.state_dict()) == keys
+        if isinstance(model.layer, MoELayer):
+            runtimes.append(model.layer._verl_chunked_ep_runtime)
+    assert len(runtimes) == 2 and runtimes[0] is not runtimes[1]
+    # An unsupported BaseMoELayer subclass must not be mistaken for a dense chunk.
+    custom = BaseMoELayer()
+    custom.config = config
+    with pytest.raises(ValueError, match="standard MoELayer"):
+        runtime_module.install_chunked_ep_overlap(custom, engine)
 
 
 @pytest.mark.parametrize("tokens,chunks,expected", [(7, 3, [3, 2, 2]), (2, 4, [1, 1, 0, 0]), (0, 2, [0, 0])])

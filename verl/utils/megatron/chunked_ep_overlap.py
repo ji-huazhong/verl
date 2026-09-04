@@ -11,7 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MoE-local EP overlap, independent of Megatron's combined-1F1B schedule.
+"""MoE-local EP overlap without Megatron's combined-1F1B schedule.
+
+The outer PP/VPP scheduler still calls ordinary forward and backward. Token
+chunks and their autograd state belong to one MoE invocation, not a virtual
+pipeline stage or a shared microbatch slot.
 
 The router remains outside the custom autograd boundary. Inside it, each chunk
 owns three local graphs and two communication graphs. Backward visits these
@@ -62,8 +66,6 @@ def validate_chunked_ep_config(engine_config, model_config=None, transformer_con
     for name in ("dynamic_context_parallel", "use_megatron_fsdp"):
         if _get(engine_config, name, False):
             raise ValueError(f"chunked_ep_overlap does not support {name}")
-    if _get(engine_config, "virtual_pipeline_model_parallel_size") not in (None, 1):
-        raise ValueError("chunked_ep_overlap does not yet support virtual pipeline parallelism")
     if _get(_get(engine_config, "override_ddp_config"), "overlap_grad_reduce", False):
         raise ValueError("chunked_ep_overlap requires override_ddp_config.overlap_grad_reduce=False")
     if _get(_get(engine_config, "qat"), "enable", False):
@@ -445,14 +447,18 @@ def _forward(self, hidden_states, intermediate_tensors=None, padding_mask=None):
 
 
 def install_chunked_ep_overlap(model, engine_config):
-    """Install on standard MoELayer instances before either bridge wraps DDP."""
+    """Install on each model chunk before either bridge wraps DDP.
+
+    Accept both a single module and a list/tuple of virtual model chunks, as
+    supplied by bridge creation hooks. Dense/embedding-only chunks need no adapter.
+    """
     options = _get(engine_config, "chunked_ep_overlap")
     if not _get(options, "enabled", False):
         return model
 
     from megatron.core.package_info import __version__
     from megatron.core.transformer.moe.experts import TEGroupedMLP
-    from megatron.core.transformer.moe.moe_layer import MoELayer
+    from megatron.core.transformer.moe.moe_layer import BaseMoELayer, MoELayer
     from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
     from packaging.version import Version
 
@@ -462,9 +468,15 @@ def install_chunked_ep_overlap(model, engine_config):
         raise ValueError("chunked_ep_overlap requires CUDA")
     if _get(options, "num_chunks") > 1 and os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") == "1":
         raise ValueError("chunked_ep_overlap requires CUDA_DEVICE_MAX_CONNECTIONS>1 before CUDA initialization")
-    layers = [m for m in model.modules() if isinstance(m, MoELayer)]
-    if not layers:
-        raise ValueError("chunked_ep_overlap found no standard MoELayer on this pipeline stage")
+    models = model if isinstance(model, list | tuple) else [model]
+    layers = []
+    for model_chunk in models:
+        if _get(model_chunk, "config") is not None:
+            validate_chunked_ep_config(engine_config, transformer_config=model_chunk.config)
+        chunk_layers = [m for m in model_chunk.modules() if isinstance(m, BaseMoELayer)]
+        if not chunk_layers:
+            logger.info("No MoE layers in model chunk (vp_stage=%s); no adapter needed", _get(model_chunk, "vp_stage"))
+        layers.extend(chunk_layers)
     for layer in layers:
         validate_chunked_ep_config(engine_config, transformer_config=layer.config)
         if type(layer) is not MoELayer or type(layer.token_dispatcher) is not MoEAlltoAllTokenDispatcher:

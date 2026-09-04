@@ -10,17 +10,20 @@ Nsight overlap, and end-to-end actor throughput still require validation on GPUs
 no throughput or peak-memory improvement is claimed yet.
 
 Local validation on 2026-09-04 (Mac, PyTorch 2.11.0, Transformers 5.3.0,
-TensorDict 0.10.0): **33 passed, 12 CUDA cases skipped** with:
+TensorDict 0.10.0): **38 passed, 18 CUDA cases skipped** with:
 
 ```bash
 python -m pytest -q \
   tests/utils/test_chunked_ep_overlap_on_cpu.py \
   tests/trainer/test_constants_ppo_on_cpu.py \
   tests/workers/config/test_engine_config_on_cpu.py \
-  tests/special_distributed/test_chunked_ep_overlap.py
+  tests/special_distributed/test_chunked_ep_overlap.py \
+  tests/special_distributed/test_chunked_ep_overlap_vpp.py
 ```
 
-The passing cases include engine YAML instantiation and Ray environment setup.
+The passing cases include engine YAML instantiation, Ray environment setup,
+VPP configuration, and the per-model-chunk installer contract using Core class
+stubs. The installer test does not execute CUDA or the real bridge.
 Changed Python files also passed Ruff and syntax checks, and the repository's
 device API check passed. Model installation in either real bridge, distributed
 optimizer updates, and all CUDA timing/stream behavior still need the GPU gate.
@@ -58,6 +61,16 @@ collective independently. The router runs once for the entire input, including
 its auxiliary losses and replay, before tokens are partitioned. Shared experts
 still execute once on the whole input.
 
+VPP can be combined with this option, for example using
+`pipeline_model_parallel_size: 2` and `virtual_pipeline_model_parallel_size: 2`
+under `actor_rollout_ref.actor.megatron`. The ordinary interleaved 1F1B scheduler
+remains in use. Token chunking inside an MoE invocation is separate from virtual
+model chunks; no `combined_1f1b` dependency or VPP-specific restriction is added.
+The installer accepts a single module or a list/tuple of virtual model chunks
+from bridge hooks; chunks containing only dense layers or embeddings are left
+unchanged. Keep the native overlap flag
+disabled when using chunked EP, including with VPP.
+
 The PPO Ray environment uses `CUDA_DEVICE_MAX_CONNECTIONS=8` for this option
 when the launching environment is unset or has the usual Megatron value `1`.
 Other explicit values are preserved. For standalone tests, benchmarks or custom
@@ -77,12 +90,11 @@ The installer rejects an explicit value of `1` when multiple chunks are requeste
   wrapping. Parameters and state-dict names are retained.
 
 Unsupported combinations are rejected: native MoE/shared-expert/wgrad overlap,
-DeepEP/flex, TP/ETP>1, virtual PP, Dynamic CP, MTP, quantization, CUDA graphs,
+DeepEP/flex, TP/ETP>1, Dynamic CP, MTP, quantization, CUDA graphs,
 activation offloading, Megatron-FSDP, capacity dropping/padding, latent/custom
 MoE, nested selective expert recompute, LoRA, and layer-wise Muon.
-CUDA static CP/PP, router replay and complete PPO training remain GPU integration
-validation targets, not measured guarantees. Stages without a standard MoE layer
-are currently rejected when the option is enabled.
+CUDA static CP/PP/VPP, router replay and complete PPO training remain GPU
+integration validation targets, not measured guarantees.
 
 ## Correctness and performance checks
 
@@ -91,6 +103,9 @@ python -m pytest tests/utils/test_chunked_ep_overlap_on_cpu.py -q
 
 CUDA_DEVICE_MAX_CONNECTIONS=8 torchrun --standalone --nproc_per_node=4 \
   -m pytest tests/special_distributed/test_chunked_ep_overlap.py -q
+
+CUDA_DEVICE_MAX_CONNECTIONS=8 torchrun --standalone --nproc_per_node=4 \
+  -m pytest tests/special_distributed/test_chunked_ep_overlap_vpp.py -q
 
 CUDA_DEVICE_MAX_CONNECTIONS=8 torchrun --standalone --nproc_per_node=2 \
   benchmarks/megatron/benchmark_chunked_ep_overlap.py \
@@ -108,6 +123,14 @@ EP=2 and expert DP=2. It checks uniform(1), uniform(2), block(1), both permutati
 implementations, and repeated Adam updates with and without the actual Core
 distributed optimizer. These CUDA cases are provided as a gate and have not yet
 been executed in the local Mac environment.
+
+The VPP gate runs real Core GPT models with PP=2, VPP=2 and EP=2 through
+`forward_backward_pipelining_with_interleaving`. It includes a dense virtual
+stage, eight microbatches, full uniform/block recompute, P2P overlap on/off,
+three distributed Adam updates and forward-only passes. Entering Core's
+combined-1F1B path fails the test. Four GPUs provide expert DP=1; use eight
+GPUs for expert DP=2. These six additional CUDA cases also remain unexecuted
+on the local Mac.
 
 The benchmark reports the maximum rank time and peak allocated/reserved memory
 for a single MoE forward + recompute + backward. It excludes attention,

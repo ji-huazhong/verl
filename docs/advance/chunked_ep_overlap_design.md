@@ -33,6 +33,11 @@ Core 的 `TransformerConfig.__post_init__` 明确禁止同时设置 full recompu
 该 overlap 开关进入 `combined_1f1b`，将不同 microbatch 的前向与反向细分后交错调度；并非仅切换 all-to-all 为异步。
 因此移除断言不能构成实现。
 
+原生 overlap 与 VPP 兼容：Core 0.18 在 PP>1 时反而要求指定 VPP。
+普通 VPP 的 interleaved 1F1B 和原生 overlap 的 combined-1F1B 分支是不同层次；
+关闭原生 overlap 后，VPP 继续走普通 interleaved 调度，full recompute 仍由原 checkpoint 路径执行。
+因此 chunked EP 不应额外禁止 VPP。首版此前添加的 VPP 配置限制已经移除，GPU 组合验证单独记录为待执行。
+
 另一个现有选项 `overlap_dispatch_backward_with_experts_wgrad` 针对 dispatch backward 与 expert wgrad 的重叠，不提供这里需要的 token chunk 前向和重计算调度。
 
 ### 2.2 博客与公开 mlite 源码
@@ -76,6 +81,12 @@ shared expert 先继续完整执行，并在最后与 routed output 相加；首
 
 安装采用实例级行为适配，保留原 MoELayer 及其参数对象、名称、state_dict 和权重导出路径，不全局替换所有 MoELayer.forward。
 actor/ref 可以各自启用。资源采用惰性初始化，以免 pre-wrap 阶段设备尚未就绪。
+
+在 PP/VPP 下，通过 bridge 的创建回调为每个 model chunk 安装适配器；
+安装器兼容单个 module 和一次传入全部虚拟 chunks 的 list/tuple 两种回调形式。
+只包含 dense 层或 embedding 的虚拟 stage 合法，安装器直接返回原模型。
+不同 MoE 层拥有各自 runtime，同一层的不同 microbatch 拥有独立 invocation，
+外层调度器继续接收常规 forward/backward 接口。
 
 ### 3.3 前向调度
 
@@ -197,6 +208,7 @@ tests/utils/test_chunked_ep_overlap_on_cpu.py   # 两进程 Gloo 数值和重算
 tests/workers/config/test_engine_config_on_cpu.py
 tests/trainer/test_constants_ppo_on_cpu.py
 tests/special_distributed/test_chunked_ep_overlap.py
+tests/special_distributed/test_chunked_ep_overlap_vpp.py  # 真实 interleaved 1F1B + PP/VPP/EP
 benchmarks/megatron/benchmark_chunked_ep_overlap.py
 docs/advance/chunked_ep_overlap.md             # 经验证的用法和限制
 ```
