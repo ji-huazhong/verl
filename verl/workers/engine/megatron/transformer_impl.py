@@ -189,6 +189,9 @@ class MegatronEngine(BaseEngine):
         self.optimizer_config = optimizer_config
         self.checkpoint_config = checkpoint_config
         assert self.engine_config.use_mbridge, "use_mbridge must be True"
+        from verl.utils.megatron.chunked_ep_overlap import validate_chunked_ep_config
+
+        validate_chunked_ep_config(self.engine_config, self.model_config)
         _check_dcp_unsupported_features(self.engine_config, self.model_config)
         self._init_device_mesh()
 
@@ -452,6 +455,10 @@ class MegatronEngine(BaseEngine):
         from verl.utils.torch_dtypes import PrecisionType
 
         override_ddp_config = dict(self.engine_config.override_ddp_config or {})
+        if getattr(getattr(self.engine_config, "chunked_ep_overlap", None), "enabled", False):
+            if override_ddp_config.get("overlap_grad_reduce", False):
+                raise ValueError("chunked_ep_overlap requires override_ddp_config.overlap_grad_reduce=False")
+            override_ddp_config["overlap_grad_reduce"] = False
         opt_cfg = self.optimizer_config
         if opt_cfg is not None and "grad_reduce_in_fp32" not in override_ddp_config:
             use_low_precision_main_grads = (
@@ -474,6 +481,13 @@ class MegatronEngine(BaseEngine):
             wrap_with_ddp = True
 
         layer_wise_muon = is_muon_layer_wise_config(self.optimizer_config)
+        callbacks = []
+        if self.engine_config.chunked_ep_overlap.enabled:
+            from verl.utils.megatron.chunked_ep_overlap import install_chunked_ep_overlap
+
+            if layer_wise_muon:
+                raise ValueError("chunked_ep_overlap does not yet support the layer-wise Muon optimizer")
+            callbacks.append(partial(install_chunked_ep_overlap, engine_config=self.engine_config))
         wrap_config = McoreModuleWrapperConfig(
             is_value_model=self.is_value_model,
             wrap_with_ddp=wrap_with_ddp,
@@ -493,6 +507,7 @@ class MegatronEngine(BaseEngine):
             override_ddp_config=override_ddp_config,
             peft_cls=self.peft_cls,
             peft_config=self.model_config.get("lora", None),
+            model_creation_callbacks=callbacks,
         )
         self.tf_config = updated_tf_config
         print(f"module: {len(module)}")

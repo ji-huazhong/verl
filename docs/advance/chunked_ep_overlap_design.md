@@ -1,6 +1,8 @@
 # Full recompute 下的 Chunked EP Overlap：实现方案
 
-状态：调研与设计，尚未实现或完成 GPU 验证。
+状态：首版代码和 CPU/Gloo 数值测试已落地，CUDA/TE 与完整 PPO 验证待执行。
+实际使用范围、验证命令和限制见 [使用说明](chunked_ep_overlap.md)，
+VeOmni 的调研见 [独立报告](veomni_ep_overlap_investigation.md)。
 
 基线：本地 verl `main`，commit `3af734b6145bc84903ed33f228ecab5e6c93cb00`。
 开发分支：`hz/feat/chunked-ep-overlap`。
@@ -187,13 +189,13 @@ forward-only 的 actor/ref 路径也要验证，因为 PPO 既计算 log-prob �
 4. **verl 集成验证与调优**：接入 Qwen3/Qwen3.5，跑 PP/CP/replay、checkpoint reload、权重导出和 PPO actor update；benchmark 确定推荐 chunk 数和回退阈值。
 5. **后续优化**：DeepEP adapter、DDP grad-reduce overlap、TP/ETP 支持，再研究 delayed wgrad 与 recompute/backward fusion。
 
-建议新增文件：
+首版文件划分（通信与调度合并为一个模块）：
 
 ```text
-verl/utils/megatron/chunked_ep_overlap.py       # 配置校验、安装、chunk policy、调度与 autograd
-verl/utils/megatron/chunked_ep_dispatcher.py    # NCCL 异步通信及独立 chunk 状态
-tests/workers/test_chunked_ep_config_on_cpu.py
-tests/models/test_chunked_ep_overlap.py        # CUDA/NCCL 数值与重算测试
+verl/utils/megatron/chunked_ep_overlap.py       # 校验、安装、独立 chunk 状态、NCCL、autograd
+tests/utils/test_chunked_ep_overlap_on_cpu.py   # 两进程 Gloo 数值和重算测试
+tests/workers/config/test_engine_config_on_cpu.py
+tests/trainer/test_constants_ppo_on_cpu.py
 tests/special_distributed/test_chunked_ep_overlap.py
 benchmarks/megatron/benchmark_chunked_ep_overlap.py
 docs/advance/chunked_ep_overlap.md             # 经验证的用法和限制
@@ -213,7 +215,7 @@ docs/advance/chunked_ep_overlap.md             # 经验证的用法和限制
 - 覆盖不均衡路由、空 expert、空 split、尾块、packed 输入、padding、不同 EP rank token 数。
 - EP=2/4，并至少包含 expert-data-parallel size>1 的组合，验证实际梯度归约与 distributed optimizer，而非只验证单个 EP 组。
 - PP=2、静态 CP=2、router replay R2/R3、forward-only；state_dict keys/shape、保存恢复和 HF 权重导出保持一致。
-- CPU 测试仅负责配置、chunk policy 和安装路径；不能替代分布式 autograd/NCCL 测试。
+- CPU/Gloo 测试验证配置、chunk policy 及分布式 autograd 数值；不能替代 CUDA/TE/NCCL 测试。
 
 ### 性能与内存
 

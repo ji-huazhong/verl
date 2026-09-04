@@ -49,3 +49,20 @@ def test_nvtx_injection_override_can_be_opted_out():
         env_vars = get_ppo_ray_runtime_env(_config("torch"))["env_vars"]
 
     assert NVTX_INJECTION_ENV not in env_vars
+
+
+def test_chunked_ep_overrides_single_connection_before_worker_start():
+    config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "actor": {"strategy": "megatron", "megatron": {"chunked_ep_overlap": {"enabled": True}}}
+            }
+        }
+    )
+    with patch.dict(os.environ, {"CUDA_DEVICE_MAX_CONNECTIONS": "1"}, clear=True):
+        assert get_ppo_ray_runtime_env(config)["env_vars"]["CUDA_DEVICE_MAX_CONNECTIONS"] == "8"
+    with patch.dict(os.environ, {"CUDA_DEVICE_MAX_CONNECTIONS": "16"}, clear=True):
+        assert get_ppo_ray_runtime_env(config)["env_vars"]["CUDA_DEVICE_MAX_CONNECTIONS"] == "16"
+    config.actor_rollout_ref.actor.megatron.chunked_ep_overlap.enabled = False
+    with patch.dict(os.environ, {"CUDA_DEVICE_MAX_CONNECTIONS": "1"}, clear=True):
+        assert "CUDA_DEVICE_MAX_CONNECTIONS" not in get_ppo_ray_runtime_env(config)["env_vars"]

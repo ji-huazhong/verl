@@ -70,6 +70,19 @@ def _uses_torch_profiler(config) -> bool:
     return OmegaConf.select(config, "global_profiler.tool", default=None) == "torch"
 
 
+def _uses_chunked_ep_overlap(config) -> bool:
+    """Check all Megatron roles before Ray workers initialize CUDA."""
+    if config is None:
+        return False
+    from omegaconf import OmegaConf
+
+    return any(
+        OmegaConf.select(config, f"{role}.strategy", default=None) == "megatron"
+        and OmegaConf.select(config, f"{role}.megatron.chunked_ep_overlap.enabled", default=False)
+        for role in ("actor_rollout_ref.actor", "actor_rollout_ref.ref", "critic")
+    )
+
+
 # CUPTI only accepts one subscriber per process. Some CUDA images install a startup hook that
 # points this variable at libcupti.so, which makes the first NVTX range in a process load libcupti
 # as the NVTX handler and claim that slot. Kineto then fails to subscribe with
@@ -125,6 +138,16 @@ def get_ppo_ray_runtime_env(config=None):
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
+    if _uses_chunked_ep_overlap(config):
+        # The usual Megatron launch scripts export 1 for TP/CP ordering. Chunk
+        # overlap uses TP=1 and independent compute/communication streams; remove
+        # that serialization before the workers create their CUDA contexts.
+        inherited = os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS")
+        runtime_env["env_vars"]["CUDA_DEVICE_MAX_CONNECTIONS"] = "8" if inherited in (None, "1") else inherited
+        logger.info(
+            "chunked_ep_overlap: worker CUDA_DEVICE_MAX_CONNECTIONS=%s",
+            runtime_env["env_vars"]["CUDA_DEVICE_MAX_CONNECTIONS"],
+        )
     # Set after the loop above on purpose: the point is to override an inherited value, so it must
     # survive the "already set in the launching shell" filter.
     if _uses_torch_profiler(config) and os.environ.get("VERL_KEEP_NVTX_INJECTION", "0") != "1":

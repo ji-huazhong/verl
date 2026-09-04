@@ -69,6 +69,16 @@ seed: 42
 # Allow to override Distributed Data Parallel (DDP) config
 override_ddp_config: {}
 
+# Experimental layer-local EP A2A overlap, compatible with full recompute.
+# Requires CUDA BF16, TP=ETP=1, EP>1, alltoall, and overlap_grad_reduce=False.
+# Keep overlap_moe_expert_parallel_comm and moe_shared_expert_overlap disabled.
+chunked_ep_overlap:
+  _target_: verl.workers.config.ChunkedEPOverlapConfig
+  enabled: false
+  num_chunks: 2
+  # All EP ranks fall back together if any rank has fewer tokens per chunk.
+  min_tokens_per_chunk: 4096
+
 # additional transformer config like: num_layers_in_first(/last)_pipeline_stage
 # oc.select: default val for ref.megatron.override_transformer_config
 override_transformer_config:

@@ -304,6 +304,7 @@ def make_megatron_module(
     override_ddp_config: dict[str, Any] = None,
     peft_cls: Any = None,
     peft_config: Any = None,
+    model_creation_callbacks: list | None = None,
 ):
     from verl.models.mcore.config_converter import get_hf_rope_theta
 
@@ -316,6 +317,9 @@ def make_megatron_module(
 
     if override_model_config is None:
         override_model_config = {}
+
+    if model_creation_callbacks and bridge is None:
+        raise ValueError("model_creation_callbacks require Megatron-Bridge or mbridge")
 
     if bridge is not None:
         if provider is None:
@@ -330,7 +334,7 @@ def make_megatron_module(
             )
             value_model_hook = make_value_model(hidden_size, provider.sequence_parallel)
 
-        post_model_creation_callbacks = []
+        post_model_creation_callbacks = list(model_creation_callbacks or ())
         if wrap_config.is_value_model:
             post_model_creation_callbacks.append(value_model_hook)
         if override_model_config.get("moe_config", {}).get("freeze_moe_router", False):

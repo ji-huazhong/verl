@@ -35,6 +35,7 @@ __all__ = [
     "EngineConfig",
     "EngineRouterReplayConfig",
     "QATEngineConfig",
+    "ChunkedEPOverlapConfig",
 ]
 
 
@@ -146,6 +147,23 @@ class QATEngineConfig(BaseConfig):
 
 
 @dataclass
+class ChunkedEPOverlapConfig(BaseConfig):
+    """MoE-local token chunk overlap, compatible with full activation recompute."""
+
+    enabled: bool = False
+    num_chunks: int = 2
+    min_tokens_per_chunk: int = 4096
+
+    def __post_init__(self):
+        if type(self.enabled) is not bool:
+            raise ValueError("chunked_ep_overlap.enabled must be a bool")
+        for name, minimum in (("num_chunks", 1), ("min_tokens_per_chunk", 0)):
+            value = getattr(self, name)
+            if type(value) is not int or value < minimum:
+                raise ValueError(f"chunked_ep_overlap.{name} must be an integer >= {minimum}")
+
+
+@dataclass
 class McoreEngineConfig(EngineConfig):
     """Configuration for Megatron parallelism.
 
@@ -179,6 +197,7 @@ class McoreEngineConfig(EngineConfig):
         pad_to_length (bool): Whether to round every packed micro-batch up to a bucket-aligned length.
         pad_to_length_bucket (int): Padding granularity on the global packed sequence.
         dtype (str): Mixed precision training param dtype, default "bfloat16"
+        chunked_ep_overlap (ChunkedEPOverlapConfig): Layer-local EP A2A overlap, default disabled.
     """
 
     # sequence_parallel is not listed as a frozen field for auto-correction purpose
@@ -212,6 +231,7 @@ class McoreEngineConfig(EngineConfig):
     use_megatron_fsdp: bool = False
     strategy: str = "megatron"
     qat: QATEngineConfig = field(default_factory=QATEngineConfig)
+    chunked_ep_overlap: ChunkedEPOverlapConfig = field(default_factory=ChunkedEPOverlapConfig)
 
     def __post_init__(self) -> None:
         super().__post_init__()

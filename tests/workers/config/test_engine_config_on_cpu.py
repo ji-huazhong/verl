@@ -12,12 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pytest
+from pathlib import Path
 
-from verl.workers.config.engine import FSDPEngineConfig, McoreEngineConfig
+import pytest
+from omegaconf import OmegaConf
+
+from verl.utils.config import omega_conf_to_dataclass
+from verl.workers.config.engine import ChunkedEPOverlapConfig, FSDPEngineConfig, McoreEngineConfig
 
 
 class TestMcoreEngineConfig:
+    def test_chunked_ep_yaml_instantiation(self):
+        path = Path(__file__).resolve().parents[3] / "verl/trainer/config/engine/megatron.yaml"
+        config = OmegaConf.load(path)
+        config.chunked_ep_overlap.enabled = True
+        config.chunked_ep_overlap.num_chunks = 4
+        config.expert_model_parallel_size = 2
+        engine = omega_conf_to_dataclass(config)
+        assert isinstance(engine.chunked_ep_overlap, ChunkedEPOverlapConfig)
+        assert engine.chunked_ep_overlap.enabled is True
+        assert engine.chunked_ep_overlap.num_chunks == 4
+        options = omega_conf_to_dataclass(config.chunked_ep_overlap, ChunkedEPOverlapConfig)
+        assert options.num_chunks == engine.chunked_ep_overlap.num_chunks
+        assert McoreEngineConfig().chunked_ep_overlap.enabled is False
+
     def test_default_values(self):
         config = McoreEngineConfig()
         assert config.tensor_model_parallel_size == 1

@@ -66,6 +66,11 @@ actor_rollout_ref:
       entropy_from_logits_chunk_size: ${oc.select:actor_rollout_ref.actor.entropy_from_logits_chunk_size,2048}
       seed: 42
       override_ddp_config: {}
+      chunked_ep_overlap:
+        _target_: verl.workers.config.ChunkedEPOverlapConfig
+        enabled: false
+        num_chunks: 2
+        min_tokens_per_chunk: 4096
       override_transformer_config:
         recompute_granularity: null
         recompute_modules:
@@ -274,6 +279,11 @@ actor_rollout_ref:
       entropy_from_logits_chunk_size: ${oc.select:actor_rollout_ref.actor.entropy_from_logits_chunk_size,2048}
       seed: ${oc.select:actor_rollout_ref.actor.megatron.seed,42}
       override_ddp_config: {}
+      chunked_ep_overlap:
+        _target_: verl.workers.config.ChunkedEPOverlapConfig
+        enabled: false
+        num_chunks: 2
+        min_tokens_per_chunk: 4096
       override_transformer_config: ${oc.select:actor_rollout_ref.actor.megatron.override_transformer_config,{}}
       override_mcore_model_config: {}
       use_mbridge: ${oc.select:actor_rollout_ref.actor.megatron.use_mbridge,False}
@@ -607,6 +617,11 @@ critic:
     entropy_from_logits_chunk_size: 2048
     seed: 42
     override_ddp_config: {}
+    chunked_ep_overlap:
+      _target_: verl.workers.config.ChunkedEPOverlapConfig
+      enabled: false
+      num_chunks: 2
+      min_tokens_per_chunk: 4096
     override_transformer_config:
       recompute_granularity: null
       recompute_modules:
