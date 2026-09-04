@@ -261,6 +261,15 @@ def _build_mtp_loss_mask_nested(response_mask, input_ids_lengths, response_atten
     return torch.nested.nested_tensor(pieces, layout=torch.jagged)
 
 
+def prepare_mtp_labels_and_mask(input_ids, labels, loss_mask, response_attention_mask=None):
+    """Align MTP targets to full input sequences before packing in either forward path."""
+    input_ids_lengths = input_ids.offsets().diff().tolist()
+    return {
+        "label": _convert_to_nested_tensor(labels, input_ids_lengths),
+        "loss_mask": _build_mtp_loss_mask_nested(loss_mask, input_ids_lengths, response_attention_mask),
+    }
+
+
 def gptmodel_forward_model_engine(
     model,
     input_ids,
@@ -314,17 +323,13 @@ def gptmodel_forward_model_engine(
 
         args = {}
         if mtp_enable_train and post_process:
-            # Use input_ids sequence length to ensure label and loss_mask alignment
-            input_ids_offsets = input_ids.offsets()
-            input_ids_lengths = input_ids_offsets.diff().tolist()
-            response_attention_mask = logits_processor_args.get("response_attention_mask", None)
-
-            for k in ["label", "loss_mask"]:
-                v = logits_processor_args[k]
-                if k == "loss_mask":
-                    v = _build_mtp_loss_mask_nested(v, input_ids_lengths, response_attention_mask)
-                else:
-                    v = _convert_to_nested_tensor(v, input_ids_lengths)
+            mtp_inputs = prepare_mtp_labels_and_mask(
+                input_ids,
+                logits_processor_args["label"],
+                logits_processor_args["loss_mask"],
+                logits_processor_args.get("response_attention_mask"),
+            )
+            for k, v in mtp_inputs.items():
                 logits_processor_args[k] = v
                 args[k] = preprocess_thd_engine(
                     v,

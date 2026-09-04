@@ -123,6 +123,8 @@ def test_engine_hook_context_and_current_thd_arguments(monkeypatch):
     assert "temperature" not in hook_kwargs
     assert hook_kwargs["output_processor"] is mff.fused_output_processor
     assert hook_kwargs["output_processor_context"].temperature == pytest.approx(0.7)
+    assert hook_kwargs["labels"] is None
+    assert hook_kwargs["output_processor_context"].labels is labels
     assert preprocess_calls == [
         {
             "pre_process": True,
@@ -149,6 +151,7 @@ def test_engine_hook_context_and_current_thd_arguments(monkeypatch):
     assert legacy_kwargs["temperature"] == pytest.approx(0.5)
     assert "output_processor" not in legacy_kwargs
     assert "output_processor_context" not in legacy_kwargs
+    assert legacy_kwargs["labels"] is labels
 
 
 class _OutputLayer(torch.nn.Module):

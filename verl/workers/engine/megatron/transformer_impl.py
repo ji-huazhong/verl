@@ -524,15 +524,25 @@ class MegatronEngine(BaseEngine):
         if not self.engine_config.use_fused_kernels:
             return
 
-        if not self.engine_config.use_remove_padding or self.is_value_model or self.model_config.mtp.enable:
+        if not self.engine_config.use_remove_padding or self.is_value_model:
             logger.warning_once(
-                "Fused kernels require remove-padding and are not supported for value models or when MTP is enabled "
-                "in Megatron engine; disabling."
+                "Fused kernels require remove-padding and are not supported for value models in Megatron engine; "
+                "disabling."
             )
             self.engine_config.use_fused_kernels = False
             return
 
-        from verl.models.mcore.model_forward_fused import patch_fused_forward
+        from verl.models.mcore.model_forward_fused import mtp_fused_forward_unavailable_reason, patch_fused_forward
+
+        # Check every pipeline chunk before installing any patches. The legacy
+        # forward replacement bypasses MTP and cannot be composed safely.
+        if self.model_config.mtp.enable:
+            for model in self.module:
+                reason = mtp_fused_forward_unavailable_reason(model)
+                if reason is not None:
+                    logger.warning_once(f"{reason}; disabling fused kernels.")
+                    self.engine_config.use_fused_kernels = False
+                    return
 
         for model in self.module:
             patch_fused_forward(model)
@@ -1266,6 +1276,8 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 "calculate_sum_pi_squared=True is not supported with use_fused_kernels=True: "
                 "fused kernels do not materialize the full logits tensor needed for Σπ²."
             )
+        if use_fused_kernels and (distillation_use_topk or distillation_only):
+            raise NotImplementedError("Top-K distillation requires use_fused_kernels=False")
         pad_mode = tu.get_non_tensor_data(batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
         temperature = batch["temperature"]
         model_inputs = self.prepare_model_inputs(batch)
@@ -1317,10 +1329,19 @@ class MegatronEngineWithLMHead(MegatronEngine):
         else:
             raise NotImplementedError(f"Pad mode {pad_mode} is not supported for megatron engine")
 
-        if use_fused_kernels:
-            temperature_value = _resolve_fused_temperature(temperature)
+        response_attention_mask = None
+        if attention_mask is not None and not loss_mask.is_nested:
+            response_attention_mask = attention_mask[:, -loss_mask.shape[-1] :]
+        mtp_enable_train = self.model_config.mtp.enable and self.model_config.mtp.enable_train
+        mtp_loss_normalization_factor = None
+        if mtp_enable_train and self.tf_config.calculate_per_token_loss:
+            batch_num_tokens = tu.get_non_tensor_data(batch, key="batch_num_tokens", default=0)
+            routed_num_tokens = tu.get_non_tensor_data(batch, key="routed_num_tokens", default=0)
+            if batch_num_tokens > 0:
+                mtp_loss_normalization_factor = routed_num_tokens / batch_num_tokens
 
         if use_fused_kernels:
+            temperature_value = _resolve_fused_temperature(temperature)
             from verl.models.mcore import get_mcore_forward_fused_model_engine_fn
 
             fused_forward_fn = get_mcore_forward_fused_model_engine_fn(self.model_config.hf_config)
@@ -1336,6 +1357,10 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 local_cp_size=local_cp_size,
                 router_padding_mask=router_padding_mask,
                 pad_to_length_bucket=pad_to_length_bucket,
+                mtp_enable_train=mtp_enable_train,
+                loss_mask=loss_mask,
+                response_attention_mask=response_attention_mask,
+                mtp_loss_normalization_factor=mtp_loss_normalization_factor,
             )
         else:
             if not isinstance(temperature, torch.Tensor):
@@ -1360,26 +1385,12 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 data_format=data_format,
             )
 
-            response_attention_mask = None
-            if attention_mask is not None and not loss_mask.is_nested:
-                response_attention_mask = attention_mask[:, -loss_mask.shape[-1] :]
             logits_processor_args = {
                 "label": label,
                 "temperature": temperature,
                 "loss_mask": loss_mask,
                 "response_attention_mask": response_attention_mask,
             }
-
-            mtp_loss_normalization_factor = None
-            if (
-                self.model_config.mtp.enable
-                and self.model_config.mtp.enable_train
-                and self.tf_config.calculate_per_token_loss
-            ):
-                batch_num_tokens = tu.get_non_tensor_data(batch, key="batch_num_tokens", default=0)
-                routed_num_tokens = tu.get_non_tensor_data(batch, key="routed_num_tokens", default=0)
-                if batch_num_tokens > 0:
-                    mtp_loss_normalization_factor = routed_num_tokens / batch_num_tokens
 
             output = forward_fn(
                 model,
@@ -1390,7 +1401,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 vision_model=hasattr(self.model_config.hf_config, "vision_config"),
                 pad_token_id=self.model_config.tokenizer.pad_token_id,
                 data_format=data_format,
-                mtp_enable_train=self.model_config.mtp.enable and self.model_config.mtp.enable_train,
+                mtp_enable_train=mtp_enable_train,
                 local_cp_size=local_cp_size,
                 router_padding_mask=router_padding_mask,
                 mtp_loss_normalization_factor=mtp_loss_normalization_factor,

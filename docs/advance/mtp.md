@@ -2,7 +2,7 @@
 
 **Author**: `https://github.com/meituan-search`
 
-Last updated: 08/11/2026
+Last updated: 09/04/2026
 
 ## 1. Scope of Support
 
@@ -32,6 +32,61 @@ The MTP training process can be flexibly controlled through the following config
 | Full-Parameter MTP Training | `enable=True`<br>`enable_train=True`<br>`mtp_loss_scaling_factor=0.1`                                                                                                                                                                                                                              | MTP Loss will apply to all model parameters                            |
 | MTP Parameter-Only Training | `enable=True`<br>`enable_train=True`<br>`detach_encoder=True`                                                                                                                                                                                                                                      | Freeze the Encoder layer, update only MTP module parameters, MTP Loss applies only to MTP parameters |
 | MTP Accelerated Rollout | 1. vLLM configuration:<br>`enable=True`<br>`enable_rollout=True`<br>`method="mtp"`<br>`num_speculative_tokens=1`<br>2. SGLang configuration:<br>`enable=True`<br>`enable_rollout=True`<br>`speculative_algorithm="EAGLE"`<br>`speculative_num_steps=2`<br>`speculative_eagle_topk=2`<br>`speculative_num_draft_tokens=4` | Achieve inference acceleration during the Rollout phase based on MTP                      |
+
+### Memory-efficient main output head (Megatron Engine)
+
+`actor_rollout_ref.model.use_fused_kernels=True` can be used together with MTP
+in the Megatron Engine. This fuses **only the main output head** with linear
+cross entropy. MTP auxiliary heads still use the existing MCore/legacy logits
+and CE path, including their original weight-gradient, masking, logging and
+loss-normalization behavior. No new kernel or checkpoint format is introduced.
+For MCore DDP, the output weight uses `zero_out_wgrad=True` so that normal
+autograd gradients from the fused main head are added alongside auxiliary
+gradients accumulated directly into `main_grad`; otherwise the main gradient
+can be skipped by DDP's `grad_added_to_main_grad` check.
+
+```yaml
+actor_rollout_ref:
+  model:
+    use_remove_padding: true
+    use_fused_kernels: true
+    mtp:
+      enable: true
+      enable_train: true  # false: load MTP without computing auxiliary loss
+```
+
+The integration requires a text GPTModel with the native `output_processor`
+and `output_processor_context` forward contract (MCore 0.18 or a compatible
+build), remove-padding/THD, and sequence parallelism when TP > 1. Value models,
+vision wrappers, legacy forward replacements, output-layer bias, FP8 output
+projection, deferred output-layer weight gradients and MuP logit scaling remain
+unsupported and disable fused execution with a warning. The
+existing CUDA/Triton kernel requirements still apply. Nonuniform temperatures,
+top-K distillation and `calculate_sum_pi_squared` are not supported with fused
+execution; disable `use_fused_kernels` for these workloads.
+
+Main-head labels are passed separately from the model's MTP labels, so
+`enable_train=False` does not accidentally activate auxiliary loss. Training
+passes the same response mask alignment, packed positions and Dynamic CP loss
+normalization metadata as the non-fused path.
+
+Before enabling this in production, compare fixed-batch runs with fused
+execution off/on on the target GPUs: main log probabilities/entropy, each MTP
+loss, parameter gradients, peak allocated memory and step time. This first
+stage does **not** eliminate auxiliary-head logits, and memory savings do not
+imply a throughput improvement. Further auxiliary Linear CE optimization should
+be driven by these measurements, not enabled by forcing detached output weights.
+
+Regression commands (run in an environment with the corresponding dependencies):
+
+```bash
+# CPU contracts with explicitly stubbed collectives/kernel; needs PyTorch + pytest.
+pytest -q tests/models/test_mtp_fused_main_ce_on_cpu.py
+
+# Additional tests in a provisioned verl + Megatron environment.
+pytest -q tests/models/test_model_forward_fused.py tests/utils/test_megatron_mtp_dcp.py \
+  tests/workers/test_megatron_mtp_fused_gate.py
+```
 
 ## 3. Experimental Results
 
@@ -109,4 +164,3 @@ The experiment was conducted using following data:
 The result: [wandb link](https://wandb.ai/hou-zg-meituan/mimo-7b-sft-mtp?nw=nwuserhouzg)
 
 The presence of mtp layer has limited effect on main loss. However, when MTP layer is detached, the mtp_loss converges to a higher value.
-

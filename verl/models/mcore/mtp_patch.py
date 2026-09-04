@@ -125,6 +125,9 @@ def _megatron_gptmodel_postprocess(
     the output layer, and computes language model loss when labels are provided.
     """
 
+    # The legacy auxiliary loop rolls its local mask; the main hook must still
+    # receive the original main-loss mask, as in the native MCore contract.
+    main_loss_mask = loss_mask
     # logits and loss
     output_weight = None
     if self.share_embeddings_and_output_weights:
@@ -252,6 +255,28 @@ def _megatron_gptmodel_postprocess(
                 else:
                     safe_num_tokens = num_tokens.clamp(min=1)
                     hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens)
+
+    # Preserve the complete MCore/legacy auxiliary-loss path above. Only the
+    # main output head is replaced; its hidden states carry MTPLossAutoScaler.
+    if output_processor is not None:
+        return output_processor(
+            hidden_states=hidden_states,
+            output_layer=self.output_layer,
+            output_weight=output_weight,
+            labels=labels,
+            loss_mask=main_loss_mask,
+            context=output_processor_context,
+            config=self.config,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            decoder_input=decoder_input,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            runtime_gather_output=runtime_gather_output,
+            compute_language_model_loss=self.compute_language_model_loss,
+            scale_logits=getattr(self, "_scale_logits", None),
+        )
 
     logits, _ = self.output_layer(hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output)
     # [s b h] => [b s h]

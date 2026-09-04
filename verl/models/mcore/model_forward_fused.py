@@ -31,6 +31,7 @@ from megatron.core.utils import deprecate_inference_params
 from packaging import version
 from torch import Tensor
 
+from verl.models.mcore.model_forward import prepare_mtp_labels_and_mask
 from verl.models.mcore.util import preprocess_packed_seqs, preprocess_thd_engine
 from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy
 from verl.utils.megatron_utils import unwrap_model
@@ -78,6 +79,9 @@ class FusedOutputProcessorContext:
     """Context passed through Megatron's native output-processor hook."""
 
     temperature: float
+    # GPTModel labels control MTP auxiliary training. Keep main-head targets
+    # separately so loading MTP for rollout alone does not enable its loss.
+    labels: Tensor | None = None
 
 
 def fused_output_processor(
@@ -106,6 +110,17 @@ def fused_output_processor(
     # untied models the weight lives on output_layer.
     weight = output_weight if output_weight is not None else output_layer.weight
 
+    if getattr(config, "mtp_num_layers", 0) and hasattr(weight, "grad_added_to_main_grad"):
+        # MCore auxiliary heads can accumulate wgrad directly into main_grad.
+        # Our main head returns a normal autograd gradient. Tell MCore to use
+        # zero dummy wgrads and let DDP add the ordinary gradient as well, even
+        # after an auxiliary head sets grad_added_to_main_grad=True. This is
+        # also the contract used for mixed gradients on tied embedding weights.
+        weight.zero_out_wgrad = True
+
+    labels = context.labels if context.labels is not None else labels
+    if labels is None:
+        raise ValueError("Fused output processing requires main-head labels")
     temperature = context.temperature
     logprobs, entropy = linear_cross_entropy(
         hidden_states,
@@ -165,6 +180,27 @@ def patch_fused_forward(model: torch.nn.Module):
     if not hasattr(model, "forward_backup"):
         model.forward_backup = model.forward
         model.forward = _fused_GPTModel_forward.__get__(model, model.__class__)
+
+
+def mtp_fused_forward_unavailable_reason(model: torch.nn.Module) -> str | None:
+    """Fail closed for MTP combinations not covered by the native-hook integration."""
+    model = unwrap_model(model)
+    if not isinstance(model, GPTModel):
+        return "MTP fused main-head CE currently supports text GPTModel only"
+    if not _supports_output_processor_hook(model):
+        return "MTP fused main-head CE requires Megatron's native output-processor hook"
+    config = model.config
+    if getattr(config, "use_mup", False):
+        return "MTP fused main-head CE does not support MuP logit scaling"
+    if getattr(config, "fp8_output", False):
+        return "MTP fused main-head CE does not support a quantized FP8 output layer"
+    if getattr(config, "defer_embedding_wgrad_compute", False):
+        return "MTP fused main-head CE does not support deferred output-layer weight gradients"
+    if getattr(config, "tensor_model_parallel_size", 1) > 1 and not config.sequence_parallel:
+        return "MTP fused main-head CE requires sequence parallelism when TP > 1"
+    if model.post_process and getattr(model.output_layer, "bias", None) is not None:
+        return "MTP fused main-head CE does not support output-layer bias"
+    return None
 
 
 def unpatch_fused_forward(model: torch.nn.Module):
@@ -269,9 +305,16 @@ def fused_forward_model_engine(vision_model: bool = False):
         local_cp_size: int | None = None,
         router_padding_mask: Tensor | None = None,
         pad_to_length_bucket: int | None = None,
+        mtp_enable_train: bool = False,
+        loss_mask: Tensor | None = None,
+        response_attention_mask: Tensor | None = None,
+        mtp_loss_normalization_factor: float | None = None,
     ):
         pre_process = unwrap_model(model).pre_process
         post_process = unwrap_model(model).post_process
+        use_hook = _use_output_processor_hook(model)
+        if mtp_enable_train and not use_hook:
+            raise ValueError("MTP training with fused main-head CE requires the native output-processor hook")
 
         fp8 = unwrap_model(model).config.fp8
         use_fp8_padding = fp8 in ["e4m3", "hybrid"]
@@ -280,9 +323,9 @@ def fused_forward_model_engine(vision_model: bool = False):
             config.csa_window_size if getattr(config, "experimental_attention_variant", None) == "dsv4_hybrid" else None
         )
 
-        input_ids_rmpad, packed_seq_params, _ = preprocess_thd_engine(
+        input_ids_rmpad, packed_seq_params, position_ids_rmpad = preprocess_thd_engine(
             input_ids,
-            pre_process=pre_process,
+            pre_process=pre_process or (post_process and mtp_enable_train),
             use_fp8_padding=use_fp8_padding,
             min_local_rows=min_local_rows,
             pad_to_length_bucket=pad_to_length_bucket,
@@ -290,8 +333,25 @@ def fused_forward_model_engine(vision_model: bool = False):
             local_cp_size=local_cp_size,
         )
         input_ids_rmpad = input_ids_rmpad.contiguous()
+        if mtp_loss_normalization_factor is not None:
+            packed_seq_params._verl_mtp_loss_normalization_factor = mtp_loss_normalization_factor
 
         model_kwargs = {}
+        if mtp_enable_train and post_process:
+            if loss_mask is None:
+                raise ValueError("MTP training requires a loss_mask")
+            mtp_inputs = prepare_mtp_labels_and_mask(input_ids, labels, loss_mask, response_attention_mask)
+            labels = mtp_inputs["label"]
+            model_kwargs["loss_mask"] = preprocess_thd_engine(
+                mtp_inputs["loss_mask"],
+                pre_process=True,
+                need_roll=True,
+                use_fp8_padding=use_fp8_padding,
+                min_local_rows=min_local_rows,
+                pad_to_length_bucket=pad_to_length_bucket,
+                cp_layout=cp_layout,
+                local_cp_size=local_cp_size,
+            )[0].contiguous()
         if router_padding_mask is not None:
             model_kwargs["padding_mask"] = router_padding_mask
         if "pixel_values" in multi_modal_inputs:
@@ -326,16 +386,16 @@ def fused_forward_model_engine(vision_model: bool = False):
         forward_kwargs = dict(
             input_ids=input_ids_rmpad,
             attention_mask=attention_mask,
-            position_ids=None,
+            position_ids=position_ids_rmpad if mtp_enable_train else None,
             packed_seq_params=packed_seq_params,
-            labels=labels_rmpad,
+            labels=labels_rmpad if not use_hook or (mtp_enable_train and post_process) else None,
             **model_kwargs,
         )
-        if _use_output_processor_hook(model):
+        if use_hook:
             output_orig: CausalLMOutputForPPO = model(
                 **forward_kwargs,
                 output_processor=fused_output_processor,
-                output_processor_context=FusedOutputProcessorContext(temperature=temperature),
+                output_processor_context=FusedOutputProcessorContext(temperature=temperature, labels=labels_rmpad),
             )
         else:
             output_orig: CausalLMOutputForPPO = model(temperature=temperature, **forward_kwargs)
