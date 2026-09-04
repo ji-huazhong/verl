@@ -98,6 +98,8 @@ bash examples/grpo_trainer/run_qwen3_8b_fsdp.sh
 | Mistral-Nemo-12B (RM demo) | ✓ |          |          | FSDP            | nvidia    |
 
 LoRA variants live in `examples/tuning/lora/`, profiling variants in `examples/profile/`.
+
+To exercise automatic CUDA OOM snapshots and multi-step memory history on one node with 8 GPUs (e.g. H20 141 GB), see the [intentional GRPO OOM test](../profile/README.md#reproduce-automatic-oom-snapshots-on-8-x-h20-141-gb).
 Scale / hardware-specific demos (e.g. `run_qwen3_8b_fsdp_gb200.sh`, FP8 variants, VeOmni) keep a trailing suffix to stay discoverable.
 
 ## Reference
