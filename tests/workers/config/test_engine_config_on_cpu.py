@@ -14,7 +14,51 @@
 
 import pytest
 
-from verl.workers.config.engine import FSDPEngineConfig, McoreEngineConfig
+from verl.workers.config.engine import FSDPEngineConfig, McoreEngineConfig, QATEngineConfig
+
+
+class TestQATEngineConfig:
+    def test_nvfp4_defaults_remain_backward_compatible(self):
+        config = QATEngineConfig()
+
+        assert config.format == "nvfp4"
+        assert config.mode == "w4a16"
+        assert config.group_size == 16
+        assert config.scope == "all_linear"
+
+    def test_integer_int4_routed_expert_contract(self):
+        config = QATEngineConfig(
+            enable=True,
+            format="INT4",
+            mode="W4A16",
+            group_size=128,
+            scope="routed_experts",
+        )
+
+        assert config.format == "int4"
+        assert config.mode == "w4a16"
+
+    @pytest.mark.parametrize(
+        ("override", "message"),
+        [
+            ({"mode": "w4a4"}, "mode='w4a16'"),
+            ({"scope": "all_linear"}, "scope='routed_experts'"),
+            ({"symmetric": False}, "symmetric"),
+            ({"group_size": 16}, "one of 32, 64, or 128"),
+        ],
+    )
+    def test_integer_int4_rejects_unsupported_contracts(self, override, message):
+        kwargs = {
+            "enable": True,
+            "format": "int4",
+            "mode": "w4a16",
+            "group_size": 128,
+            "scope": "routed_experts",
+        }
+        kwargs.update(override)
+
+        with pytest.raises(ValueError, match=message):
+            QATEngineConfig(**kwargs)
 
 
 class TestMcoreEngineConfig:

@@ -20,6 +20,7 @@ Not recommended depending on vllm for this file.
 import gc
 import logging
 import os
+import time
 from multiprocessing import shared_memory
 from typing import Callable, TypedDict
 
@@ -109,6 +110,17 @@ class BucketedWeightSender:
         """
         from verl.workers.rollout.utils import ensure_async_iterator
 
+        profile_enabled = os.environ.get("VERL_INT4_QAT_RELOAD_PROFILE", "0") == "1"
+        profile_started_at = time.perf_counter() if profile_enabled else 0.0
+        iterator_seconds = 0.0
+        copy_enqueue_seconds = 0.0
+        synchronize_seconds = 0.0
+        receiver_ack_seconds = 0.0
+        cleanup_seconds = 0.0
+        tensor_count = 0
+        tensor_bytes = 0
+        bucket_count = 0
+
         try:
             self._init_socket()
             self._init_buffer()
@@ -117,7 +129,18 @@ class BucketedWeightSender:
             offset = 0
             bucket_meta: dict[str, TensorMetadata] = {}
             # dtype = PrecisionType.to_dtype(self.config.dtype)
-            async for name, weight in ensure_async_iterator(weights):
+            weight_iterator = ensure_async_iterator(weights).__aiter__()
+            while True:
+                iterator_started_at = time.perf_counter() if profile_enabled else 0.0
+                try:
+                    name, weight = await weight_iterator.__anext__()
+                except StopAsyncIteration:
+                    break
+                if profile_enabled:
+                    iterator_seconds += time.perf_counter() - iterator_started_at
+                    tensor_count += 1
+                    tensor_bytes += weight.nbytes
+
                 # model parameters are in fp32 full precision
                 # (vermouth1992) we should not force cast weight here because some parameters
                 # (such as moe gate) have to keep fp32 precision. If a weight is bf16 in the rollout side,
@@ -127,9 +150,16 @@ class BucketedWeightSender:
 
                 # fill the tensor bucket
                 if offset + weight.nbytes > self.bucket_size and len(bucket_meta) > 0:
+                    sync_started_at = time.perf_counter() if profile_enabled else 0.0
                     get_torch_device().synchronize()
+                    if profile_enabled:
+                        synchronize_seconds += time.perf_counter() - sync_started_at
+                    ack_started_at = time.perf_counter() if profile_enabled else 0.0
                     self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": False})
                     self.socket.recv()
+                    if profile_enabled:
+                        receiver_ack_seconds += time.perf_counter() - ack_started_at
+                        bucket_count += 1
                     bucket_meta = {}
                     offset = 0
 
@@ -138,7 +168,11 @@ class BucketedWeightSender:
                         f"Weight {name}({weight.shape}, {weight.dtype}) is too large to fit in the bucket."
                         f"Please increase rollout.update_weights_bucket_megabytes({self.bucket_size_mb} MB)."
                     )
+                    direct_started_at = time.perf_counter() if profile_enabled else 0.0
                     self._direct_send_large_weight(name, weight)
+                    if profile_enabled:
+                        receiver_ack_seconds += time.perf_counter() - direct_started_at
+                        bucket_count += 1
                     continue
 
                 bucket_meta[name] = {
@@ -148,17 +182,43 @@ class BucketedWeightSender:
                     "offset": offset,
                     "handle": None,
                 }
+                copy_started_at = time.perf_counter() if profile_enabled else 0.0
                 self.buffer[offset : offset + weight.nbytes].view(dtype=weight.dtype).view(weight.shape).copy_(
                     weight, non_blocking=True
                 )
+                if profile_enabled:
+                    copy_enqueue_seconds += time.perf_counter() - copy_started_at
                 offset += weight.nbytes
 
             # send the last bucket
+            sync_started_at = time.perf_counter() if profile_enabled else 0.0
             get_torch_device().synchronize()
+            if profile_enabled:
+                synchronize_seconds += time.perf_counter() - sync_started_at
+            ack_started_at = time.perf_counter() if profile_enabled else 0.0
             self.socket.send_pyobj({"bucket_meta": bucket_meta, "is_last": True})
             self.socket.recv()
+            if profile_enabled:
+                receiver_ack_seconds += time.perf_counter() - ack_started_at
+                bucket_count += 1
         finally:
+            cleanup_started_at = time.perf_counter() if profile_enabled else 0.0
             self._cleanup()
+            if profile_enabled:
+                cleanup_seconds = time.perf_counter() - cleanup_started_at
+                logger.warning(
+                    "INT4 reload sender profile: total=%.3fs iterator-next=%.3fs copy-enqueue=%.3fs "
+                    "gpu-sync=%.3fs receiver-ack=%.3fs cleanup=%.3fs tensors=%d bytes=%.2fGiB buckets=%d",
+                    time.perf_counter() - profile_started_at,
+                    iterator_seconds,
+                    copy_enqueue_seconds,
+                    synchronize_seconds,
+                    receiver_ack_seconds,
+                    cleanup_seconds,
+                    tensor_count,
+                    tensor_bytes / (1 << 30),
+                    bucket_count,
+                )
 
     def _init_socket(self):
         """Initialize ZMQ REQ socket and bind."""

@@ -16,6 +16,7 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import os
 import uuid
 from pprint import pprint
@@ -673,6 +674,15 @@ class vLLMHttpServer:
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+            if os.environ.get("VERL_INT4_QAT_RELOAD_DIAGNOSTICS", "0") == "1":
+                finite_log_probs = [value for value in log_probs if math.isfinite(value)]
+                logger.warning(
+                    "Rollout log-prob diagnostics: tokens=%d nonfinite=%d finite_min=%s finite_max=%s",
+                    len(log_probs),
+                    len(log_probs) - len(finite_log_probs),
+                    min(finite_log_probs) if finite_log_probs else None,
+                    max(finite_log_probs) if finite_log_probs else None,
+                )
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
@@ -1053,9 +1063,12 @@ class vLLMHttpServer:
                 apply_modelopt_nvfp4_patches()
                 quantization = "modelopt"
             elif quant_method == "compressed-tensors":
-                from verl.utils.qat import apply_qat_patches
+                if qat_config.format == "nvfp4":
+                    from verl.utils.qat import apply_qat_patches
 
-                apply_qat_patches()
+                    apply_qat_patches()
+                elif qat_config.format != "int4":
+                    raise ValueError(f"Unsupported compressed-tensors QAT format: {qat_config.format}")
                 quantization = "compressed-tensors"
             else:
                 raise ValueError(f"Unsupported quant_method: {quant_method}")

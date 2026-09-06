@@ -26,6 +26,7 @@ actor_rollout_ref:
     fsdp_config:
       qat:
         enable: true
+        format: "nvfp4"
         mode: "w4a16"
         group_size: 16
         ignore_patterns:
@@ -38,6 +39,7 @@ actor_rollout_ref:
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `fsdp_config.qat.enable` | Enable QAT | `False` |
+| `fsdp_config.qat.format` | Weight format | `"nvfp4"` |
 | `fsdp_config.qat.mode` | Quantization mode | `"w4a16"` |
 | `fsdp_config.qat.group_size` | Quantization group size | `16` |
 | `fsdp_config.qat.ignore_patterns` | Layers to skip. Supports `re:` prefix for regex, otherwise substring match | `["lm_head", "embed_tokens", "re:.*mlp.gate$"]` |
@@ -53,6 +55,7 @@ actor_rollout_ref:
     megatron:
       qat:
         enable: true
+        format: "nvfp4"
         mode: "w4a16"
         group_size: 16
         ignore_patterns:
@@ -64,6 +67,7 @@ actor_rollout_ref:
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `megatron.qat.enable` | Enable QAT | `False` |
+| `megatron.qat.format` | Weight format | `"nvfp4"` |
 | `megatron.qat.mode` | Quantization mode | `"w4a16"` |
 | `megatron.qat.group_size` | Quantization group size | `16` |
 | `megatron.qat.ignore_patterns` | Layers to skip. Uses `fnmatch` glob syntax | `["lm_head", "*mlp.gate"]` |

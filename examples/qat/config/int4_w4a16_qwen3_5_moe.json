@@ -1,0 +1,28 @@
+{
+  "config_groups": {
+    "group_0": {
+      "input_activations": null,
+      "output_activations": null,
+      "targets": [
+        "re:.*\\.mlp\\.experts\\.\\d+\\.(gate_proj|up_proj|down_proj)$"
+      ],
+      "weights": {
+        "actorder": null,
+        "block_structure": null,
+        "dynamic": false,
+        "group_size": 32,
+        "num_bits": 4,
+        "observer": "minmax",
+        "observer_kwargs": {},
+        "strategy": "group",
+        "symmetric": true,
+        "type": "int"
+      }
+    }
+  },
+  "format": "pack-quantized",
+  "ignore": [],
+  "kv_cache_scheme": null,
+  "quant_method": "compressed-tensors",
+  "quantization_status": "compressed"
+}

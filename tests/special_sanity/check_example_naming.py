@@ -106,6 +106,12 @@ DEFAULT_IGNORE_FILES = (
     # folding ``_multi_rs`` into a ROLLOUT_SERVER env-var toggle rather than
     # in this PR.
     "examples/rollout_correction/run_qwen2_5_7b_fsdp_multi_rs.sh",
+    # Private INT4 QAT/PTQ experiment entry points and asset bootstrap are
+    # intentionally kept separate from the canonical upstream examples.
+    "examples/grpo_trainer/run_qwen3_30b_a3b_megatron_int4_ptq.sh",
+    "examples/grpo_trainer/run_qwen3_30b_a3b_megatron_int4_qat.sh",
+    "examples/grpo_trainer/run_qwen3_5_35b_megatron_int4_qat.sh",
+    "examples/qat/prepare_qwen3_5_35b_formal_assets.sh",
 )
 
 

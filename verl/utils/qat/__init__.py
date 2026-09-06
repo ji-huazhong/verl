@@ -15,13 +15,16 @@
 """
 QAT (Quantization-Aware Training) module for verl.
 
-Supports NVFP4 (W4A4 and W4A16) quantization modes for FSDP training.
+Supports NVFP4 (W4A4 and W4A16) for FSDP/Megatron and integer INT4
+W4A16 routed-expert QAT for Megatron training with vLLM rollout.
 
 Module Structure:
 - core.py: QATConfig, apply_qat, enable_qat_fuse (training setup)
 - linear.py: QATLinear layer with Triton kernels for fake quantization
 - quantizer.py: QATQuantizer for true quantization + scale computation utilities
 - vllm_patch.py: Patches for vLLM dynamic weight loading
+- int4.py: Integer W4A16 fake quantization and compressed-tensors export
+- int4_vllm.py: Native vLLM WNA16 layerwise reload integration
 
 Usage:
     from verl.utils.qat import apply_qat, QATConfig
