@@ -105,6 +105,9 @@ def expand_qwen3_5_fused_int4_weights(
         yield name, tensor
 
 
+# TODO(ji-huazhong): Replace this Qwen3.5-specific compatibility shim with a
+# capability-based fused-MoE INT4 loader in vLLM/compressed-tensors, then remove
+# the runtime monkey patch after repeated-reload and TP/PP/EP coverage passes.
 def patch_qwen3_5_fused_int4_loader(model: torch.nn.Module) -> bool:
     """Patch Qwen3.5's instance loader to accept compact fused INT4 updates."""
     if type(model).__name__ not in {"Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration"}:
