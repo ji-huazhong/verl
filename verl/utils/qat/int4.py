@@ -145,6 +145,60 @@ def fake_quant_int4_ste(
         return _Int4FakeQuantSTE.apply(weight, group_size, scale_dtype)
 
 
+class _Int4GroupedWeightSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, weight: torch.Tensor, quantized: torch.Tensor) -> torch.Tensor:
+        # Return a new view, not the input object: autograd may otherwise wrap
+        # the alias and drop Python attributes such as TE's main_grad.
+        output = quantized.view_as(weight)
+        if hasattr(weight, "main_grad"):
+            output.main_grad = weight.main_grad
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output, None
+
+
+def fake_quant_int4_grouped_ste(
+    weights: list[torch.Tensor],
+    group_size: int = 128,
+    scale_dtype: str = "bfloat16",
+) -> list[torch.Tensor]:
+    """Coalesce compatible local expert weights into one QDQ call, without caching.
+
+    Every row must independently satisfy the quantization contract before
+    flattening, so neither row nor expert boundaries change the scale grid.
+    Outputs share a fresh QDQ allocation owned by their views; later calls and
+    optimizer updates cannot overwrite tensors saved for backward.
+    """
+    _resolve_scale_dtype(scale_dtype)
+    for weight in weights:
+        _validate_weight(weight, group_size)
+    if not weights:
+        return []
+    first = weights[0]
+    compatible = len(weights) > 1 and all(
+        type(weight) in (torch.Tensor, torch.nn.Parameter)
+        and (weight.is_cuda or weight.device.type == "cpu")
+        and weight.device == first.device
+        and weight.dtype == first.dtype
+        and weight.dtype in (torch.float32, torch.float16, torch.bfloat16)
+        and weight.is_contiguous()
+        and weight.numel() > 0
+        for weight in weights
+    )
+    if not compatible:
+        return [fake_quant_int4_ste(weight, group_size, scale_dtype) for weight in weights]
+
+    # Detach before concatenation: each master weight gets its own identity STE,
+    # including TE's main_grad, without a concatenation backward or saved input.
+    flat = torch.cat([weight.detach().reshape(-1) for weight in weights]).view(1, -1)
+    quantized = fake_quant_int4_ste(flat, group_size, scale_dtype).view(-1)
+    chunks = quantized.split([weight.numel() for weight in weights])
+    return [_Int4GroupedWeightSTE.apply(weight, chunk) for weight, chunk in zip(weights, chunks, strict=True)]
+
+
 def pack_int4_levels(levels: torch.Tensor) -> torch.Tensor:
     """Pack signed INT4 levels along the last dimension into GPTQ-order INT32."""
     if levels.shape[-1] % INT4_PACK_FACTOR != 0:
@@ -277,6 +331,10 @@ def apply_int4_qat_to_modules(modules: list[torch.nn.Module], qat_config: Any) -
     """Patch instantiated Megatron TE GroupedLinear routed experts for INT4 QAT."""
     group_size = int(getattr(qat_config, "group_size", 128))
     scale_dtype = str(getattr(qat_config, "scale_dtype", "bfloat16"))
+    grouped_setting = os.environ.get("VERL_INT4_QAT_GROUPED_QDQ", "1")
+    if grouped_setting not in ("0", "1"):
+        raise ValueError("VERL_INT4_QAT_GROUPED_QDQ must be 0 (per expert) or 1 (grouped)")
+    grouped_qdq = grouped_setting == "1"
     patched = 0
 
     for model in modules:
@@ -290,6 +348,8 @@ def apply_int4_qat_to_modules(modules: list[torch.nn.Module], qat_config: Any) -
 
             def _qat_get_weight_tensors(self):
                 weights = self._verl_int4_original_get_weight_tensors()
+                if grouped_qdq:
+                    return fake_quant_int4_grouped_ste(weights, group_size, scale_dtype)
                 return [fake_quant_int4_ste(weight, group_size, scale_dtype) for weight in weights]
 
             module._get_weight_tensors = MethodType(_qat_get_weight_tensors, module)
@@ -302,7 +362,11 @@ def apply_int4_qat_to_modules(modules: list[torch.nn.Module], qat_config: Any) -
             "Integer INT4 QAT requires routed experts implemented by Megatron TE GroupedLinear "
             "(mlp.experts.linear_fc1/linear_fc2); no compatible modules were found."
         )
-    logger.info("Enabled integer INT4 fake quant on %d Megatron routed-expert GroupedLinear modules", patched)
+    logger.info(
+        "Enabled integer INT4 fake quant on %d Megatron routed-expert GroupedLinear modules (grouped_qdq=%s)",
+        patched,
+        grouped_qdq,
+    )
     return modules
 
 
@@ -314,6 +378,7 @@ __all__ = [
     "Int4WeightExporter",
     "apply_int4_qat_to_modules",
     "dequantize_int4_levels",
+    "fake_quant_int4_grouped_ste",
     "fake_quant_int4_ste",
     "is_routed_expert_weight",
     "pack_int4_levels",

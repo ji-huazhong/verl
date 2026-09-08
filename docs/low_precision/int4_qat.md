@@ -1,6 +1,6 @@
 # Integer INT4 QAT with Megatron and vLLM
 
-Last updated: 09/07/2026
+Last updated: 09/08/2026
 
 verl provides an experimental integer INT4 QAT path for Qwen3 and Qwen3.5 MoE models on Hopper GPUs. The initial scope is deliberately narrow: Megatron training, vLLM rollout, BF16 activations, and only routed-expert weights quantized to symmetric group-wise INT4.
 
@@ -61,6 +61,35 @@ The worker therefore logs end-to-end `reload receive/load`, local vLLM `load_wei
 
 ## Configuration
 
+### Grouped training QDQ
+
+INT4 QAT now defaults to coalescing compatible weights returned by one local
+Megatron/TE `GroupedLinear` into a single QDQ call. It concatenates detached
+weights, applies the existing tiled QDQ kernel, and returns shaped views with
+an independent identity STE and TE `main_grad` for each master weight. Each row
+is validated before concatenation; scale groups never cross row or expert
+boundaries. Export, weight synchronization, and vLLM kernels are unchanged.
+
+Set `VERL_INT4_QAT_GROUPED_QDQ=0` in training workers **before QAT hooks are
+installed** to retain per-expert calls for A/B testing; the default is `1`.
+This switch is independent of `VERL_INT4_QAT_QDQ_GROUPS_PER_PROGRAM`, which
+controls tiling inside each CUDA kernel. A single weight, noncontiguous or
+mixed-device/dtype weights, and tensor subclasses use the per-expert fallback.
+Invalid quantization shapes still fail instead of changing group boundaries.
+
+This optimization does not inspect model classes, assume an expert count, or
+change TP/EP communication. It works on weights already local to the module;
+cross-node and different train/rollout parallel layouts still depend on the
+existing exporter/transport and require their own end-to-end validation.
+
+There is **no persistent QDQ cache**, host offload, prefetch stream, weight-version
+tracking, or schedule-level reuse. Every microbatch and checkpoint recomputation
+reads current master weights. Concatenation temporarily allocates one module's
+weight volume; output views share a fresh QDQ allocation that stays alive until
+its consumers release it. This is not zero-extra-memory, but does not retain a
+model-sized cache between calls. An unused expert view can keep the same shared
+allocation alive as its used peers.
+
 ### Training-side QDQ profiling
 
 The CUDA fake-QDQ kernel tiles independent groups within a program, keeping
@@ -85,6 +114,10 @@ profiled schedules in one process are rejected. Records go directly to stderr
 to avoid framework logger filtering. Set `RAY_DEDUP_LOGS=0` in the launcher
 before Ray starts, or inspect original worker stderr files, to retain every
 rank's record instead of Ray's deduplicated console summary.
+
+With grouped QDQ, one compatible module invocation counts as one QDQ call,
+using the flattened tensor shape and summed output bytes. These QDQ samples do
+not include the preceding concatenation; end-to-end stage timings include it.
 
 Profiling waits for sampled events at the schedule boundary and perturbs
 timings. Sampled CUDA spans include launch/stream gaps and are not full-stage
