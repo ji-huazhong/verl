@@ -8,9 +8,15 @@
 
 """Fused CUDA fake-quant kernel for integer INT4 QAT."""
 
+import os
+
 import torch
 import triton
 import triton.language as tl
+
+_QDQ_GROUPS_PER_PROGRAM = int(os.environ.get("VERL_INT4_QAT_QDQ_GROUPS_PER_PROGRAM", "0"))
+if _QDQ_GROUPS_PER_PROGRAM < 0 or (_QDQ_GROUPS_PER_PROGRAM and _QDQ_GROUPS_PER_PROGRAM & (_QDQ_GROUPS_PER_PROGRAM - 1)):
+    raise ValueError("VERL_INT4_QAT_QDQ_GROUPS_PER_PROGRAM must be zero (auto) or a positive power of two")
 
 
 @triton.jit
@@ -52,6 +58,33 @@ def _int4_fake_quant_kernel(
     rounded = _round_to_nearest_even(scaled)
     quantized = tl.minimum(tl.maximum(rounded, -7.0), 7.0)
     tl.store(output_ptr + offsets, quantized * scale, mask=mask)
+
+
+@triton.jit
+def _int4_fake_quant_tiled_kernel(
+    input_ptr,
+    output_ptr,
+    numel,
+    GROUP_SIZE: tl.constexpr,
+    GROUPS_PER_PROGRAM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    SCALE_BF16: tl.constexpr,
+):
+    group_ids = tl.program_id(0) * GROUPS_PER_PROGRAM + tl.arange(0, GROUPS_PER_PROGRAM)
+    offsets = group_ids[:, None] * GROUP_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
+    mask = (offsets < numel) & (tl.arange(0, BLOCK_SIZE)[None, :] < GROUP_SIZE)
+    values = tl.load(input_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+
+    # Each row retains its own quantization grid; tiling only amortizes
+    # program scheduling and does not combine amax reductions across groups.
+    amax = tl.max(tl.abs(values), axis=1)
+    scale = tl.maximum(tl.div_rn(amax, 7.0), 1e-5)
+    if SCALE_BF16:
+        scale = scale.to(tl.bfloat16).to(tl.float32)
+    else:
+        scale = scale.to(tl.float16).to(tl.float32)
+    quantized = tl.minimum(tl.maximum(_round_to_nearest_even(tl.div_rn(values, scale[:, None])), -7.0), 7.0)
+    tl.store(output_ptr + offsets, quantized * scale[:, None], mask=mask)
 
 
 @triton.jit
@@ -101,7 +134,9 @@ def _int4_quantize_pack_kernel(
     tl.store(packed_ptr + packed_offsets, packed, mask=packed_mask)
 
 
-def fake_quant_int4_cuda(weight: torch.Tensor, group_size: int, scale_dtype: str) -> torch.Tensor:
+def fake_quant_int4_cuda(
+    weight: torch.Tensor, group_size: int, scale_dtype: str, *, groups_per_program: int | None = None
+) -> torch.Tensor:
     """Run fused group-wise INT4 QDQ on a contiguous CUDA weight tensor."""
     if not weight.is_cuda:
         raise ValueError("fake_quant_int4_cuda requires a CUDA tensor")
@@ -110,18 +145,29 @@ def fake_quant_int4_cuda(weight: torch.Tensor, group_size: int, scale_dtype: str
     if weight.numel() % group_size != 0:
         raise ValueError("weight numel must be divisible by group_size")
 
-    output = torch.empty_like(weight)
     block_size = triton.next_power_of_2(group_size)
-    grid = (triton.cdiv(weight.numel(), group_size),)
-    _int4_fake_quant_kernel[grid](
-        weight,
-        output,
-        weight.numel(),
+    if groups_per_program is None:
+        groups_per_program = _QDQ_GROUPS_PER_PROGRAM or max(1, 1024 // block_size)
+    if groups_per_program <= 0 or groups_per_program & (groups_per_program - 1):
+        raise ValueError("groups_per_program must be a positive power of two")
+    output = torch.empty_like(weight)
+    if weight.numel() == 0:
+        return output
+    kwargs = dict(
         GROUP_SIZE=group_size,
         BLOCK_SIZE=block_size,
         SCALE_BF16=scale_dtype.lower() in {"bfloat16", "bf16"},
         num_warps=4,
     )
+    if groups_per_program == 1:
+        # Preserve the original kernel for controlled A/B measurements.
+        grid = (triton.cdiv(weight.numel(), group_size),)
+        _int4_fake_quant_kernel[grid](weight, output, weight.numel(), **kwargs)
+    else:
+        grid = (triton.cdiv(weight.numel(), group_size * groups_per_program),)
+        _int4_fake_quant_tiled_kernel[grid](
+            weight, output, weight.numel(), GROUPS_PER_PROGRAM=groups_per_program, **kwargs
+        )
     return output
 
 

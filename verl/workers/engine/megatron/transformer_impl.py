@@ -978,15 +978,22 @@ class MegatronEngine(BaseEngine):
 
         # TODO: we may use the new schedule instead
         # for flash-attn: (seq_len, batch_size, hidden_size) = (mbs*seq_len, 1, hidden_size)
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step,
-            data_iterator=batch_generator,
-            model=self.module,
-            num_microbatches=n_micro_batch,
-            seq_length=1,  # the communication shape is obtained via p2p comm
-            micro_batch_size=1,  # the communication shape is obtained via p2p comm
-            forward_only=forward_only,
-        )
+        from verl.utils.qat.int4_profile import int4_qat_profile
+
+        with int4_qat_profile(
+            "logprob" if forward_only else "train",
+            n_micro_batch,
+            enabled=self._qat_enabled and self._qat_format == "int4",
+        ) as qat_profile:
+            losses_reduced = forward_backward_func(
+                forward_step_func=qat_profile.wrap_forward_step(forward_step) if qat_profile else forward_step,
+                data_iterator=batch_generator,
+                model=self.module,
+                num_microbatches=n_micro_batch,
+                seq_length=1,  # the communication shape is obtained via p2p comm
+                micro_batch_size=1,  # the communication shape is obtained via p2p comm
+                forward_only=forward_only,
+            )
 
         if self.model_config.mtp.enable and mpu.is_pipeline_last_stage(ignore_virtual=True):
             # All CP ranks must participate in the all_reduce inside get_megatron_mtp_loss,

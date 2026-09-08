@@ -185,6 +185,58 @@ def test_cuda_fake_quant_and_packer_match_cpu_reference(shape, group_size):
     assert f"{base_name}.weight_shape" not in exported
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Triton")
+@pytest.mark.parametrize("group_size", [32, 64, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("scale_dtype", ["bfloat16", "float16"])
+def test_cuda_tiled_qdq_preserves_groups_tails_ties_and_zero(group_size, dtype, scale_dtype):
+    from verl.utils.qat.int4_triton import fake_quant_int4_cuda
+
+    # Three groups leave a partial program in every tiled configuration.
+    weight = torch.zeros(3, group_size, dtype=dtype)
+    weight[0, :10] = torch.tensor([-7, 7, -0.5, 0.5, -1.5, 1.5, -2.5, 2.5, -3.5, 3.5], dtype=dtype)
+    weight[1, :4] = torch.tensor([-1e-6, 1e-6, -1e-5, 1e-5], dtype=dtype)
+    levels, scale = quantize_int4_levels(weight, group_size, scale_dtype)
+    expected = dequantize_int4_levels(levels, scale, group_size, dtype)
+    cuda_weight = weight.cuda()
+    for tile in (1, 2, 8, 32):
+        actual = fake_quant_int4_cuda(cuda_weight, group_size, scale_dtype, groups_per_program=tile)
+        assert torch.equal(actual.cpu(), expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Triton")
+@pytest.mark.parametrize("shape", [(512, 2048), (2048, 512), (3, 512, 2048)])
+@pytest.mark.parametrize("group_size", [32, 64, 128])
+def test_cuda_tiled_qdq_matches_legacy_on_expert_shapes(shape, group_size):
+    from verl.utils.qat.int4_triton import fake_quant_int4_cuda
+
+    generator = torch.Generator(device="cuda").manual_seed(123)
+    weight = torch.randn(shape, dtype=torch.bfloat16, device="cuda", generator=generator)
+    legacy = fake_quant_int4_cuda(weight, group_size, "bfloat16", groups_per_program=1)
+    for tile in (2, 8, 32):
+        assert torch.equal(fake_quant_int4_cuda(weight, group_size, "bfloat16", groups_per_program=tile), legacy)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Triton")
+def test_cuda_tiled_qdq_preserves_ste_main_grad_and_weight_updates(monkeypatch):
+    from verl.utils.qat import int4_triton
+
+    monkeypatch.setattr(int4_triton, "_QDQ_GROUPS_PER_PROGRAM", 32)
+    weight = torch.randn(16, 128, dtype=torch.bfloat16, device="cuda", requires_grad=True)
+    weight.main_grad = torch.zeros_like(weight, dtype=torch.float32)
+    upstream = torch.randn_like(weight)
+    for _ in range(3):
+        quantized = fake_quant_int4_ste(weight, group_size=32)
+        assert quantized.main_grad is weight.main_grad
+        expected = int4_triton.fake_quant_int4_cuda(weight, 32, "bfloat16", groups_per_program=1)
+        assert torch.equal(quantized, expected)
+        quantized.backward(upstream)
+        assert torch.equal(weight.grad, upstream)
+        with torch.no_grad():
+            weight.add_(0.125)
+        weight.grad = None
+
+
 def test_exporter_keeps_individual_expert_weight_shape_resident():
     weight = torch.randn(16, 128, dtype=torch.bfloat16)
     base_name = "model.layers.0.mlp.experts.0.gate_proj"

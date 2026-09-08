@@ -28,6 +28,8 @@ from typing import Any
 
 import torch
 
+from verl.utils.qat.int4_profile import current_int4_qat_profile
+
 logger = logging.getLogger(__name__)
 
 INT4_QMIN = -7
@@ -136,7 +138,11 @@ def fake_quant_int4_ste(
     """Apply integer INT4 QDQ in forward and identity STE in backward."""
     _validate_weight(weight, group_size)
     _resolve_scale_dtype(scale_dtype)
-    return _Int4FakeQuantSTE.apply(weight, group_size, scale_dtype)
+    profile = current_int4_qat_profile()
+    if profile is None:
+        return _Int4FakeQuantSTE.apply(weight, group_size, scale_dtype)
+    with profile.measure(weight, group_size):
+        return _Int4FakeQuantSTE.apply(weight, group_size, scale_dtype)
 
 
 def pack_int4_levels(levels: torch.Tensor) -> torch.Tensor:

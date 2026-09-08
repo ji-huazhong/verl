@@ -1,6 +1,6 @@
 # Integer INT4 QAT with Megatron and vLLM
 
-Last updated: 09/06/2026
+Last updated: 09/07/2026
 
 verl provides an experimental integer INT4 QAT path for Qwen3 and Qwen3.5 MoE models on Hopper GPUs. The initial scope is deliberately narrow: Megatron training, vLLM rollout, BF16 activations, and only routed-expert weights quantized to symmetric group-wise INT4.
 
@@ -60,6 +60,37 @@ The worker therefore logs end-to-end `reload receive/load`, local vLLM `load_wei
 `VERL_INT4_QAT_RELOAD_DIAGNOSTICS=1` validates every exported scale but is intentionally not a benchmark setting: the original per-tensor checks raised iterator time from about 3.11s to 8.35s. Diagnostics now aggregate device scalars and synchronize once at the end. With diagnostics disabled, the old metadata stream took 15.775s for one post-step update. The generic shape-elision path completed three post-step updates in 13.613/13.828/13.389s (mean 13.610s, population standard deviation 0.179s), 13.7% below that old single-sample baseline. Its six sender measurements averaged 10.812s: 2.376s iterator, 0.663s copy enqueue, 6.763s receiver acknowledgement, and 0.526s cleanup. Receiver receive/load was 9.717–9.886s, local vLLM loading was 6.172–6.434s, and WNA16 finalization was 0.002s. The next portable target is therefore producer/receiver pipelining or a generic vLLM/compressed-tensors loader index; model-class or parameter-name-specific fast paths are deliberately excluded. An eight-group-per-program pack kernel remains bit-exact for both individual Qwen3 and fused Qwen3.5 expert tensors, but its isolated controlled post-step delta was only -0.7%. A direct trainer-to-Marlin packet format is outside this first vLLM path because it would couple Megatron export to vLLM's private packed layout.
 
 ## Configuration
+
+### Training-side QDQ profiling
+
+The CUDA fake-QDQ kernel tiles independent groups within a program, keeping
+the stored scale, rounding, group boundaries, and identity STE unchanged.
+`VERL_INT4_QAT_QDQ_GROUPS_PER_PROGRAM=1` selects the original kernel for A/B
+measurements; the default `0` selects a 1,024-value tile based on group size.
+These settings must be present in the training workers' environment before
+the CUDA module is imported. No QDQ weight cache is retained between calls.
+
+Set `VERL_INT4_QAT_TRAIN_PROFILE=1` to log `INT4_QAT_TRAIN_PROFILE` JSON records
+for Megatron logprob and training schedules. The records separate QDQ calls
+inside schedule forward callbacks from calls during backward/recomputation,
+and report exact call counts, output-allocation volume, host call time, bounded
+CUDA-event samples, and device memory. `PROFILE_SAMPLE_EVERY` (default 1024),
+`PROFILE_MAX_SAMPLES` (128 per phase/shape group), and `PROFILE_MAX_SCHEDULES`
+(0 means unlimited) use the `VERL_INT4_QAT_` prefix. Limiting schedules to 2
+can profile the first logprob/training pair and leave subsequent schedules
+uninstrumented, provided each pair uses one schedule of each kind.
+
+The active diagnostic scope is shared with autograd worker threads; overlapping
+profiled schedules in one process are rejected. Records go directly to stderr
+to avoid framework logger filtering. Set `RAY_DEDUP_LOGS=0` in the launcher
+before Ray starts, or inspect original worker stderr files, to retain every
+rank's record instead of Ray's deduplicated console summary.
+
+Profiling waits for sampled events at the schedule boundary and perturbs
+timings. Sampled CUDA spans include launch/stream gaps and are not full-stage
+kernel times; cumulative output bytes are allocation traffic, not peak live
+memory. The process peak-memory counter is read without resetting it. Use
+uninstrumented schedules for performance comparisons.
 
 The ready-to-run entry point is:
 
