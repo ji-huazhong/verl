@@ -403,6 +403,10 @@ global_profiler:
     # Enable memory visualization and automatic CUDA/NPU OOM snapshots for debugging memory usage.
     torch_memory:
 
+      # Recorder backend: torch (allocator snapshots + OOM dump) or memray (native allocation
+      # trace). Install the optional `verl[memray]` extra before selecting memray.
+      memory_recorder: "torch"
+
       #  Maximum number of allocation entries to record
       trace_alloc_max_entries: 100_000
 

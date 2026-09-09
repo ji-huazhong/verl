@@ -49,8 +49,8 @@ class TestTorchMemoryProfiler(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def _config(self) -> ProfilerConfig:
-        return ProfilerConfig(enable=True, ranks=[0], save_path="/tmp/profiles")
+    def _config(self, save_path: str = "/tmp/profiles") -> ProfilerConfig:
+        return ProfilerConfig(enable=True, ranks=[0], save_path=save_path)
 
     def test_oom_observer_is_automatic_and_dumps_without_sync(self):
         profiler = TorchMemoryProfiler(rank=0, config=self._config(), tool_config=TorchMemoryToolConfig())
@@ -150,6 +150,55 @@ class TestTorchMemoryProfiler(unittest.TestCase):
 
             dump_snapshot.assert_called_once_with(out_dir="/tmp/profiles", tag="torch_memory", sub_dir="steps4-5")
             clear_memory_history.assert_called_once_with(trace_alloc_max_entries=100_000, stack_depth=32)
+
+    def test_memray_recorder_writes_a_trace_for_each_completed_window(self):
+        tracker = MagicMock()
+        memray = SimpleNamespace(Tracker=MagicMock(return_value=tracker))
+        tool_config = TorchMemoryToolConfig(memory_recorder="memray", memory_snapshot_num_steps=2)
+        with tempfile.TemporaryDirectory() as out_dir, patch.dict(sys.modules, {"memray": memray}):
+            profiler = TorchMemoryProfiler(rank=0, config=self._config(out_dir), tool_config=tool_config)
+            self.attach_observer.assert_not_called()
+
+            profiler.start(profile_step=4)
+            memray.Tracker.assert_called_once()
+            output_path = Path(memray.Tracker.call_args.kwargs["file_name"])
+            self.assertEqual(output_path.parent, Path(out_dir) / ".memray")
+            self.assertRegex(output_path.name, r"memray_rank0_pid\d+\.bin")
+            self.assertTrue(memray.Tracker.call_args.kwargs["native_traces"])
+            tracker.__enter__.assert_called_once_with()
+
+            with patch.object(profiler.sampler, "dump_memory_snapshot") as dump_snapshot:
+                profiler.stop()
+                dump_snapshot.assert_not_called()
+                tracker.__exit__.assert_not_called()
+
+                profiler.start(profile_step=5)
+                output_path.touch()
+                profiler.stop()
+
+            dump_snapshot.assert_not_called()
+            tracker.__exit__.assert_called_once_with(None, None, None)
+            self.assertTrue((Path(out_dir) / "steps4-5" / output_path.name).is_file())
+
+    def test_missing_memray_is_nonfatal(self):
+        tool_config = TorchMemoryToolConfig(memory_recorder="memray")
+        with (
+            patch.dict(sys.modules, {"memray": None}),
+            self.assertLogs("verl.utils.profiler.torch_memory_profile", level="WARNING") as logs,
+        ):
+            profiler = TorchMemoryProfiler(rank=0, config=self._config(), tool_config=tool_config)
+            profiler.start(profile_step=4)
+            profiler.stop()
+
+        self.assertTrue(any("memray recorder requested but memray is not installed" in entry for entry in logs.output))
+
+    def test_memory_recorder_config_validation(self):
+        for memory_recorder in ("both", "invalid"):
+            with (
+                self.subTest(memory_recorder=memory_recorder),
+                self.assertRaisesRegex(AssertionError, "memory_recorder"),
+            ):
+                TorchMemoryToolConfig(memory_recorder=memory_recorder)
 
     def test_oom_diagnostics_and_dump_failures_are_nonfatal(self):
         profiler = TorchMemoryProfiler(rank=0, config=self._config())

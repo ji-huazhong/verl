@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import logging
+import os
 import traceback
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -27,11 +29,11 @@ logger = logging.getLogger(__name__)
 
 
 class TorchMemoryProfiler:
-    """Profiler that dumps CUDA/NPU memory snapshots at step boundaries.
+    """Profiler that records PyTorch allocator snapshots and optional Memray traces.
 
     Behavior:
-    - On first construction (per process), enable memory history recording if an accelerator is available
-    - Automatically register an OOM snapshot callback on selected ranks when supported
+    - ``torch`` enables PyTorch allocator history and OOM snapshots
+    - ``memray`` records native process allocations within profile windows
     - On start(step=X), begin or extend a configured memory-history window
     - On stop(), dump a memory snapshot once the window reaches its configured number of steps
     """
@@ -54,20 +56,27 @@ class TorchMemoryProfiler:
         self._window_start_step = None
         self._window_end_step = None
         self._steps_in_window = 0
+        self._memray_tracker = None
+        self._memray_output_path: Path | None = None
+        self._memray_disabled = False
         self.sampler = MemorySnapshotSampler()
 
         # Get parameters from tool_config, with fallback to defaults
         if tool_config:
+            self.memory_recorder = tool_config.memory_recorder
             self.trace_alloc_max_entries = tool_config.trace_alloc_max_entries
             self.stack_depth = tool_config.stack_depth
             self.memory_snapshot_num_steps = tool_config.memory_snapshot_num_steps
         else:
+            self.memory_recorder = "torch"
             self.trace_alloc_max_entries = 100_000
             self.stack_depth = 32
             self.memory_snapshot_num_steps = 1
+        self._record_torch_memory = self.memory_recorder == "torch"
+        self._record_memray = self.memory_recorder == "memray"
 
         # Best-effort enable memory history once
-        if not TorchMemoryProfiler._memory_history_enabled:
+        if self._record_torch_memory and not TorchMemoryProfiler._memory_history_enabled:
             try:
                 enable_memory_visualize(
                     trace_alloc_max_entries=self.trace_alloc_max_entries, stack_depth=self.stack_depth
@@ -77,7 +86,7 @@ class TorchMemoryProfiler:
                 pass
             TorchMemoryProfiler._memory_history_enabled = True
 
-        if self._should_profile_this_rank():
+        if self._record_torch_memory and self._should_profile_this_rank():
             self._attach_oom_observer()
 
     def _attach_oom_observer(self) -> None:
@@ -150,6 +159,7 @@ class TorchMemoryProfiler:
         if self._steps_in_window == 0:
             self._window_start_step = profile_step
         self._window_end_step = profile_step
+        self._start_memray()
         self.this_step = True
 
     def stop(self):
@@ -163,15 +173,17 @@ class TorchMemoryProfiler:
             return
 
         out_dir = self.config.save_path or "outputs/profile"
-        tag = "torch_memory"
-        # Dump snapshot; all ranks write into the same window directory.
-        try:
-            self.sampler.dump_memory_snapshot(out_dir=out_dir, tag=tag, sub_dir=self._window_sub_dir())
-        except Exception:
-            pass
-        # Clear memory history
-        if TorchMemoryProfiler._memory_history_enabled:
-            clear_memory_history(trace_alloc_max_entries=self.trace_alloc_max_entries, stack_depth=self.stack_depth)
+        window_sub_dir = self._window_sub_dir()
+        if self._record_torch_memory:
+            # Dump snapshot; all ranks write into the same window directory.
+            try:
+                self.sampler.dump_memory_snapshot(out_dir=out_dir, tag="torch_memory", sub_dir=window_sub_dir)
+            except Exception:
+                pass
+            # Clear memory history after each regular torch snapshot window.
+            if TorchMemoryProfiler._memory_history_enabled:
+                clear_memory_history(trace_alloc_max_entries=self.trace_alloc_max_entries, stack_depth=self.stack_depth)
+        self._stop_memray()
         self._steps_in_window = 0
         self._window_start_step = None
         self._window_end_step = None
@@ -182,6 +194,52 @@ class TorchMemoryProfiler:
         if self._window_start_step == self._window_end_step:
             return f"step{self._window_start_step}"
         return f"steps{self._window_start_step}-{self._window_end_step}"
+
+    def _start_memray(self) -> None:
+        """Start a Memray tracker for the current profile window, if requested."""
+        if not self._record_memray or self._memray_tracker is not None or self._memray_disabled:
+            return
+
+        out_dir = Path(self.config.save_path or "outputs/profile")
+        # The end step is not known until stop(), so record to a staging directory
+        # and move the complete trace beside the final window snapshot afterwards.
+        staging_dir = out_dir / ".memray"
+        self._memray_output_path = staging_dir / f"memray_rank{self.rank}_pid{os.getpid()}.bin"
+        try:
+            import memray
+        except ImportError:
+            logger.warning("[torch_memory] memray recorder requested but memray is not installed; install verl[memray]")
+            self._memray_disabled = True
+            return
+
+        try:
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            self._memray_tracker = memray.Tracker(file_name=str(self._memray_output_path), native_traces=True)
+            self._memray_tracker.__enter__()
+            logger.info("[torch_memory] memray recording started: %s", self._memray_output_path)
+        except Exception as exc:
+            logger.warning("[torch_memory] failed to start memray recorder: %s", exc)
+            self._memray_tracker = None
+            self._memray_disabled = True
+
+    def _stop_memray(self) -> None:
+        """Flush the current Memray trace after a completed profile window."""
+        if self._memray_tracker is None:
+            return
+
+        try:
+            self._memray_tracker.__exit__(None, None, None)
+            assert self._memray_output_path is not None
+            final_dir = Path(self.config.save_path or "outputs/profile") / (self._window_sub_dir() or "memray")
+            final_dir.mkdir(parents=True, exist_ok=True)
+            final_path = final_dir / self._memray_output_path.name
+            self._memray_output_path.replace(final_path)
+            logger.info("[torch_memory] memray trace saved: %s", final_path)
+        except Exception as exc:
+            logger.warning("[torch_memory] failed to stop memray recorder: %s", exc)
+        finally:
+            self._memray_tracker = None
+            self._memray_output_path = None
 
     def _should_profile_this_rank(self) -> bool:
         if self.config.all_ranks:

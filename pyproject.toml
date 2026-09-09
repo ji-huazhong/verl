@@ -27,6 +27,7 @@ requires-python = ">=3.10,<3.13"
 test          = ["pytest", "pre-commit", "py-spy", "pytest-asyncio", "pytest-rerunfailures"]
 math          = ["math-verify"]
 mcore         = ["mbridge"]
+memray        = ["memray>=1.19"]
 # Named extra so the git source lives in one place; verl-core pulls it in, so it
 # is always installed (no longer opt-in).
 transferqueue = ["TransferQueue @ git+https://github.com/Ascend/TransferQueue.git@main"]
