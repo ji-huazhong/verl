@@ -26,12 +26,13 @@ Every role has a profiler config, and by default, rollout/ref/reward models foll
 
 ## CUDA/NPU memory snapshots
 
-Selecting `global_profiler.tool=torch_memory` automatically enables best-effort OOM
-snapshot dumping on the selected profiler ranks when the CUDA/NPU allocator observer
-is available. The callback logs the Python stack and allocator memory summary, then writes a snapshot under
+Selecting `global_profiler.tool=torch_memory` with `memory_recorder=torch` (the default)
+automatically enables best-effort OOM snapshot dumping on the selected profiler ranks when
+the CUDA/NPU allocator observer is available. The callback logs the Python stack and
+allocator memory summary, then writes a snapshot under
 `<save_path>/oom_<timestamp>/` without synchronizing the device. It remains active outside
-the scheduled profiling steps once registered; it cannot run after `SIGKILL`.
-Unsupported devices or PyTorch builds emit a warning and continue without the OOM callback.
+the scheduled profiling steps once registered; it cannot run after `SIGKILL`. Unsupported
+devices or PyTorch builds emit a warning and continue without the OOM callback.
 
 NPU support requires `torch_npu._C._npu_attach_out_of_memory_observer` and the memory
 history/snapshot APIs (present in `torch-npu==2.10.0.post4`). Both regular and OOM NPU
@@ -47,6 +48,19 @@ Normal step-boundary snapshots remain controlled by `global_profiler.steps` and
 (default: `1`). Set `global_profiler.profile_continuous_steps=False` when using this
 step count so each profiled step contributes one start/stop cycle to the window.
 Training that does not select the `torch_memory` tool is unaffected.
+
+### Memray native-allocation traces
+
+`torch_memory.memory_recorder` selects one recorder for the same profile window:
+`torch` (default) writes PyTorch allocator snapshots and keeps automatic CUDA/NPU
+OOM snapshots; `memray` writes a native process-allocation trace. Install Memray with
+`uv sync --extra memray` before selecting `memray`.
+
+Memray traces are written as `memray_rank<rank>_pid<pid>.bin` beside the regular
+window snapshot, and can be rendered with `memray flamegraph <trace.bin>`. A Memray
+trace is flushed only at the end of a completed profiling window. It is deliberately
+not flushed from the allocator OOM callback, so do not expect a complete Memray report
+after an ungraceful process kill.
 
 ## To Add a new profiling tool
 
