@@ -138,6 +138,9 @@ profiler:
       # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
       _target_: verl.utils.profiler.config.TorchMemoryToolConfig
 
+      # Recorder backend: torch or memray.
+      memory_recorder: ${oc.select:global_profiler.global_tool_config.torch_memory.memory_recorder,torch}
+
       # Maximum number of memory allocation entries to track
       trace_alloc_max_entries: ${oc.select:global_profiler.global_tool_config.torch_memory.trace_alloc_max_entries,100000}
 
