@@ -202,7 +202,9 @@ def test_tiny_vlm_lora_update_export_and_recompute(tmp_path):
     from megatron.bridge.peft.lora import LoRA
     from megatron.core.packed_seq_params import PackedSeqParams
     from megatron.core.transformer.module import Float16Module
+    from PIL import Image
 
+    from tests.models.mcore.qwen38_vision_fixture import make_tiny_rgb, make_tiny_vision_processor
     from verl.models.mcore.qwen3_8_next.bridge import Qwen38NextBridge
 
     provider = make_tiny_provider(tmp_path)
@@ -255,18 +257,30 @@ def test_tiny_vlm_lora_update_export_and_recompute(tmp_path):
     # metadata. Sixteen input patches merge into four image token embeddings.
     image_ids = ids.clone()
     image_ids[0, 3:9] = torch.tensor([250, 252, 252, 252, 252, 251], device="cuda")
-    image_pixels = torch.linspace(-0.25, 0.25, 16 * 1536, device="cuda", dtype=torch.float32).reshape(16, 1536)
-    image_grid = torch.tensor([[1, 4, 4]], device="cuda")
+    processor = make_tiny_vision_processor()
+    image_rgb = make_tiny_rgb()
+    processed = processor.image_processor(images=[Image.fromarray(image_rgb)], return_tensors="pt")
+    changed_processed = processor.image_processor(images=[Image.fromarray(255 - image_rgb)], return_tensors="pt")
+    image_pixels = processed["pixel_values"].cuda()
+    image_grid = processed["image_grid_thw"].cuda()
+    changed_pixels = changed_processed["pixel_values"].cuda()
+    assert image_pixels.shape == (16, 1536) and image_grid.tolist() == [[1, 4, 4]]
     image_inputs = dict(inputs, input_ids=image_ids, pixel_values=image_pixels, image_grid_thw=image_grid)
     vision_outputs = []
+    vision_positions = []
     vision_hook = model.vision_model.register_forward_hook(
         lambda _module, _args, output: vision_outputs.append(output[0].detach().cpu().clone())
     )
+    position_hook = model.language_model.register_forward_pre_hook(
+        lambda _module, _args, kwargs: vision_positions.append(kwargs["position_ids"].detach().cpu().clone()),
+        with_kwargs=True,
+    )
     with torch.no_grad():
         image_base = mixed_model(**image_inputs)
-        changed_image = mixed_model(**dict(image_inputs, pixel_values=-image_pixels))
+        changed_image = mixed_model(**dict(image_inputs, pixel_values=changed_pixels))
         torch.testing.assert_close(mixed_model(**image_inputs), image_base, rtol=0, atol=0)
     vision_hook.remove()
+    position_hook.remove()
     assert len(vision_outputs) == 3 and vision_outputs[0].shape == (4, 128)
     assert bool(image_base.isfinite().all()) and bool(changed_image.isfinite().all())
     assert not torch.equal(vision_outputs[0], vision_outputs[1]), "Vision encoder ignored changed pixels"
@@ -282,6 +296,7 @@ def test_tiny_vlm_lora_update_export_and_recompute(tmp_path):
         model_path.mkdir(parents=True, exist_ok=False)
         hf_config = AutoConfig.from_pretrained(tmp_path, local_files_only=True)
         hf_config.save_pretrained(model_path)
+        processor.save_pretrained(model_path)
         exported_base = {
             item.param_name: item.weight.detach().contiguous().clone()
             for item in Qwen38NextBridge().stream_weights_megatron_to_hf(
@@ -353,6 +368,7 @@ def test_tiny_vlm_lora_update_export_and_recompute(tmp_path):
         torch.testing.assert_close(mixed_model(**image_inputs), image_base, rtol=0, atol=0)
     with torch.no_grad():
         image_updated = mixed_model(**image_inputs)
+        changed_image_updated = mixed_model(**dict(image_inputs, pixel_values=changed_pixels))
     assert bool(image_updated.isfinite().all()) and not torch.equal(image_updated, image_base)
 
     exports = list(Qwen38NextBridge().stream_adapter_weights_megatron_to_hf([model], cpu=True, show_progress=False))
@@ -409,10 +425,15 @@ def test_tiny_vlm_lora_update_export_and_recompute(tmp_path):
                 "lora_alpha": torch.tensor(peft.alpha),
                 "vision_input_ids": image_ids.cpu(),
                 "vision_pixel_values": image_pixels.cpu(),
+                "vision_rgb": torch.from_numpy(image_rgb.copy()),
+                "vision_changed_pixel_values": changed_pixels.cpu(),
                 "vision_image_grid_thw": image_grid.cpu(),
+                "vision_position_ids": vision_positions[0],
                 "vision_embeddings": vision_outputs[0],
                 "vision_base_logits": image_base.cpu(),
                 "vision_adapter_logits": image_updated.cpu(),
+                "vision_changed_base_logits": changed_image.cpu(),
+                "vision_changed_adapter_logits": changed_image_updated.cpu(),
                 **traces,
             },
             str(fixture_dir / "reference.safetensors"),

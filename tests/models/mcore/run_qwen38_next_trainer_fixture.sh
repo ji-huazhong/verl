@@ -44,6 +44,23 @@ if [[ -n "${QWEN38_RESUME_FROM:-}" ]]; then
     resume_args=(trainer.resume_mode=resume_path "trainer.resume_from_path=$QWEN38_RESUME_FROM")
 fi
 
+# The --images fixture uses real tokenizer/processor assets, but only 64x64
+# synthetic images. Keep processor resizing consistent in dataset and rollout.
+image_args=()
+if [[ "${QWEN38_SMOKE_IMAGES:-0}" == "1" ]]; then
+    image_args=(
+        # The real chat template plus four image tokens needs 70-71 tokens.
+        # Preserve filtering/truncation checks; 96 + 32 stays within 128.
+        data.max_prompt_length=96
+        data.image_patch_size=16
+        +data.mm_processor_kwargs.min_pixels=4096
+        +data.mm_processor_kwargs.max_pixels=4096
+        '+actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_kwargs={min_pixels:4096,max_pixels:4096}'
+        '+actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt={image:1,video:0}'
+        +actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0
+    )
+fi
+
 bash examples/tuning/lora/run_qwen38_flash_next_megatron.sh \
     "trainer.n_gpus_per_node=$QWEN38_SMOKE_GPUS" \
     "actor_rollout_ref.actor.megatron.tensor_model_parallel_size=$QWEN38_SMOKE_GPUS" \
@@ -78,4 +95,5 @@ bash examples/tuning/lora/run_qwen38_flash_next_megatron.sh \
     "trainer.default_local_dir=$QWEN38_SMOKE_OUTPUT/checkpoints" \
     trainer.save_freq=1 \
     "${resume_args[@]}" \
+    "${image_args[@]}" \
     "$@"

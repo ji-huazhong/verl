@@ -4,7 +4,7 @@
 This expands only the vocabulary of the exported four-layer GPU fixture. It
 does not copy real model weights or claim real-model/accuracy acceptance.
 Usage: python <this file> --fixture <GPU export> --assets <real checkpoint>
-       --output <new directory>
+       --output <new directory> [--images]
 """
 
 import argparse
@@ -21,6 +21,33 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kw
     return {"score": int.from_bytes(digest[:4], "little") / (2**32 - 1)}
 
 
+def make_rows(images=False):
+    rows = [
+        {
+            "data_source": "qwen38_synthetic_integration",
+            "prompt": [{"role": "user", "content": f"Say a short word about number {i}."}],
+            "ability": "synthetic_integration_only",
+            "reward_model": {"style": "rule", "ground_truth": "not_an_accuracy_test"},
+            "extra_info": {"index": i},
+        }
+        for i in range(16)
+    ]
+    if images:
+        from io import BytesIO
+
+        from PIL import Image
+
+        from tests.models.mcore.qwen38_vision_fixture import make_tiny_rgb
+
+        rgb = make_tiny_rgb()
+        for index, row in enumerate(rows):
+            encoded = BytesIO()
+            Image.fromarray(255 - rgb if index % 2 else rgb).save(encoded, format="PNG")
+            row["prompt"][0]["content"] = f"<image>Say a short word about this image and number {index}."
+            row["images"] = [{"bytes": encoded.getvalue(), "min_pixels": 4096, "max_pixels": 4096}]
+    return rows
+
+
 def main():
     import pandas as pd
     import torch
@@ -30,6 +57,7 @@ def main():
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--assets", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--images", action="store_true", help="Use synthetic RGB images with real processor assets")
     args = parser.parse_args()
     if args.output.exists():
         raise FileExistsError("Use a new output directory; do not overwrite a fixture or checkpoint")
@@ -66,19 +94,10 @@ def main():
         "generation_config.json",
     ):
         shutil.copy2(args.assets / name, model_dir / name)
-    rows = [
-        {
-            "data_source": "qwen38_synthetic_integration",
-            "prompt": [{"role": "user", "content": f"Say a short word about number {i}."}],
-            "ability": "synthetic_integration_only",
-            "reward_model": {"style": "rule", "ground_truth": "not_an_accuracy_test"},
-            "extra_info": {"index": i},
-        }
-        for i in range(16)
-    ]
+    rows = make_rows(images=args.images)
     pd.DataFrame(rows).to_parquet(args.output / "train.parquet", index=False)
     pd.DataFrame(rows[:4]).to_parquet(args.output / "val.parquet", index=False)
-    print(f"QWEN38_RANDOM_TRAINER_FIXTURE vocab={vocab} tensors={len(weights)} rows={len(rows)}")
+    print(f"QWEN38_RANDOM_TRAINER_FIXTURE vocab={vocab} tensors={len(weights)} rows={len(rows)} images={args.images}")
 
 
 if __name__ == "__main__":
