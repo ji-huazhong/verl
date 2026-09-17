@@ -58,17 +58,19 @@ def validate_runtime(config):
     if cp_size != 1:
         if cp_size != 2:
             raise NotImplementedError("Flash-Next model validation currently covers context_parallel_size=1 or 2")
-        if any(
-            (getattr(config, name, 1) or 1) != 1
-            for name in ("tensor_model_parallel_size", "pipeline_model_parallel_size", "expert_model_parallel_size")
-        ):
-            raise NotImplementedError("Flash-Next CP2 combined TP/PP/EP execution still requires validation")
+        tp_size = getattr(config, "tensor_model_parallel_size", 1) or 1
+        ep_size = getattr(config, "expert_model_parallel_size", 1) or 1
+        pp_size = getattr(config, "pipeline_model_parallel_size", 1) or 1
+        if pp_size != 1 or (tp_size, ep_size) not in ((1, 1), (2, 2)):
+            raise NotImplementedError("Flash-Next CP2 combined TP/PP/EP requires PP1 and TP1/EP1 or TP2/EP2")
+        if tp_size > 1 and not getattr(config, "sequence_parallel", False):
+            raise NotImplementedError("Flash-Next TP2/CP2 requires sequence_parallel=True")
         if not getattr(config, "calculate_per_token_loss", False):
             raise ValueError("Flash-Next CP requires calculate_per_token_loss=True")
         for name in ("linear_num_key_heads", "linear_num_value_heads"):
             count = getattr(config, name, 0)
-            if count < cp_size or count % cp_size:
-                raise ValueError(f"Flash-Next CP requires {name} to be divisible by context_parallel_size")
+            if count < tp_size * cp_size or count % (tp_size * cp_size):
+                raise ValueError(f"Flash-Next CP requires {name} to be divisible by TP * CP")
     if (
         getattr(config, "virtual_pipeline_model_parallel_size", None)
         and (getattr(config, "pipeline_model_parallel_size", 1) or 1) < 2

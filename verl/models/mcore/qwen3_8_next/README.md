@@ -118,7 +118,7 @@ These runs do not establish bitwise trajectory equivalence, effective learning,
 or real-checkpoint acceptance. The combined CPU suite passed 132 tests with five
 opt-in skips; the production-backward GPU fixture passed three tests.
 
-The trainer fixture also accepts `QWEN38_SMOKE_GPUS=2` (or 8) with exactly that
+The trainer fixture also accepts `QWEN38_SMOKE_GPUS=2`, 4 or 8 with exactly that
 many visible devices. It validates fixture dimensions and at least 10 GiB free
 on every device before launch. Ray CPU slots scale as `3 * GPUs + 16`:
 the actual resource pool reserves three CPU slots per GPU, and the tested
@@ -205,7 +205,7 @@ ETP=1, dense DP=1, expert DP=2; VPP=2 means two chunks per physical stage.
 Actual group collectives and virtual layer partition checks passed. Both model
 construction cases previously failed at the provider's PP1 guard. Dynamic-shape
 PP2/VPP2 is now separately tested with CP1 and overlap P2P. Standalone CP2 has
-the separate evidence below, but CP with TP/PP/EP remains explicitly guarded
+the separate evidence below, as does TP2/EP2/CP2; CP with PP/VPP remains guarded
 and the requested hybrid model gate is still red. It is not marked xfail and does not bypass
 the guards. No hybrid forward/backward, LoRA update or reload has run. Passing
 these construction tests in future will still not prove numerical or schedule
@@ -239,7 +239,7 @@ sparse/full-coverage budgets and full recompute. Forward gaps were zero; the
 largest relative LoRA gradient L2 error was 8.59e-6. Existing elementwise
 tolerances were not relaxed. This is not a full-model, DDP optimizer, hybrid
 TP/PP/EP/CP/VPP, or rollout CP test. The standalone full-model CP2 gate below
-provides separate evidence; combined schedules remain guarded.
+provides separate evidence; combined pipeline/context schedules remain guarded.
 
 ### PLE context-parallel component gate
 
@@ -312,7 +312,8 @@ six-token decode/prefill checks: base/adapter mean logprob gaps are
 
 Standalone CP2 is enabled only with TP/PP/EP=1, `calculate_per_token_loss=True`
 and CP-divisible GDN key/value head counts. CP4 is a component result only;
-CP>2 and combined TP/PP/EP/CP remain rejected. The DDP gate uses an explicitly
+CP>2 and CP combined with PP/VPP remain rejected. The TP2/EP2 extension is
+described below. The DDP gate uses an explicitly
 globally normalized synthetic objective and SUM reduction; it is not the
 production trainer's token-count normalization or effective RL learning.
 These are four-layer random text-model results, not full-checkpoint or visual CP
@@ -339,6 +340,56 @@ tests reproduce the old view error, verify exact restoration and subsequent
 backward, and check caller grad-mode restoration on success and failure.
 The new tests plus existing checkpoint-manager tests pass 43 cases; the full
 combined Flash-Next/checkpoint CPU collection passes 111 with 34 opt-in skips.
+After that fix, a fresh standalone CP2 trainer restored adapter, optimizer,
+scheduler and RNG, completed step 2 and saved optimizer/scheduler step 2. This
+does not establish bitwise trajectory equivalence with the uninterrupted run.
+
+### PLE SP gradient ownership and TP2/EP2/CP2
+
+PLE's sequence-parallel all-gather must reduce-scatter SUM its input gradient:
+each TP rank consumes different output rows, whose causal convolutions can
+read another rank's input rows. The original split-only backward silently lost
+those contributions despite correct forward outputs. This is a correctness
+fix, not a claimed throughput optimization; backward now includes a collective.
+The frozen QSA indexer's no-grad gather is a different contract and is unchanged.
+
+`test_qwen38_next_ple_sp_cp.py` sets loss only on the right SP output shard,
+requiring the left input shard to receive its nonzero convolution gradient.
+With `RUN_QWEN38_PLE_SP_CP_TESTS=1` and the original tiny fixture, run two
+workers for TP2/CP1 or four for TP2/CP2. The old implementation fails both
+topologies with relative input-gradient L2 error 1.0 on the left shard; the
+fixed implementation matches the reference exactly for two packed batches,
+ordinary/full recompute and queued-context cleanup. Failures are coordinated
+across ranks so a numerical negative control cannot strand peers in the next
+collective. Earlier finite-gradient/forward tests did not cover this invariant.
+
+The full model gate above also accepts `QWEN38_MODEL_TP=2 QWEN38_MODEL_EP=2`:
+use two workers for its independent CP1 reference, then four for CP2. It saves
+and compares each TP shard separately, gathering vocab-parallel logits before
+the globally normalized objective. Both TP/EP sizes remain fixed between these
+runs; this comparison does not claim TP1-to-TP2 gradient equivalence.
+Each rank passed the 48-LoRA-gradient ordinary/recompute, AdamW, frozen-base,
+adapter-disable and 78-tensor export checks. Maximum CP2/CP1 gradient relative
+L2 was 7.30e-8, with no relaxed gates. Base and initialized-adapter logprob gaps
+were zero; updated batch means were 0 and 0.000044384 (maximum 0.001970768).
+Independent TP1 vLLM passed both exports: base/adapter mean gaps were
+0.00061147/0.00066502, including disable/remove/reload and six-token decode.
+
+TP2/EP2/CP2 additionally requires sequence parallel, PP1, per-token loss and
+GDN key/value head counts divisible by TP*CP, not merely CP. Other TP/EP pairs,
+CP>2 and CP with pipeline stages remain rejected. These are random four-layer
+text-model gates, not the requested eight-rank TP2/PP2/EP2/CP2/VPP2 schedule,
+full-checkpoint execution, visual CP or effective RL learning. The current
+combined CPU regression has 111 passing tests and 35 opt-in skips.
+
+The separate four-GPU GRPO fixture also completed two steps and full saves with
+actor/reference TP2/EP2/CP2/PP1 and vLLM TP4/EP1. Set `QWEN38_SMOKE_GPUS=4`
+in the wrapper, override actor/ref TP=2, EP=2, CP=2, and use `token-mean` loss.
+This covers real HTTP rollout, token-count normalization, full recompute,
+sleep/wake and adapter sync across different training/rollout layouts.
+All 184 TensorBoard scalars were finite. Both checkpoints have world_size=4
+and four optimizer fragments, each at the matching step 1/2, with scheduler
+step 1/2. Saving and counter checks are not proof of actual restoration.
 
 The GPU suites enforce memory headroom and
 per-process allocation caps. Never evict another job to run them.
@@ -372,7 +423,8 @@ are not silently treated as equivalent; unsupported mappings fail explicitly.
 
 ## Important current boundaries
 
-- CP1, or standalone CP2 with the restrictions above; PP requires dynamic P2P shapes, and VPP additionally requires overlap
+- CP1, or CP2 with TP1/EP1 or TP2/EP2 and the restrictions above; CP with
+  PP/VPP remains guarded. PP requires dynamic P2P shapes, and VPP additionally requires overlap
   P2P. PP2/VPP2 is tested on the random fixture. TP/EP and complete-model PP still require full-model
   validation; HC residual width is not the ordinary hidden width.
 - Full-layer recompute only; no selective attention recompute, CUDA graphs,

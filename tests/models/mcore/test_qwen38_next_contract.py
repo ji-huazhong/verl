@@ -153,6 +153,19 @@ def test_cp_requires_valid_head_partition_and_per_token_loss():
         with pytest.raises(NotImplementedError, match="combined TP/PP/EP"):
             validate_runtime(config)
         setattr(config, name, 1)
+    config.tensor_model_parallel_size = config.expert_model_parallel_size = 2
+    config.sequence_parallel = True
+    validate_runtime(config)
+    config.sequence_parallel = False
+    with pytest.raises(NotImplementedError, match="sequence_parallel"):
+        validate_runtime(config)
+    config.sequence_parallel = True
+    for name in ("linear_num_key_heads", "linear_num_value_heads"):
+        original = getattr(config, name)
+        setattr(config, name, 2)  # Divisible by CP, but not by TP * CP.
+        with pytest.raises(ValueError, match=name):
+            validate_runtime(config)
+        setattr(config, name, original)
 
 
 def test_provider_preserves_virtual_chunk_identity(monkeypatch):

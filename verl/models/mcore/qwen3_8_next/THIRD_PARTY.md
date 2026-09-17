@@ -14,8 +14,11 @@ QSA additions include packed context-parallel projection/KV exchange,
 rectangular query/key tensor-core kernels, and explicit mapping from packed
 document blocks to physical key tiles. PLE additions include packed token
 metadata reconstruction, document-clipped causal convolution halos, FP32
-reverse-gradient accumulation, and context/recompute integration. Provider-level
-CP support remains guarded pending complete-model and mixed-topology validation.
+reverse-gradient accumulation, and context/recompute integration. SP input
+gradients sum all convolution consumers before scattering back to token owners;
+the original split-only backward is not used for this cross-token operation.
+Provider-level CP is enabled only for separately validated configurations;
+untested mixed pipeline/context topologies remain guarded.
 Refer to the repository LICENSE for the Apache License 2.0 terms.
 Upstream code is reference implementation evidence, not proof that the adapted
 training, weight export or LoRA path has passed end-to-end validation.

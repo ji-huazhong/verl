@@ -8,7 +8,7 @@ set -euo pipefail
 : "${QWEN38_RAY_TEMP:?Set a short, unique Ray temp directory}"
 : "${CUDA_VISIBLE_DEVICES:?Select the test GPUs with sufficient free memory}"
 export QWEN38_SMOKE_GPUS="${QWEN38_SMOKE_GPUS:-1}"
-case "$QWEN38_SMOKE_GPUS" in 1|2|8) ;; *) exit 2 ;; esac
+case "$QWEN38_SMOKE_GPUS" in 1|2|4|8) ;; *) exit 2 ;; esac
 # The production pool reserves three CPU slots per GPU before any workers
 # launch. The queue and trainer already consume nine CPU slots BEFORE the
 # placement group: 3*8+8 leaves only 23 for its required 24 and waits forever.

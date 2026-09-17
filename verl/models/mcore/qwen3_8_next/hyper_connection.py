@@ -244,7 +244,10 @@ class Qwen38NextPLEHyperConnection(Qwen38NextHyperConnection):
             local_seq = hidden_states.shape[0]
             full = gather_from_sequence_parallel_region(
                 hidden_states,
-                tensor_parallel_output_grad=False,
+                # Each rank consumes only its output rows, but PLE's causal
+                # convolution also reads other SP shards. Sum all consumers'
+                # input gradients before scattering them back to their owners.
+                tensor_parallel_output_grad=True,
                 group=get_tensor_model_parallel_group(),
             )
             updated = self._apply_ple(full, ngram_ids, cu_seqlens)

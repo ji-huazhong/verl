@@ -4,6 +4,8 @@
 Run CP1 first, then CP2 with QWEN38_MODEL_CP_REFERENCE=<CP1 output directory>.
 Both need RUN_QWEN38_MODEL_CP_TESTS=1, QWEN38_TINY_EXPORT_DIR=<original fixture>
 and a fresh QWEN38_MODEL_CP_OUTPUT. Exported artifacts stay outside the repo.
+Optional QWEN38_MODEL_TP=2 / QWEN38_MODEL_EP=2 uses two/four workers for
+CP1/CP2, comparing each TP shard with its matching independent CP1 baseline.
 The production provider guard is never bypassed or monkey-patched here.
 """
 
@@ -29,7 +31,10 @@ def model_context():
     from verl.models.mcore.patch import apply_patch_megatron_recomputation_backward
 
     size = int(os.environ.get("WORLD_SIZE", "0"))
-    assert size in (1, 2)
+    tp = int(os.environ.get("QWEN38_MODEL_TP", "1"))
+    ep = int(os.environ.get("QWEN38_MODEL_EP", str(tp)))
+    assert tp in (1, 2) and ep == tp and size in (tp, 2 * tp)
+    cp = size // tp
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)
     free, total = torch.cuda.mem_get_info()
@@ -42,10 +47,15 @@ def model_context():
         torch.distributed.all_reduce(enough, op=torch.distributed.ReduceOp.MIN)
         if not enough.item():
             pytest.skip("Every GPU needs 8 GiB free; never evict another job")
-        parallel_state.initialize_model_parallel(context_parallel_size=size)
+        parallel_state.initialize_model_parallel(
+            tensor_model_parallel_size=tp,
+            expert_model_parallel_size=ep,
+            expert_tensor_parallel_size=1,
+            context_parallel_size=cp,
+        )
         model_parallel_cuda_manual_seed(123)
         apply_patch_megatron_recomputation_backward()
-        yield size
+        yield tp, ep, cp
     finally:
         tensor_random.CheckpointFunction.backward = staticmethod(original_backward)
         torch.cuda.synchronize()
@@ -55,16 +65,18 @@ def model_context():
 
 def test_complete_model_packing_ddp_lora_recompute_and_export(model_context):
     try:
-        _run_model_case(model_context)
+        _run_model_case(*model_context)
     except Exception:
         traceback.print_exc()
         raise
 
 
-def _run_model_case(cp_size):
+def _run_model_case(tp_size, ep_size, cp_size):
     from megatron.bridge.peft.lora import LoRA
+    from megatron.core import parallel_state
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig, finalize_model_grads
     from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
     from megatron.core.transformer.module import Float16Module
     from safetensors.torch import load_file, save_file
 
@@ -76,18 +88,24 @@ def _run_model_case(cp_size):
     fixture = Path(os.environ["QWEN38_TINY_EXPORT_DIR"])
     output_dir = Path(os.environ["QWEN38_MODEL_CP_OUTPUT"])
     rank = torch.distributed.get_rank()
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    cp_rank = parallel_state.get_context_parallel_rank()
+    comparison_name = "comparison.safetensors" if tp_size == 1 else f"comparison-tp{tp_rank}.safetensors"
     assert not output_dir.exists(), "Use a fresh output directory; never overwrite prior evidence"
     baseline = None
     if cp_size > 1:
-        baseline = load_file(str(Path(os.environ["QWEN38_MODEL_CP_REFERENCE"]) / "comparison.safetensors"))
+        baseline = load_file(str(Path(os.environ["QWEN38_MODEL_CP_REFERENCE"]) / comparison_name))
     bridge = AutoBridge.from_hf_pretrained(fixture / "model", local_files_only=True)
     assert isinstance(bridge._model_bridge, Qwen38NextBridge)
     config = bridge.to_megatron_provider(load_weights=False)
     assert config.num_layers == 4 and config.hidden_size == 128
     config.context_parallel_size = cp_size
-    config.sequence_parallel = False
-    config.tensor_model_parallel_size = config.expert_model_parallel_size = config.expert_tensor_parallel_size = 1
+    config.sequence_parallel = tp_size > 1
+    config.tensor_model_parallel_size = tp_size
+    config.expert_model_parallel_size = ep_size
+    config.expert_tensor_parallel_size = 1
     config.moe_router_load_balancing_type = "none"
+    config.moe_token_dispatcher_type = "alltoall"
     config.moe_aux_loss_coeff = 0.0
     config.moe_permute_fusion = False
     config.params_dtype = torch.bfloat16
@@ -118,8 +136,10 @@ def _run_model_case(cp_size):
         nested = torch.nested.nested_tensor(docs, layout=torch.jagged)
         output = gptmodel_forward_model_engine(module, nested, multi_modal_inputs={}, vision_model=True, pad_token_id=0)
         assert [v.shape[0] for v in output.unbind()] == [v.numel() for v in docs]
-        assert output.shape[-1] == 256
-        return output.values()
+        assert output.shape[-1] * tp_size == 256
+        # Gather autograd splits the vocabulary gradient back to its owner;
+        # the full-vocabulary mean below is already normalized exactly once.
+        return gather_from_tensor_model_parallel_region(output.values(), group=config._pg_collection.tp)
 
     recorded = {}
 
@@ -140,7 +160,8 @@ def _run_model_case(cp_size):
             else:
                 gap = (detached.log_softmax(-1) - expected.log_softmax(-1)).abs()
                 print(
-                    f"QWEN38_MODEL_CP NAME={name} RANK={rank} GAP_MEAN={gap.mean():.9f} GAP_MAX={gap.max():.9f}",
+                    f"QWEN38_MODEL_CP TP={tp_size} EP={ep_size} CP={cp_size} NAME={name} "
+                    f"RANK={rank} GAP_MEAN={gap.mean():.9f} GAP_MAX={gap.max():.9f}",
                     flush=True,
                 )
                 assert gap.mean() < 0.005 and gap.max() < 0.05
@@ -200,7 +221,9 @@ def _run_model_case(cp_size):
                 torch.testing.assert_close(value, normal_grads[name], rtol=0.02, atol=2e-5)
         normal_grads = grads
         print(
-            f"QWEN38_MODEL_CP_DDP_GRADS CP={cp_size} RANK={rank} RECOMPUTE={recompute} TENSORS={len(grads)}", flush=True
+            f"QWEN38_MODEL_CP_DDP_GRADS TP={tp_size} EP={ep_size} CP={cp_size} RANK={rank} "
+            f"RECOMPUTE={recompute} TENSORS={len(grads)}",
+            flush=True,
         )
     optimizer = torch.optim.AdamW(list(trainable.values()), lr=1e-2)
     for parameter in trainable.values():
@@ -230,7 +253,6 @@ def _run_model_case(cp_size):
             base_logits = forward(mixed, [ids])
     if rank == 0:
         output_dir.mkdir(parents=True, exist_ok=False)
-        save_file(recorded, str(output_dir / "comparison.safetensors"))
         (output_dir / "model").mkdir()
         (output_dir / "adapter").mkdir()
         bridge.hf_pretrained.config.save_pretrained(output_dir / "model")
@@ -248,4 +270,7 @@ def _run_model_case(cp_size):
             str(output_dir / "reference.safetensors"),
         )
     torch.distributed.barrier()
-    print(f"QWEN38_MODEL_CP_EXPORT_PASSED CP={cp_size} RANK={rank} TENSORS=78", flush=True)
+    if cp_rank == 0:
+        save_file(recorded, str(output_dir / comparison_name))
+    torch.distributed.barrier()
+    print(f"QWEN38_MODEL_CP_EXPORT_PASSED TP={tp_size} EP={ep_size} CP={cp_size} RANK={rank} TENSORS=78", flush=True)
