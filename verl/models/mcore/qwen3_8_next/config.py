@@ -55,8 +55,15 @@ def validate_runtime(config):
         raise NotImplementedError("Flash-Next PP requires variable_seq_lengths=True for HC P2P shapes")
     if (getattr(config, "context_parallel_size", 1) or 1) != 1:
         raise NotImplementedError("Flash-Next currently requires context_parallel_size=1")
-    if getattr(config, "virtual_pipeline_model_parallel_size", None):
-        raise NotImplementedError("Flash-Next interleaved pipeline scheduling is not implemented")
+    if (
+        getattr(config, "virtual_pipeline_model_parallel_size", None)
+        and (getattr(config, "pipeline_model_parallel_size", 1) or 1) < 2
+    ):
+        raise NotImplementedError("Flash-Next interleaved pipeline requires at least two physical stages")
+    if getattr(config, "virtual_pipeline_model_parallel_size", None) and not getattr(config, "overlap_p2p_comm", False):
+        raise NotImplementedError(
+            "Flash-Next VPP requires overlap_p2p_comm=True; synchronous dynamic P2P backward is not validated"
+        )
     if getattr(config, "mtp_num_layers", None):
         raise NotImplementedError("Flash-Next MTP is not part of the current policy implementation")
     if getattr(config, "cuda_graph_impl", "none") not in (None, "none"):

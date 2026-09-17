@@ -97,7 +97,7 @@ def test_unsupported_runtime_fails_early(field, value):
         validate_runtime(config)
 
 
-def test_non_interleaved_pipeline_requires_dynamic_shape_protocol():
+def test_pipeline_requires_dynamic_shapes_and_vpp_overlap():
     config = SimpleNamespace(
         num_residual_streams=4,
         qwen3_8_next_indexer_kv_heads=1,
@@ -115,8 +115,39 @@ def test_non_interleaved_pipeline_requires_dynamic_shape_protocol():
         validate_runtime(config)
     config.context_parallel_size = 1
     config.virtual_pipeline_model_parallel_size = 2
-    with pytest.raises(NotImplementedError, match="interleaved"):
+    for batched in (False, True):
+        config.batch_p2p_comm = batched
+        with pytest.raises(NotImplementedError, match="overlap_p2p_comm"):
+            validate_runtime(config)
+    config.batch_p2p_comm = False
+    config.overlap_p2p_comm = True
+    validate_runtime(config)
+    config.pipeline_model_parallel_size = 1
+    with pytest.raises(NotImplementedError, match="two physical stages"):
         validate_runtime(config)
+
+
+def test_provider_preserves_virtual_chunk_identity(monkeypatch):
+    pytest.importorskip("megatron.bridge")
+    from verl.models.mcore.qwen3_8_next import provider
+
+    config = SimpleNamespace(
+        num_residual_streams=4,
+        qwen3_8_next_indexer_kv_heads=1,
+        pipeline_model_parallel_size=2,
+        virtual_pipeline_model_parallel_size=2,
+        variable_seq_lengths=True,
+        overlap_p2p_comm=True,
+    )
+    # Exercise the actual override without allocating model parameters.
+    model = torch.nn.Module()
+    model.vp_stage = None
+    monkeypatch.setattr(provider.Qwen35VLMoEModelProvider, "provide", lambda *args: model)
+    for stage in (0, 1):
+        # The concrete provider is needed for super().
+        fake = object.__new__(provider.Qwen38NextModelProvider)
+        fake.__dict__.update(config.__dict__)
+        assert fake.provide(False, False, stage).vp_stage == stage
 
 
 @pytest.mark.parametrize("load_format", ["dummy", "pt", None])

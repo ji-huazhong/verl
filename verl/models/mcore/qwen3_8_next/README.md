@@ -143,9 +143,30 @@ on three microbatches (16/13/7 tokens). It checks receive shapes of
 `[tokens, 1, 256]` and compares logprobs with the unpartitioned fixture reference;
 all three mean/max gaps were zero. Launch it under two torchrun workers with
 `RUN_QWEN38_PIPELINE_TESTS=1` and the original `QWEN38_TINY_EXPORT_DIR`.
-The tested PLE layer belongs to the first stage. This does not validate later
-PLE placement, PP>2, multimodal PP, CP, VPP or their combined topology.
+The tested PLE layer belongs to the first stage. This initial result does not
+validate PP>2, multimodal PP, CP or their combined topology.
 The final combined CPU regression passed 133 tests with six opt-in skips.
+
+The pipeline gate now also accepts `QWEN38_PIPELINE_VPP=2` and defaults to
+overlap P2P, matching the production engine. It constructs two real chunks per
+rank, checks global layer identities and HC receive shapes, and compares four
+variable-length microbatches (16/13/7/11 tokens) with the unpartitioned reference.
+The initial overlap run had zero mean/max logprob gaps and passed no-recompute
+versus full-recompute LoRA gradient checks (24 gradient tensors per rank).
+Here the PLE layer is on physical rank 1, chunk 0, not the embedding stage.
+The same production trainer completed two PP2/VPP2 steps and independently
+resumed step 1 to step 2, including adapter/optimizer/scheduler/RNG loading and
+checkpoint saving. Saved optimizer shards and scheduler counters were all 2.
+These remain random four-layer, text-only results, not full-checkpoint acceptance.
+
+Synchronous VPP with dynamic P2P did not complete backward in bounded tests,
+with either unbatched or batched communication. Removing synchronous host
+copies from the test did not resolve the wait. Its root cause is still open;
+VPP therefore requires `overlap_p2p_comm=True` and rejects the unvalidated path
+before model allocation. No shared Core implementation is patched.
+The final overlap gate additionally checks exact receive-shape multiplicities;
+both ranks passed (35.27/35.44 seconds), with the same zero reference gaps and
+24 gradient tensors each. The final CPU suite passed 134 tests with six skips.
 
 `test_qwen38_next_parallel.py` consumes the same exported fixture through the
 real AutoBridge HF import path. A 128-tensor exact round trip and TP1/TP2-EP2
@@ -178,12 +199,12 @@ RUN_QWEN38_HYBRID_TESTS=1 QWEN38_TINY_EXPORT_DIR=/path/to/tiny-fixture \
 ETP=1, dense DP=1, expert DP=2; VPP=2 means two chunks per physical stage.
 Actual group collectives and virtual layer partition checks passed. Both model
 construction cases previously failed at the provider's PP1 guard. Dynamic-shape
-non-interleaved PP2 is now separately tested, but CP and VPP remain explicitly
+PP2/VPP2 is now separately tested with CP1 and overlap P2P, but CP remains explicitly
 unsupported and the requested hybrid model gate is still red. It is not marked xfail and does not bypass
 the guards. No hybrid forward/backward, LoRA update or reload has run. Passing
 these construction tests in future will still not prove numerical or schedule
-correctness; HC P2P widths, global CP contexts and chunk/microbatch-keyed PLE
-recompute state need their own integration validation.
+correctness; global CP contexts and the full combined schedule still need their
+own integration validation. The per-layer PLE FIFO is not shared across chunks.
 
 The GPU suites enforce memory headroom and
 per-process allocation caps. Never evict another job to run them.
@@ -217,13 +238,13 @@ are not silently treated as equivalent; unsupported mappings fail explicitly.
 
 ## Important current boundaries
 
-- CP1 and no VPP; non-interleaved PP requires dynamic P2P shapes, with PP2 tested
-  on the random fixture. TP/EP and complete-model PP still require full-model
+- CP1; PP requires dynamic P2P shapes, and VPP additionally requires overlap
+  P2P. PP2/VPP2 is tested on the random fixture. TP/EP and complete-model PP still require full-model
   validation; HC residual width is not the ordinary hidden width.
 - Full-layer recompute only; no selective attention recompute, CUDA graphs,
   or activation offloading in this first implementation.
-- One packed stream per microbatch; independently keyed multiple PLE layers,
-  padding gaps, and interleaved PP are not implemented.
+- One packed stream per microbatch; independently keyed multiple PLE layers
+  and padding gaps are not implemented. Synchronous VPP remains guarded.
 - MTP is explicitly disabled for the GRPO policy.
 - The frozen PLE host table and hash metadata load directly from the original
   checkpoint and are excluded from ordinary actor weight export. **Rollout

@@ -92,5 +92,9 @@ class Qwen38NextModelProvider(Qwen35VLMoEModelProvider):
     def provide(self, pre_process=None, post_process=None, vp_stage=None):
         validate_runtime(self)
         model = super().provide(pre_process, post_process, vp_stage)
+        # Bridge passes vp_stage to the language decoder but drops it on the
+        # outer VL wrapper. Core's schedule, PEFT and verl inspect this root
+        # attribute to distinguish virtual chunks on the same physical rank.
+        model.vp_stage = vp_stage
         install_ple_context_hooks(model)
         return model

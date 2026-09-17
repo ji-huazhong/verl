@@ -183,9 +183,10 @@ class Qwen38NextPLEHyperConnection(Qwen38NextHyperConnection):
         checkpointed original pass (is_checkpointing() and grads disabled) the
         batch is also enqueued; the recompute pass (is_checkpointing() and grads
         enabled) pops from the queue instead of reading the channel. Plain
-        no-checkpoint forwards just read the channel. FIFO matches non-interleaved
-        1F1B's backward order; interleaved VPP would need a smarter key, and this
-        model rejects VPP in the spec anyway.
+        no-checkpoint forwards just read the channel. Core's non-interleaved and
+        interleaved schedules both consume input/output tensors FIFO *within
+        each model chunk*. Each chunk owns distinct layer instances, hence its
+        own queue; sharing this queue across virtual chunks would be incorrect.
         """
 
         if not hasattr(self, "_ple_recompute_fifo"):
@@ -196,7 +197,7 @@ class Qwen38NextPLEHyperConnection(Qwen38NextHyperConnection):
                 raise RuntimeError(
                     "PLE recompute ran with no queued n-gram batch; the checkpointed "
                     "original pass did not enqueue (or the recompute order diverged "
-                    "from FIFO, e.g. interleaved VPP)."
+                    "from this model chunk's FIFO)."
                 )
             return self._ple_recompute_fifo.pop(0)
 
