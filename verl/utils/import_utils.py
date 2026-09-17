@@ -88,6 +88,25 @@ def import_external_libs(external_libs=None):
         importlib.import_module(external_lib)
 
 
+def validate_external_model_rollout_config(model_config, rollout_config):
+    """Run optional model-plugin rollout contracts before starting the engine.
+
+    An explicitly configured external model module may expose
+    ``validate_verl_rollout(model_config, rollout_config)``. The hook must raise
+    for incompatible settings rather than silently changing the user's config.
+    Modules without this hook retain their existing behavior.
+    """
+    external_libs = getattr(model_config, "external_lib", None)
+    if external_libs is None:
+        return
+    if isinstance(external_libs, str):
+        external_libs = [external_libs]
+    for module_name in external_libs:
+        hook = getattr(importlib.import_module(module_name), "validate_verl_rollout", None)
+        if hook is not None:
+            hook(model_config, rollout_config)
+
+
 def resolve_config_path(config_path: str) -> str:
     """Resolve agent loop configuration file path.
 

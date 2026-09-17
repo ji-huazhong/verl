@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from verl.models.mcore.qwen3_8_next.config import validate_runtime
+from verl.models.mcore.qwen3_8_next.config import validate_rollout, validate_runtime
 from verl.models.mcore.qwen3_8_next.ops.sequence import apply_indexer_rope, packed_token_segments
 
 
@@ -65,6 +65,60 @@ def test_unsupported_runtime_fails_early(field, value):
     setattr(config, field, value)
     with pytest.raises(NotImplementedError):
         validate_runtime(config)
+
+
+@pytest.mark.parametrize("load_format", ["dummy", "pt", None])
+def test_frozen_ple_rejects_non_checkpoint_rollout(load_format):
+    hf = SimpleNamespace(model_type="qwen4_exp", text_config=SimpleNamespace(ple_layer_ids=[2]))
+    with pytest.raises(ValueError, match="frozen PLE"):
+        validate_rollout(hf, SimpleNamespace(load_format=load_format))
+
+
+@pytest.mark.parametrize("key", ["load_format", "load-format"])
+def test_frozen_ple_cannot_bypass_guard_via_engine_kwargs(key):
+    hf = SimpleNamespace(model_type="qwen4_exp", text_config=SimpleNamespace(ple_layer_ids=[2]))
+    rollout = SimpleNamespace(load_format="auto", engine_kwargs={"vllm": {key: "dummy"}})
+    with pytest.raises(ValueError, match="frozen PLE"):
+        validate_rollout(hf, rollout)
+
+
+def test_frozen_ple_allows_real_base_loading():
+    hf = SimpleNamespace(model_type="qwen4_exp", text_config=SimpleNamespace(ple_layer_ids=[2]))
+    for load_format in ("auto", "safetensors"):
+        validate_rollout(hf, SimpleNamespace(load_format=load_format))
+    validate_rollout(SimpleNamespace(model_type="different_architecture"), SimpleNamespace(load_format="dummy"))
+
+
+def test_rollout_calls_explicit_model_plugin_contract(monkeypatch):
+    import sys
+    from types import ModuleType
+
+    from verl.utils.import_utils import validate_external_model_rollout_config
+
+    plugin = ModuleType("test_model_contract_plugin")
+    calls = []
+    plugin.validate_verl_rollout = lambda model, rollout: calls.append((model, rollout))
+    monkeypatch.setitem(sys.modules, plugin.__name__, plugin)
+    model, rollout = SimpleNamespace(external_lib=plugin.__name__), SimpleNamespace()
+    validate_external_model_rollout_config(model, rollout)
+    assert calls == [(model, rollout)]
+    del plugin.validate_verl_rollout
+    validate_external_model_rollout_config(model, rollout)  # Existing import-only plugins unchanged.
+
+
+def test_actual_vllm_server_validation_rejects_dummy_before_engine_allocation():
+    pytest.importorskip("vllm")
+    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
+
+    # Exercise the real server method without __init__, Ray, or GPU allocation.
+    server = object.__new__(vLLMHttpServer)
+    server.model_config = SimpleNamespace(
+        external_lib="verl.models.mcore.qwen3_8_next.bridge",
+        hf_config=SimpleNamespace(model_type="qwen4_exp", text_config=SimpleNamespace(ple_layer_ids=[2])),
+    )
+    server.config = SimpleNamespace(load_format="dummy")
+    with pytest.raises(ValueError, match="frozen PLE"):
+        server._validate_configs()
 
 
 def test_qsa_compression_respects_packed_boundaries():

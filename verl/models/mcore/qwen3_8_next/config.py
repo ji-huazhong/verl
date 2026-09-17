@@ -67,3 +67,21 @@ def validate_runtime(config):
         raise ValueError("Flash-Next requires multiple residual streams")
     if getattr(config, "qwen3_8_next_indexer_kv_heads", None) != 1:
         raise ValueError("QSA kernels require one indexer KV head")
+
+
+def validate_rollout(hf_config, rollout_config):
+    """The actor exporter omits immutable PLE storage; rollout must load it."""
+    if getattr(hf_config, "model_type", None) != "qwen4_exp":
+        return
+    if not getattr(hf_config.text_config, "ple_layer_ids", None):
+        return
+    engine_options = getattr(rollout_config, "engine_kwargs", {}) or {}
+    vllm_options = engine_options.get("vllm", {}) or {}
+    formats = [getattr(rollout_config, "load_format", None)]
+    formats.extend(vllm_options[key] for key in ("load_format", "load-format") if key in vllm_options)
+    if any(value not in ("auto", "safetensors") for value in formats):
+        raise ValueError(
+            "Flash-Next's frozen PLE table is not exported by actor weight sync. "
+            "Use rollout.load_format=auto or safetensors with the original complete "
+            "base checkpoint; dummy loading and engine_kwargs overrides are unsafe."
+        )

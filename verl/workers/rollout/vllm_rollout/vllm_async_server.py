@@ -1059,6 +1059,9 @@ class vLLMHttpServer:
 
     def _validate_configs(self) -> None:
         """Validate config/model_config after initialisation."""
+        from verl.utils.import_utils import validate_external_model_rollout_config
+
+        validate_external_model_rollout_config(self.model_config, self.config)
         max_position_embeddings = get_max_position_embeddings(self.model_config.hf_config)
         if self.config.max_model_len is None:
             self.config.max_model_len = max_position_embeddings

@@ -14,12 +14,17 @@ from transformers import AutoConfig
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from vllm.models.qwen4_exp.config import Qwen4ExpConfig, Qwen4ExpTextConfig
 
-from .config import apply_flash_next_config
+from .config import apply_flash_next_config, validate_rollout
 from .provider import Qwen38NextModelProvider
 
 for config_cls in (Qwen4ExpConfig, Qwen4ExpTextConfig):
     if config_cls.model_type not in CONFIG_MAPPING:
         AutoConfig.register(config_cls.model_type, config_cls)
+
+
+def validate_verl_rollout(model_config, rollout_config):
+    """Model-plugin contract consumed by the rollout server before allocation."""
+    validate_rollout(model_config.hf_config, rollout_config)
 
 
 @MegatronModelBridge.register_bridge(
