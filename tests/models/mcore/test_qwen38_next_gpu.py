@@ -32,7 +32,16 @@ def gpu_context():
 
     parallel_state.initialize_model_parallel()
     model_parallel_cuda_manual_seed(123)
+    # The production engine replaces Core's checkpoint backward. Exercising
+    # only the unpatched Core path missed its checkpoint-state regression.
+    from megatron.core.tensor_parallel import random as tensor_random
+
+    from verl.models.mcore.patch import apply_patch_megatron_recomputation_backward
+
+    original_backward = tensor_random.CheckpointFunction.backward
+    apply_patch_megatron_recomputation_backward()
     yield
+    tensor_random.CheckpointFunction.backward = staticmethod(original_backward)
     torch.cuda.synchronize()
     print(f"QWEN38_GPU_PEAK_ALLOCATED_MIB={torch.cuda.max_memory_allocated() / 1024**2:.1f}")
     parallel_state.destroy_model_parallel()

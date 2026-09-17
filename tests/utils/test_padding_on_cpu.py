@@ -11,11 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import pickle
 import random
 
+import pytest
 import torch
 from tensordict import TensorDict
 
+from verl.utils import tensordict_utils as tu
 from verl.workers.utils.padding import (
     build_attention_mask_from_nested,
     embeds_padding_2_no_padding,
@@ -24,6 +27,65 @@ from verl.workers.utils.padding import (
     response_from_nested,
     response_to_nested,
 )
+
+
+@pytest.mark.parametrize("axes", [3, 4])
+@pytest.mark.parametrize("lengths", [[7, 7, 7], [5, 7, 6]])
+@pytest.mark.parametrize("serialize", [False, True])
+def test_mrope_padding_uses_sequence_ragged_axis(axes, lengths, serialize):
+    """Equal lengths must not make the mRoPE axes become the ragged dimension."""
+    batch, width = len(lengths), max(lengths) + 2
+    positions = torch.arange(batch * axes * width).reshape(batch, axes, width)
+    mask = torch.zeros(batch, width, dtype=torch.long)
+    for i, length in enumerate(lengths):
+        mask[i, 1 : length + 1] = 1
+    data = TensorDict(
+        {
+            "input_ids": torch.arange(batch * width).reshape(batch, width),
+            "attention_mask": mask,
+            "response_mask": torch.ones(batch, 2, dtype=torch.long),
+            "position_ids": positions,
+        },
+        batch_size=[batch],
+    )
+    data = left_right_2_no_padding(data)
+    if serialize:
+        data = pickle.loads(pickle.dumps(data.consolidate()))
+    tu.maybe_fix_3d_position_ids(data)
+    selected = tu.index_select_tensor_dict(data, [2, 0])
+    assert selected["position_ids"].shape[1] == axes
+    assert selected["position_ids"].offsets().diff().tolist() == [lengths[2], lengths[0]]
+    for actual, index in zip(selected["position_ids"].unbind(), [2, 0], strict=True):
+        torch.testing.assert_close(actual, positions[index, :, mask[index].bool()], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("axes", [3, 4])
+@pytest.mark.parametrize("lengths", [[93] * 8, [91, 93, 92, 93, 91, 93, 92, 93]])
+@pytest.mark.parametrize("serialize", [False, True])
+def test_mrope_transferqueue_packing_uses_sequence_ragged_axis(axes, lengths, serialize):
+    """Exercise the actual TQ packer: equal-length samples infer jagged axes."""
+    manager = pytest.importorskip("transfer_queue.storage.managers.simple_storage_manager").AsyncSimpleStorageManager
+    positions = [torch.arange(axes * length).reshape(axes, length) + i for i, length in enumerate(lengths)]
+    data = TensorDict({"position_ids": manager._pack_field_values(positions)}, batch_size=[len(lengths)])
+    if serialize:
+        data = pickle.loads(pickle.dumps(data.consolidate()))
+    tu.maybe_fix_3d_position_ids(data)
+    tu.maybe_fix_3d_position_ids(data)  # Worker and engine both normalize; must be idempotent.
+    selected = tu.index_select_tensor_dict(data, [2, 0])
+    assert selected["position_ids"].shape[1] == axes
+    assert selected["position_ids"].offsets().diff().tolist() == [lengths[2], lengths[0]]
+    for actual, index in zip(selected["position_ids"].unbind(), [2, 0], strict=True):
+        torch.testing.assert_close(actual, positions[index], rtol=0, atol=0)
+
+
+def test_mrope_ambiguous_serialization_fails_closed():
+    positions = tu.nested_tensor_from_tensor_list([torch.arange(8).reshape(4, 2)] * 2)
+    data = TensorDict({"position_ids": positions}, batch_size=[2])
+    data = pickle.loads(pickle.dumps(data.consolidate()))
+    if data["position_ids"]._ragged_idx == 2:
+        pytest.skip("Installed TensorDict preserves jagged_dim")
+    with pytest.raises(ValueError, match="Ambiguous serialized mRoPE"):
+        tu.maybe_fix_3d_position_ids(data)
 
 
 def test_padding_conversion_with_log_probs():

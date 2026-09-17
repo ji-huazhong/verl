@@ -28,6 +28,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.lora.merge=False \
     'actor_rollout_ref.model.lora.target_modules=[language_model.decoder.layers.*.self_attention.linear_qkv,language_model.decoder.layers.*.self_attention.linear_proj,language_model.decoder.layers.*.self_attention.in_proj,language_model.decoder.layers.*.self_attention.out_proj,language_model.decoder.layers.*.mlp.*.linear_fc1,language_model.decoder.layers.*.mlp.*.linear_fc2]' \
     actor_rollout_ref.actor.optim.lr=1e-5 \
+    actor_rollout_ref.actor.optim.use_checkpoint_opt_param_scheduler=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=8 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=1024 \

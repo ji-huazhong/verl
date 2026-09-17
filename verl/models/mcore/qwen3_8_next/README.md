@@ -84,6 +84,40 @@ This is TP1 text-only transport/loader integration, not the HTTP server, a live
 Megatron actor/optimizer, sleep/wake, distributed rollout, or complete GRPO.
 The hashes cover named base parameters, not every buffer or host PLE table.
 
+The actual trainer has a separate **random-model** smoke fixture:
+
+```bash
+python tests/models/mcore/prepare_qwen38_next_trainer_fixture.py \
+  --fixture /path/to/tiny-export --assets /path/to/real-checkpoint \
+  --output /path/to/new-trainer-fixture
+
+CUDA_VISIBLE_DEVICES=0 QWEN38_TRAINER_FIXTURE=/path/to/new-trainer-fixture \
+  QWEN38_SMOKE_OUTPUT=/path/to/new-run QWEN38_RAY_TEMP=/tmp/q38-smoke \
+  bash tests/models/mcore/run_qwen38_next_trainer_fixture.sh
+```
+
+This uses four random layers, real tokenizer/processor assets, a 248320-entry
+vocabulary, and a deterministic synthetic reward (not math accuracy). It runs
+the production Megatron/GRPO trainer, HTTP vLLM, TransferQueue, full recompute,
+sleep/wake, optimizer, and multi-bucket adapter updates at TP1. Two bugs surfaced
+only in this path: the production backward patch omitted Core's checkpoint
+marker, and nested mRoPE tensors lost their semantic ragged axis in transport.
+Both have generic fixes and negative/positive regressions; the GPU fixture now
+also exercises the production backward patch rather than only native Core.
+
+The first successful step saved model/optimizer/extra. With
+`QWEN38_RESUME_FROM=/path/to/previous-run/checkpoints/global_step_1`, a fresh
+trainer loaded adapter, optimizer and RNG, completed step 2, saved another
+complete checkpoint, and exited 0. Its grad norm was 0.27648; this proves tiny
+trainer execution, not yet complete state restoration: auditing that first run
+found the default configuration skipped LR scheduler loading. The recipe now
+explicitly enables `use_checkpoint_opt_param_scheduler`. A separate run from
+scratch completed both steps; another resume loaded all four states and saved
+optimizer step 2 and scheduler step 2, matching the uninterrupted counters.
+These runs do not establish bitwise trajectory equivalence, effective learning,
+or real-checkpoint acceptance. The combined CPU suite passed 132 tests with five
+opt-in skips; the production-backward GPU fixture passed three tests.
+
 `test_qwen38_next_parallel.py` consumes the same exported fixture through the
 real AutoBridge HF import path. A 128-tensor exact round trip and TP1/TP2-EP2
 base forward parity have passed (TP2 mean/max logprob gap 0.00033432/0.00201797).

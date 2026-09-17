@@ -177,9 +177,9 @@ def nested_tensor_from_tensor_list(tensors: list[torch.Tensor], ragged_idx: int 
     offsets = torch.zeros(len(tensors) + 1, dtype=torch.long, device=values.device)
     torch.cumsum(lengths, dim=0, out=offsets[1:])
 
-    nested_tensor = torch.nested.nested_tensor_from_jagged(values=values, offsets=offsets)
-    nested_tensor._ragged_idx = ragged_idx
-    return nested_tensor
+    # Set the ragged dimension at construction so shape/stride metadata agrees
+    # with offsets. Mutating only _ragged_idx afterwards leaves stale metadata.
+    return torch.nested.nested_tensor_from_jagged(values=values, offsets=offsets, jagged_dim=ragged_idx)
 
 
 def concat_nested_tensors(tensors: list[torch.Tensor]) -> torch.Tensor:
@@ -908,11 +908,29 @@ def contiguous(data: TensorDict) -> TensorDict:
 
 
 def maybe_fix_3d_position_ids(data: TensorDict):
-    # note for tensordict with pickle/unpickle. nested tensor in tensordict after consolidate and pickle/unpickle
-    # will incur indexing error for ragged tensor. This only happens when using 3D position ids in VLMs.
-    # This is likely a bug in tensordict. As a workaround, we manually set _ragged_index.
+    # Transport packers may infer jagged dim 1 for equal-length [axes, sequence]
+    # samples. Changing _ragged_idx alone then interprets axes-sized offsets as
+    # sequence lengths. Repack the intact samples with the semantic ragged axis,
+    # updating values, offsets and shape metadata together.
     if "position_ids" in data.keys() and data["position_ids"].dim() == 3 and data["position_ids"].is_nested:
-        data["position_ids"]._ragged_idx = 2
+        position_ids = data["position_ids"]
+        if getattr(position_ids, "_ragged_idx", None) != 2:
+            if position_ids.layout == torch.jagged:
+                values, offsets = position_ids.values(), position_ids.offsets()
+                end = offsets[-1].item()
+                # Some TensorDict serialization versions reset jagged_dim to 1
+                # but retain the sequence-concatenated buffer and offsets.
+                matches_axes, matches_sequence = end == values.shape[0], end == values.shape[1]
+                if matches_axes and matches_sequence and len(offsets) > 2:
+                    raise ValueError("Ambiguous serialized mRoPE ragged axis; refusing to reinterpret positions")
+                if not matches_axes and not matches_sequence:
+                    raise ValueError("Invalid serialized mRoPE offsets for the packed values")
+                if matches_sequence and not matches_axes:
+                    data["position_ids"] = torch.nested.nested_tensor_from_jagged(
+                        values, offsets, lengths=position_ids.lengths(), jagged_dim=2
+                    )
+                    return
+            data["position_ids"] = nested_tensor_from_tensor_list(list(position_ids.unbind()), ragged_idx=2)
 
 
 def list_of_dict_to_tensordict(list_of_dicts: list[dict[str, Any]]) -> TensorDict:

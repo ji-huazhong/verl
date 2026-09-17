@@ -604,8 +604,7 @@ def apply_patch_megatron_recomputation_backward():
     gather_split_1d_tensor = rd.gather_split_1d_tensor
     safely_set_viewless_tensor_data = rd.safely_set_viewless_tensor_data
 
-    @staticmethod
-    def patch_backward(ctx, *args):
+    def backward_impl(ctx, *args):
         """Backward pass."""
         if not torch.autograd._is_checkpoint_valid():
             raise RuntimeError("Checkpointing is not compatible with .grad(), please use .backward() if possible")
@@ -667,5 +666,23 @@ def apply_patch_megatron_recomputation_backward():
                         t.grad.untyped_storage().resize_(0)
         # ctx.saved_tensors = None
         return (None, None) + grads
+
+    @staticmethod
+    def patch_backward(ctx, *args):
+        # Preserve Core's recompute marker: model-side contexts (e.g. PLE)
+        # distinguish backward replay from a fresh forward using this flag.
+        # Older Core versions without this API retain the previous behavior.
+        is_checkpointing = getattr(rd, "is_checkpointing", None)
+        if is_checkpointing is None:
+            return backward_impl(ctx, *args)
+        was_checkpointing = is_checkpointing()
+        rd._set_checkpointing()
+        try:
+            return backward_impl(ctx, *args)
+        finally:
+            if was_checkpointing:
+                rd._set_checkpointing()
+            else:
+                rd._unset_checkpointing()
 
     rd.CheckpointFunction.backward = patch_backward
