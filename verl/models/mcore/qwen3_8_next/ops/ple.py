@@ -221,24 +221,41 @@ class Qwen38NextFrozenNGramEmbedding(MegatronModule):
         self.row_start = self.shard_ids[0] * self.rows_per_shard
         self.row_end = (self.shard_ids[-1] + 1) * self.rows_per_shard
 
+        # Bridge's structural inspection uses meta initialization. An explicit
+        # CPU device would escape that context and allocate the full pinned
+        # table (over 100 GB for the public checkpoint) without loading weights.
+        # This instance is inspection-only: Module.to_empty cannot materialize
+        # an unregistered host table, so loading/forward must fail closed.
+        meta_init = getattr(config, "init_model_with_meta_device", False) or torch.empty(0).is_meta
         self.table = torch.empty(
             (self.row_end - self.row_start, self.embedding_dim),
             dtype=torch.bfloat16,
-            device="cpu",
-            pin_memory=True,
+            device="meta" if meta_init else "cpu",
+            pin_memory=not meta_init,
         )
         self._loaded = False
         self._hf_checkpoint = getattr(config, "qwen3_8_next_hf_checkpoint", None)
 
-        self.register_buffer("layer_multipliers", torch.zeros(self.ngram_size, dtype=torch.long), persistent=False)
-        self.register_buffer("ngram_heads_vocab_sizes", torch.zeros(heads, dtype=torch.long), persistent=False)
-        self.register_buffer("ngram_heads_offsets", torch.zeros(heads, dtype=torch.long), persistent=False)
+        metadata_device = "meta" if meta_init else None
+        self.register_buffer(
+            "layer_multipliers",
+            torch.zeros(self.ngram_size, dtype=torch.long, device=metadata_device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "ngram_heads_vocab_sizes", torch.zeros(heads, dtype=torch.long, device=metadata_device), persistent=False
+        )
+        self.register_buffer(
+            "ngram_heads_offsets", torch.zeros(heads, dtype=torch.long, device=metadata_device), persistent=False
+        )
 
-        if self._hf_checkpoint is not None:
+        if self._hf_checkpoint is not None and not meta_init:
             self.load_metadata_from_hf(self._hf_checkpoint)
 
     def load_metadata_from_hf(self, hf_checkpoint: str) -> None:
         """Load the three integer tensors that parameterise the hash."""
+        if self.table.is_meta:
+            raise RuntimeError("PLE meta instance is inspection-only; reconstruct with real initialization to load")
         index = _weight_map(hf_checkpoint)
         prefix = f"model.language_model.layers.{self.hf_layer_index}.ple.ple_embedding"
         cache: dict = {}
@@ -255,6 +272,8 @@ class Qwen38NextFrozenNGramEmbedding(MegatronModule):
     def load_from_hf(self, hf_checkpoint: str) -> None:
         """Fill the table from the HF safetensors."""
         self._loaded = False  # A failed reload must not expose a partially overwritten table.
+        if self.table.is_meta:
+            raise RuntimeError("PLE meta instance is inspection-only; reconstruct with real initialization to load")
         index = _weight_map(hf_checkpoint)
         prefix = f"model.language_model.layers.{self.hf_layer_index}.ple.ple_embedding"
         cache: dict = {}
@@ -288,6 +307,8 @@ class Qwen38NextFrozenNGramEmbedding(MegatronModule):
 
     def forward(self, ids: Tensor) -> Tensor:
         """``[T, n_heads]`` int64 -> ``[T, n_heads * embedding_dim]`` bf16."""
+        if self.table.is_meta:
+            raise RuntimeError("PLE meta instance is inspection-only; reconstruct with real initialization to run")
         if not self._loaded:
             if self._hf_checkpoint is None:
                 raise RuntimeError(

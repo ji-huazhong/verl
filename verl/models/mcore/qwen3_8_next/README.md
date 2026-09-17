@@ -467,6 +467,23 @@ are not silently treated as equivalent; unsupported mappings fail explicitly.
 
 ## Important current boundaries
 
+Full-size structural inspection is available separately from numerical tests:
+set `RUN_QWEN38_FULL_STRUCTURE_TESTS=1`, `QWEN38_MODEL_PATH` to the real local
+checkpoint, and run eight torchrun workers on
+`tests/models/mcore/test_qwen38_next_full_structure.py -k full_checkpoint`.
+The default is TP8/EP8; `QWEN38_STRUCTURE_HYBRID=1` selects the exact
+TP2/PP2/EP2/CP2/VPP2/ETP1 layout. This retains all 48 layers, audits native
+Bridge conversion tasks against checkpoint header shapes/dtypes and verifies
+global coverage of every fused expert row. Unknown mapping families fail.
+
+The inspection-only allocation context compensates for explicit CUDA factory
+calls in dependencies: all model parameters and the unregistered PLE table
+must remain meta. The test bounds PyTorch CUDA allocations at 1 GiB/process
+and requires 4 GiB free on every GPU; communication/runtime still use memory.
+It reads no weight payload and does not prove loading, packing order, hashes,
+forward/backward, refit, or training. Meta PLE instances explicitly reject
+loading/forward, including after `to_empty`; reconstruct a real model instead.
+
 - CP1, or CP2 with TP1/EP1/PP1, TP2/EP2/PP1 or the exact
   TP2/PP2/EP2/VPP2/ETP1 combination above. Other CP/pipeline combinations remain
   guarded. PP requires dynamic P2P shapes, and VPP additionally requires overlap.

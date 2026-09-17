@@ -4,10 +4,62 @@
 import builtins
 import json
 import struct
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
+
+
+@pytest.mark.parametrize("via_flag", [False, True])
+def test_meta_table_does_not_allocate_host_storage_or_read_payload(tmp_path, monkeypatch, via_flag):
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from verl.models.mcore.qwen3_8_next.ops import ple
+
+    path, _, _ = make_checkpoint(tmp_path)
+    config = SimpleNamespace(
+        qwen3_8_next_ngram_size=2,
+        qwen3_8_next_heads_per_ngram=1,
+        qwen3_8_next_ple_embed_dim=3,
+        qwen3_8_next_split_ngram_parts=2,
+        qwen3_8_next_hf_checkpoint=str(tmp_path),
+        init_model_with_meta_device=via_flag,
+    )
+    allocations = []
+
+    class AllocationGuard(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            if func == torch.ops.aten.empty.memory_format:
+                allocations.append(kwargs.copy())
+                assert not kwargs.get("pin_memory", False), "Meta inspection must never pin host storage"
+            return func(*args, **kwargs)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Meta inspection read tensor payload or launched a PLE kernel")
+
+    load_metadata = ple.Qwen38NextFrozenNGramEmbedding.load_metadata_from_hf
+    monkeypatch.setattr(ple.Qwen38NextFrozenNGramEmbedding, "load_metadata_from_hf", forbidden)
+    monkeypatch.setattr(ple, "gather_ple_rows", forbidden)
+    with AllocationGuard(), nullcontext() if via_flag else torch.device("meta"):
+        model = ple.Qwen38NextFrozenNGramEmbedding(config, layer_number=2)
+    assert allocations and path.exists()
+    assert model.table.is_meta and model.table.shape == (8, 3)
+    assert all(buffer.is_meta for buffer in model.buffers())
+    assert not model._loaded and not list(model.parameters()) and not model.state_dict()
+    with pytest.raises(RuntimeError, match="inspection-only"):
+        load_metadata(model, str(tmp_path))
+    with pytest.raises(RuntimeError, match="inspection-only"):
+        model.load_from_hf(str(tmp_path))
+    with pytest.raises(RuntimeError, match="inspection-only"):
+        model(torch.tensor([[0]]))
+    # to_empty only touches registered buffers, not the deliberately unregistered
+    # frozen table. It must not accidentally make this instance runnable.
+    model.to_empty(device="cpu")
+    assert model.table.is_meta
+    with pytest.raises(RuntimeError, match="inspection-only"):
+        model(torch.tensor([[0]]))
 
 
 def make_checkpoint(tmp_path, *, dtype=torch.bfloat16):
