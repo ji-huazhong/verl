@@ -69,7 +69,11 @@ def load_dist_checkpointing(sharded_state_dict, ckpt_dir):
     except Exception:
         pass
 
-    # Load model sharded state dicts
-    state_dict = dist_checkpointing.load(sharded_state_dict, ckpt_dir, sharded_strategy=load_strategy)
+    # Restore is a state mutation, not part of the training graph. Factories
+    # can create views under no_grad that distributed loading fills in-place;
+    # their merges must use the same grad mode (notably replicated LoRA shards).
+    # Keep this scoped so callers retain their mode even when loading fails.
+    with torch.no_grad():
+        state_dict = dist_checkpointing.load(sharded_state_dict, ckpt_dir, sharded_strategy=load_strategy)
 
     return state_dict

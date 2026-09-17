@@ -330,6 +330,16 @@ All 184 TensorBoard scalar samples were finite; grad norms were 0.28595847 and
 This is still a random-model smoke with synthetic rewards, not evidence of
 learning quality, full-checkpoint correctness or bitwise resume equivalence.
 
+The first independent CP2 resume exposed a generic checkpoint-loading issue:
+expert factories create no-grad views, while distributed restore can mutate
+their live storage before merging them with autograd enabled. The loader now
+keeps Core's build/load/merge in one scoped `torch.no_grad()` region, without
+disabling subsequent training or modifying shared dependencies. CPU regression
+tests reproduce the old view error, verify exact restoration and subsequent
+backward, and check caller grad-mode restoration on success and failure.
+The new tests plus existing checkpoint-manager tests pass 43 cases; the full
+combined Flash-Next/checkpoint CPU collection passes 111 with 34 opt-in skips.
+
 The GPU suites enforce memory headroom and
 per-process allocation caps. Never evict another job to run them.
 
