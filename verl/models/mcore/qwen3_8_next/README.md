@@ -206,6 +206,35 @@ these construction tests in future will still not prove numerical or schedule
 correctness; global CP contexts and the full combined schedule still need their
 own integration validation. The per-layer PLE FIFO is not shared across chunks.
 
+### QSA context-parallel component gate
+
+```bash
+RUN_QWEN38_QSA_CP_TESTS=1 QWEN38_TINY_EXPORT_DIR=/path/to/tiny-export \
+  torchrun --standalone --nproc-per-node=2 -m pytest -s -q \
+  tests/models/mcore/test_qwen38_next_qsa_cp.py
+```
+
+The QSA component uses real packed zigzag CP2: local queries and output
+projections, global projected KV, and global document-aware indexer keys.
+It does not replicate the decoder's full hidden-state computation. Tensor-core
+kernels now support unequal Q/KV lengths and map document-relative blocks to
+physical KV tiles, including tile-boundary straddles.
+
+Forward KV communication stays BF16. An FP32 autograd edge retains partial KV
+gradients until reduce-scatter, casting only after the sum. This adds temporary
+FP32 KV/gradient storage and FP32 backward communication; it is not a
+memory-free optimization. The component test uses fused FP32 LoRA weight
+gradient accumulation, matching the tested Bridge trainer configuration.
+
+Two ranks each passed five tests: exact gather/backward including a cancellation
+case, a packed-tile negative control, rectangular Q=13/KV=160 forward/backward
+against an independent mixed-precision Torch reference, and CP2/CP1 QSA with
+sparse/full-coverage budgets and full recompute. Forward gaps were zero; the
+largest relative LoRA gradient L2 error was 8.59e-6. Existing elementwise
+tolerances were not relaxed. This is not a full-model, DDP optimizer, hybrid
+TP/PP/EP/CP/VPP, or rollout CP test. Provider-level CP remains rejected until
+PLE's cross-shard n-gram/convolution boundaries and full integration pass.
+
 The GPU suites enforce memory headroom and
 per-process allocation caps. Never evict another job to run them.
 

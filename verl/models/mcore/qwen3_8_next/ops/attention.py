@@ -16,6 +16,7 @@ from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel
 from megatron.core.transformer.module import MegatronModule
 from torch import Tensor
 
+from verl.models.mcore.qwen3_8_next.ops.context_parallel import PackedContextParallelLayout
 from verl.models.mcore.qwen3_8_next.ops.kernel.qsa_block_sparse_attn import (
     qsa_block_sparse_attention_triton,
 )
@@ -43,6 +44,19 @@ class Qwen38NextQSACoreAttention(MegatronModule):
                 "means core_attention was called out of band."
             )
         block_form = getattr(self._owner, "_qsa_block_form", None)
+        cp_layout = getattr(self._owner, "_qsa_cp_layout", None)
+        if cp_layout is not None:
+            if query.dim() != 3:
+                raise NotImplementedError("QSA CP requires THD packed queries")
+            group = self._owner.pg_collection.cp
+            # One collective/autograd node for K and V ensures the same
+            # backward collective order on all ranks.
+            key_value = cp_layout.gather(torch.stack((key, value), dim=1), group, fp32_output=True)
+            key, value = key_value.unbind(1)
+            sel_bitmap, lo, hi, blk_base, tok_base, blk = block_form
+            return qsa_block_sparse_attention_triton(
+                query, key, value, sel_bitmap, lo, hi, blk_base, tok_base, self.softmax_scale, blk
+            ).reshape(query.shape[0], -1)
         if query.dim() == 3:
             if block_form is not None:
                 sel_bitmap, lo, hi, blk_base, tok_base, blk = block_form
@@ -74,6 +88,7 @@ class Qwen38NextAttention(Qwen3VLSelfAttention):
         self.core_attention = Qwen38NextQSACoreAttention(config, layer_number, owner=self)
         self._qsa_selection = None
         self._qsa_block_form = None
+        self._qsa_cp_layout = None
 
     @staticmethod
     def _packed_positions(cu_seqlens: Tensor, total: int) -> Tensor:
@@ -104,6 +119,36 @@ class Qwen38NextAttention(Qwen3VLSelfAttention):
                         group=get_tensor_model_parallel_group(),
                     )
         seq = indexer_states.shape[0]
+        cp_group = self.pg_collection.cp
+        if cp_group.size() > 1:
+            if packed is None or packed.qkv_format != "thd":
+                raise NotImplementedError("QSA CP requires packed physical sequence boundaries")
+            cp_layout = PackedContextParallelLayout(packed.cu_seqlens_q, cp_group.size(), cp_group.rank())
+            if seq != cp_layout.local_indices.numel():
+                raise ValueError("QSA indexer input does not match the CP-local token layout")
+            with torch.no_grad():
+                selection = self.indexer.forward_context_parallel(indexer_states[:, 0], rotary, cp_layout, cp_group)
+                _, global_positions = packed_token_segments(packed.cu_seqlens_q, cp_layout.total)
+                positions = cp_layout.local(global_positions)
+                seq_start = cp_layout.local_indices - positions
+                tail = (positions + 1) // self.compress_ratio * self.compress_ratio
+                tail = tail[:, None] + torch.arange(self.compress_ratio, device=positions.device)
+                tail = torch.where(tail <= positions[:, None], seq_start[:, None] + tail, -1)
+                selection = torch.cat((selection, tail.to(selection.dtype)), dim=1)
+                valid = (selection >= seq_start[:, None]) & (selection <= cp_layout.local_indices[:, None])
+                self._qsa_selection = selection.masked_fill(~valid, -1)
+                self._qsa_cu_seqlens = packed.cu_seqlens_q
+                self._qsa_block_form = self._publish_block_form(
+                    self._qsa_selection, positions, seq_start, seq, cp_layout=cp_layout
+                )
+            self._qsa_cp_layout = cp_layout
+            try:
+                return super().forward(hidden_states, *args, **kwargs)
+            finally:
+                self._qsa_selection = None
+                self._qsa_cp_layout = None
+                self._qsa_cu_seqlens = None
+                self._qsa_block_form = None
         if packed is not None:
             cu = getattr(packed, "cu_seqlens_q", None)
             if cu is None:
@@ -145,7 +190,7 @@ class Qwen38NextAttention(Qwen3VLSelfAttention):
             self._qsa_cu_seqlens = None
             self._qsa_block_form = None
 
-    def _publish_block_form(self, selection: Tensor, positions: Tensor, seq_start: Tensor, seq: int):
+    def _publish_block_form(self, selection: Tensor, positions: Tensor, seq_start: Tensor, seq: int, cp_layout=None):
         """Selection rows -> the block form the tensor-core kernel consumes.
 
         Block ids come from the indexer's own per-sequence grid (``PackedBlockLayout``), not
@@ -156,14 +201,17 @@ class Qwen38NextAttention(Qwen3VLSelfAttention):
         ratio = self.compress_ratio
         cu = self._qsa_cu_seqlens
         if cu is not None and cu.numel() > 2:
-            layout = PackedBlockLayout(cu, positions, ratio)
+            layout_positions = positions if cp_layout is None else packed_token_segments(cu, cp_layout.total)[1]
+            layout = PackedBlockLayout(cu, layout_positions, ratio)
             blk_base = layout.token_block_start.to(torch.int32)
             tok_base = layout.token_start.to(torch.int32)
+            if cp_layout is not None:
+                blk_base, tok_base = cp_layout.local(blk_base), cp_layout.local(tok_base)
             num_blocks = layout.num_blocks
         else:
             blk_base = torch.zeros(seq, dtype=torch.int32, device=selection.device)
             tok_base = torch.zeros(seq, dtype=torch.int32, device=selection.device)
-            num_blocks = -(-seq // ratio)
+            num_blocks = -(-(seq if cp_layout is None else cp_layout.total) // ratio)
 
         sel_bitmap = torch.zeros(seq, num_blocks, dtype=torch.uint8, device=selection.device)
         valid = selection >= 0

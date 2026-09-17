@@ -196,6 +196,47 @@ class Qwen38NextQSAIndexer(MegatronModule):
         rest = x[..., rotary_dim:]
         return torch.cat([self.rotary_emb(positions, head), rest], dim=-1)
 
+    def forward_context_parallel(self, hidden_states, rotary_pos_emb, cp_layout, cp_group):
+        """Score local queries against globally compressed indexer keys.
+
+        Project only local tokens. Gather the single-head indexer key and the
+        composed rotary angles, never full decoder hidden states or queries.
+        Compression must happen after restoring document order: a block can
+        straddle two CP chunks, including when its size does not divide them.
+        """
+        total = cp_layout.total
+        _, global_positions = packed_token_segments(cp_layout.cu_seqlens, total)
+        layout = PackedBlockLayout(cp_layout.cu_seqlens, global_positions, self.compress_ratio)
+        qk, _ = self.index_qk_proj(hidden_states)
+        split = self.n_heads * self.head_dim
+        q = gemma_rmsnorm_last_dim(
+            qk[..., :split].reshape(-1, self.n_heads, self.head_dim), self.q_layernorm, self.norm_eps
+        )
+        token_k = cp_layout.gather(qk[..., split:].reshape(-1, self.head_dim), cp_group)
+        block_k = compress_keys_by_mean_packed(token_k, layout)
+        block_k = gemma_rmsnorm_last_dim(block_k, self.k_layernorm, self.norm_eps)
+        angles = cp_layout.gather(rotary_pos_emb, cp_group)
+        first_tokens = layout.sequence_starts[layout.block_seq] + layout.block_local * self.compress_ratio
+        q = apply_indexer_rope(q, rotary_pos_emb)
+        block_k = apply_indexer_rope(block_k.unsqueeze(1), angles[first_tokens]).squeeze(1)
+
+        positions = cp_layout.local(global_positions)
+        block_start = cp_layout.local(layout.token_block_start)
+        token_start = cp_layout.local(layout.token_start)
+        scores = torch.einsum("mhd,nd->mnh", q.float(), block_k.float())
+        logits = torch.relu(scores).sum(-1) / math.sqrt(self.head_dim)
+        blocks = torch.arange(layout.num_blocks, device=positions.device).unsqueeze(0)
+        first_invalid = block_start + (positions + 1) // self.compress_ratio
+        valid = (blocks >= block_start.unsqueeze(1)) & (blocks < first_invalid.unsqueeze(1))
+        logits.masked_fill_(~valid, float("-inf"))
+        scores, selected = torch.topk(logits, min(self.block_topk, layout.num_blocks), dim=-1)
+        offsets = torch.arange(self.compress_ratio, device=positions.device)
+        tokens = token_start[:, None, None] + (
+            (selected - block_start[:, None]).unsqueeze(-1) * self.compress_ratio + offsets
+        )
+        tokens.masked_fill_(~torch.isfinite(scores).unsqueeze(-1), -1)
+        return tokens.flatten(-2)[..., : self.token_topk].to(torch.int32)
+
     def score_blocks(
         self,
         q: Tensor,

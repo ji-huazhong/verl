@@ -61,6 +61,7 @@ def _qsa_bs_fwd_kernel(
     stride_ot,
     stride_oh,
     T,
+    S,
     NB,
     scale,
     GROUP: tl.constexpr,
@@ -98,7 +99,7 @@ def _qsa_bs_fwd_kernel(
     for i in range(0, n_tiles):
         kt = tl.load(KLIST + pid_t * stride_kl + i)
         offs_k = kt * BK + tl.arange(0, BK)
-        k_in = offs_k < T
+        k_in = offs_k < S
 
         # per-sequence block grid: after the packed-indexer fix a sequence's blocks start
         # at its own first token, which is not a multiple of BLK in a packed batch.
@@ -176,6 +177,7 @@ def _qsa_bs_dq_kernel(
     stride_ot,
     stride_oh,
     T,
+    S,
     NB,
     scale,
     GROUP: tl.constexpr,
@@ -211,7 +213,7 @@ def _qsa_bs_dq_kernel(
     for i in range(0, n_tiles):
         kt = tl.load(KLIST + pid_t * stride_kl + i)
         offs_k = kt * BK + tl.arange(0, BK)
-        k_in = offs_k < T
+        k_in = offs_k < S
 
         # per-sequence block grid: after the packed-indexer fix a sequence's blocks start
         # at its own first token, which is not a multiple of BLK in a packed batch.
@@ -279,6 +281,7 @@ def _qsa_bs_dkdv_kernel(
     stride_ot,
     stride_oh,
     T,
+    S,
     NB,
     scale,
     GROUP: tl.constexpr,
@@ -299,7 +302,7 @@ def _qsa_bs_dkdv_kernel(
 
     offs_k = pid_k * BK + tl.arange(0, BK)
     offs_d = tl.arange(0, D)
-    k_in = offs_k < T
+    k_in = offs_k < S
 
     k_tile = tl.load(
         K + offs_k[:, None] * stride_kt + kv_head * stride_kh + offs_d[None, :], mask=k_in[:, None], other=0.0
@@ -363,6 +366,28 @@ def _qsa_bs_dkdv_kernel(
 
     tl.store(DK + offs_k[:, None] * stride_kt + kv_head * stride_kh + offs_d[None, :], dk, mask=k_in[:, None])
     tl.store(DV + offs_k[:, None] * stride_vt + kv_head * stride_vh + offs_d[None, :], dv, mask=k_in[:, None])
+
+
+def selection_to_key_tile_bitmap(sel, lo, hi, blk_base, tok_base, key_tokens, tile_size, block_size):
+    """Map document-relative blocks to physical KV tiles, including straddles.
+
+    A packed document can start between physical tiles. Grouping the packed
+    block IDs directly into tiles is incorrect then, and can omit a selected
+    key tile. Query count and global key count are independent under CP.
+    """
+    if block_size > tile_size:
+        raise ValueError("QSA block size must not exceed the physical key tile size")
+    flags = torch.zeros(sel.shape[0], triton.cdiv(key_tokens, tile_size), dtype=torch.uint8, device=sel.device)
+    rows, blocks = sel.nonzero(as_tuple=True)
+    starts = tok_base[rows] + (blocks - blk_base[rows]) * block_size
+    ends = torch.minimum(starts + block_size - 1, hi[rows]).clamp_max(key_tokens - 1)
+    starts = torch.maximum(starts, lo[rows]).clamp_min(0)
+    valid = starts <= ends
+    # One selection block spans at most two physical tiles. Keep both; the
+    # kernel still checks exact per-query block membership and causal bounds.
+    flags[rows[valid], starts[valid] // tile_size] = 1
+    flags[rows[valid], ends[valid] // tile_size] = 1
+    return flags
 
 
 def selection_to_block_bitmap(indices: Tensor, num_tokens: int, block_size: int) -> Tensor:
@@ -438,10 +463,19 @@ class _QSABlockSparseAttn(torch.autograd.Function):
         S, Hkv, _ = k.shape
         assert Hq % Hkv == 0
         group = Hq // Hkv
-        qc, kc, vc = q.contiguous(), k.contiguous(), v.contiguous()
+        # CP's FP32 KV edge retains unrounded partial dKV until reduction.
+        # Forward tensor-core products still use Q's activation dtype; KV
+        # values on this edge came from an exact cast of the same BF16 inputs.
+        if k.dtype != q.dtype and not (q.dtype == torch.bfloat16 and k.dtype == torch.float32):
+            raise ValueError("QSA requires matching Q/KV dtype or a BF16-to-FP32 CP KV edge")
+        if v.dtype != k.dtype:
+            raise ValueError("QSA key and value dtypes must match")
+        ctx.input_dtypes = (q.dtype, k.dtype, v.dtype)
+        qc, kc, vc = q.contiguous(), k.to(q.dtype).contiguous(), v.to(q.dtype).contiguous()
         selc = sel.contiguous()
         BQ_, BK_ = 64, 64
-        klist, kcnt = build_tile_index(selc, BQ_, BK_, block_size)
+        tile_bitmap = selection_to_key_tile_bitmap(selc, lo, hi, blk_base, tok_base, S, BK_, block_size)
+        klist, kcnt = build_tile_index(tile_bitmap, BQ_, 1, 1)
         o = torch.empty(T, Hq, D, device=q.device, dtype=torch.float32)
         lse = torch.empty(Hq, T, device=q.device, dtype=torch.float32)
         BQ, BK = 64, 64
@@ -470,6 +504,7 @@ class _QSABlockSparseAttn(torch.autograd.Function):
             o.stride(0),
             o.stride(1),
             T,
+            S,
             selc.shape[1],
             scale,
             GROUP=group,
@@ -498,7 +533,9 @@ class _QSABlockSparseAttn(torch.autograd.Function):
         dv = torch.zeros(vc.shape, device=vc.device, dtype=torch.float32)
 
         BQ, BK = 64, 32
-        klist, kcnt, qlist, qcnt = build_tile_index_pair(selc, BQ, BK, ctx.block_size)
+        S = kc.shape[0]
+        tile_bitmap = selection_to_key_tile_bitmap(selc, lo, hi, blk_base, tok_base, S, BK, ctx.block_size)
+        klist, kcnt, qlist, qcnt = build_tile_index_pair(tile_bitmap, BQ, 1, 1)
         common = (
             qc.stride(0),
             qc.stride(1),
@@ -529,6 +566,7 @@ class _QSABlockSparseAttn(torch.autograd.Function):
             do.stride(0),
             do.stride(1),
             T,
+            S,
             selc.shape[1],
             ctx.scale,
             GROUP=ctx.group,
@@ -539,7 +577,7 @@ class _QSABlockSparseAttn(torch.autograd.Function):
             num_warps=8,
             num_stages=1,
         )
-        _qsa_bs_dkdv_kernel[(triton.cdiv(T, BK), kc.shape[1])](
+        _qsa_bs_dkdv_kernel[(triton.cdiv(S, BK), kc.shape[1])](
             qc,
             kc,
             vc,
@@ -560,6 +598,7 @@ class _QSABlockSparseAttn(torch.autograd.Function):
             do.stride(0),
             do.stride(1),
             T,
+            S,
             selc.shape[1],
             ctx.scale,
             GROUP=ctx.group,
@@ -570,7 +609,8 @@ class _QSABlockSparseAttn(torch.autograd.Function):
             num_warps=8,
             num_stages=1,
         )
-        return dq.to(qc.dtype), dk.to(kc.dtype), dv.to(vc.dtype), None, None, None, None, None, None, None
+        q_dtype, k_dtype, v_dtype = ctx.input_dtypes
+        return dq.to(q_dtype), dk.to(k_dtype), dv.to(v_dtype), None, None, None, None, None, None, None
 
 
 def qsa_block_sparse_attention_triton(
@@ -598,7 +638,7 @@ def qsa_sparse_attention_from_indices(
 ) -> Tensor:
     """Drop-in for the gather kernel: derives the bitmap and range from ``indices``."""
     T = q.shape[0]
-    sel = selection_to_block_bitmap(indices, T, block_size)
+    sel = selection_to_block_bitmap(indices, k.shape[0], block_size)
     valid = indices >= 0
     big = torch.iinfo(torch.int32).max
     lo = torch.where(valid, indices, torch.full_like(indices, big)).min(dim=1).values.to(torch.int32)
