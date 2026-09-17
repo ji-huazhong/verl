@@ -4,6 +4,7 @@
 import copy
 from dataclasses import dataclass
 
+import torch
 from megatron.bridge.models.qwen_vl.qwen35_vl_provider import Qwen35VLMoEModelProvider
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -18,6 +19,7 @@ from .ops.attention import Qwen38NextAttention
 from .ops.gated_delta_net import Qwen38NextGatedDeltaNet
 from .ops.ple import (
     Qwen38NextFrozenNGramEmbedding,
+    build_ngram_contexts_cp,
     build_ngram_contexts_packed,
     clear_ple_batch,
     publish_ple_batch,
@@ -65,7 +67,18 @@ def install_ple_context_hooks(model):
             raise NotImplementedError("Flash-Next currently requires a single packed token stream per microbatch")
         packed = kwargs.get("packed_seq_params")
         cu = getattr(packed, "cu_seqlens_q", None)
-        contexts = build_ngram_contexts_packed(ids.reshape(-1), cu, embedding.ngram_size, embedding.eos_token_id)
+        cp_group = getattr(embedding, "cp_group", None)
+        if cp_group is not None and cp_group.size() > 1:
+            if packed is None or packed.qkv_format != "thd" or cu is None:
+                raise ValueError("PLE CP requires packed physical sequence boundaries")
+            padded = getattr(packed, "cu_seqlens_q_padded", None)
+            if padded is not None and not torch.equal(padded, cu):
+                raise NotImplementedError("PLE padding gaps need explicit logical-to-physical token mapping")
+            contexts = build_ngram_contexts_cp(
+                ids.reshape(-1), cu, embedding.ngram_size, embedding.eos_token_id, cp_group
+            )
+        else:
+            contexts = build_ngram_contexts_packed(ids.reshape(-1), cu, embedding.ngram_size, embedding.eos_token_id)
         publish_ple_batch(embedding.compute_ngram_ids(contexts), cu)
 
     def post_hook(_module, _args, _output):

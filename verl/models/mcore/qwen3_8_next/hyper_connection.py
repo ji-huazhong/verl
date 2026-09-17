@@ -10,6 +10,7 @@ gate with a MEAN over streams, and identity residual mixing (h_res is None).
 import torch
 import torch.nn.functional as F
 from megatron.core.parallel_state import (
+    get_context_parallel_group,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -171,7 +172,8 @@ class Qwen38NextPLEHyperConnection(Qwen38NextHyperConnection):
             tp_group = get_tensor_model_parallel_group()
         except AssertionError:
             pass  # not initialised (shape audits); falls back to unsharded
-        self.ple = Qwen38NextPLE(config, layer_number=layer_number, tp_group=tp_group)
+        cp_group = get_context_parallel_group() if config.context_parallel_size > 1 else None
+        self.ple = Qwen38NextPLE(config, layer_number=layer_number, tp_group=tp_group, cp_group=cp_group)
 
     def _resolve_ple_batch(self):
         """The published batch, made safe under activation recompute.

@@ -240,7 +240,7 @@ def _seg_bounds(T: int, cu_seqlens, device):
 
 class _PLEGateConv(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, hc_state, key, value, wk, wq, wc, conv_w, n, eps, dilation, cu_seqlens):
+    def forward(ctx, hc_state, key, value, wk, wq, wc, conv_w, n, eps, dilation, cu_seqlens, halo, cp_group):
         T, W = hc_state.shape
         C = W // n
         Kk = conv_w.shape[-1]
@@ -271,20 +271,29 @@ class _PLEGateConv(torch.autograd.Function):
 
         normed, rstdc = _norm_fwd(gated, wc, n, eps)
 
-        seg_lo, seg_hi = _seg_bounds(T, cu_seqlens, dev)
+        conv_tokens = T
+        if halo is not None:
+            normed = halo.expand(normed, cp_group)
+            conv_tokens = halo.expanded_count
+            # Halo outputs are discarded. Only core rows need the residual.
+            expanded_gated = gated.new_zeros((conv_tokens, W))
+            expanded_gated.index_copy_(0, halo.core_indices, gated)
+            gated = expanded_gated
+            cu_seqlens = halo.cu_seqlens
+        seg_lo, seg_hi = _seg_bounds(conv_tokens, cu_seqlens, dev)
         convw2d = conv_w.reshape(W, Kk).contiguous()
-        out = torch.empty(T, W, dtype=hc_state.dtype, device=dev)
-        conv_pre = torch.empty(T, W, dtype=torch.float32, device=dev)
+        out = torch.empty(conv_tokens, W, dtype=hc_state.dtype, device=dev)
+        conv_pre = torch.empty(conv_tokens, W, dtype=torch.float32, device=dev)
         BW = 256
-        if T > 0:
-            _ple_conv_fwd_kernel[(T, triton.cdiv(W, BW))](
+        if conv_tokens > 0:
+            _ple_conv_fwd_kernel[(conv_tokens, triton.cdiv(W, BW))](
                 normed,
                 gated,
                 convw2d,
                 seg_lo,
                 out,
                 conv_pre,
-                T,
+                conv_tokens,
                 W,
                 K=Kk,
                 DIL=dilation,
@@ -295,7 +304,8 @@ class _PLEGateConv(torch.autograd.Function):
             hc_state, key, value, wk, wq, wc, convw2d, gate, rstdk, rstdq, rstdc, seg_lo, seg_hi, conv_pre
         )
         ctx.dims = (n, eps, dilation, Kk, conv_w.dtype)
-        return out
+        ctx.halo, ctx.cp_group = halo, cp_group
+        return out.index_select(0, halo.core_indices) if halo is not None else out
 
     @staticmethod
     def backward(ctx, dout):
@@ -332,12 +342,20 @@ class _PLEGateConv(torch.autograd.Function):
             )
         normed, _ = _norm_fwd(gated, wc, n, eps)
 
-        dnormed = torch.empty(T, W, dtype=torch.float32, device=dev)
+        halo, cp_group = ctx.halo, ctx.cp_group
+        conv_tokens = T
+        if halo is not None:
+            normed = halo.expand(normed, cp_group)
+            conv_tokens = halo.expanded_count
+            expanded_dout = dout.new_zeros((conv_tokens, W))
+            expanded_dout.index_copy_(0, halo.core_indices, dout)
+            dout = expanded_dout
+        dnormed = torch.empty(conv_tokens, W, dtype=torch.float32, device=dev)
         dconvw = torch.zeros(W, Kk, dtype=torch.float32, device=dev)
-        dgated = torch.empty(T, W, dtype=torch.float32, device=dev)
+        dgated = torch.empty(conv_tokens, W, dtype=torch.float32, device=dev)
         BW = 256
-        if T > 0:
-            _ple_conv_bwd_kernel[(T, triton.cdiv(W, BW))](
+        if conv_tokens > 0:
+            _ple_conv_bwd_kernel[(conv_tokens, triton.cdiv(W, BW))](
                 dout,
                 conv_pre,
                 normed,
@@ -347,12 +365,15 @@ class _PLEGateConv(torch.autograd.Function):
                 dnormed,
                 dconvw,
                 dgated,
-                T,
+                conv_tokens,
                 W,
                 K=Kk,
                 DIL=dilation,
                 BLOCK_W=BW,
             )
+        if halo is not None:
+            dnormed = halo.reduce(dnormed, cp_group)
+            dgated = dgated.index_select(0, halo.core_indices)
 
         x_hat = (gated.view(T, n, C) * rstdc.unsqueeze(-1)).view(T, W)
         dwc = (dnormed * x_hat).sum(dim=0).to(wc.dtype)
@@ -395,7 +416,7 @@ class _PLEGateConv(torch.autograd.Function):
         dwq = dwq_part.sum(dim=0).to(wq.dtype)
         dconv_w = dconvw.view(W, 1, Kk).to(conv_w_dtype)
 
-        return (dquery, dkey, dvalue, dwk, dwq, dwc, dconv_w, None, None, None, None)
+        return (dquery, dkey, dvalue, dwk, dwq, dwc, dconv_w, None, None, None, None, None, None)
 
 
 def ple_gate_conv_triton(
@@ -410,8 +431,18 @@ def ple_gate_conv_triton(
     eps: float,
     dilation: int,
     cu_seqlens,
+    *,
+    halo=None,
+    cp_group=None,
 ):
     """Full PLE increment (gate chain + norm + causal conv + SiLU + residual)."""
+    if halo is not None:
+        if halo.depth < (conv1d_weight.shape[-1] - 1) * dilation:
+            raise ValueError("PLE halo is shorter than the causal convolution context")
+        if cu_seqlens is None or not torch.equal(cu_seqlens, halo.layout.cu_seqlens):
+            raise ValueError("PLE halo does not match physical packed boundaries")
+        if hc_state.shape[0] != halo.local_count:
+            raise ValueError("PLE halo does not match the local token count")
     return _PLEGateConv.apply(
         hc_state.contiguous(),
         key.contiguous(),
@@ -424,4 +455,6 @@ def ple_gate_conv_triton(
         eps,
         dilation,
         cu_seqlens,
+        halo,
+        cp_group,
     )

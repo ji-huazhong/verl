@@ -12,8 +12,10 @@ The subsequent changes include composed mRoPE in QSA, empty packed-sequence
 handling, and exception-safe PLE context hooks at the packed language boundary.
 QSA additions include packed context-parallel projection/KV exchange,
 rectangular query/key tensor-core kernels, and explicit mapping from packed
-document blocks to physical key tiles. Provider-level CP support remains
-guarded pending PLE boundary handling and complete-model validation.
+document blocks to physical key tiles. PLE additions include packed token
+metadata reconstruction, document-clipped causal convolution halos, FP32
+reverse-gradient accumulation, and context/recompute integration. Provider-level
+CP support remains guarded pending complete-model and mixed-topology validation.
 Refer to the repository LICENSE for the Apache License 2.0 terms.
 Upstream code is reference implementation evidence, not proof that the adapted
 training, weight export or LoRA path has passed end-to-end validation.

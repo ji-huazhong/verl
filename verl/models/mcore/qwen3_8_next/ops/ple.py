@@ -21,8 +21,10 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from safetensors import safe_open
 from torch import Tensor
 
+from verl.models.mcore.qwen3_8_next.ops.context_parallel import PackedContextParallelLayout
 from verl.models.mcore.qwen3_8_next.ops.kernel.ple_gather import gather_ple_rows
 from verl.models.mcore.qwen3_8_next.ops.kernel.ple_triton import ple_gate_conv_triton
+from verl.models.mcore.qwen3_8_next.ops.ple_context_parallel import PackedCPHalo
 from verl.models.mcore.qwen3_8_next.ops.sequence import packed_token_segments
 
 logger = logging.getLogger(__name__)
@@ -97,6 +99,18 @@ def build_ngram_contexts_packed(
     return torch.cat(parts, dim=0)
 
 
+def build_ngram_contexts_cp(tokens, cu_seqlens, ngram_size, eos_token_id, cp_group):
+    """Reconstruct small integer metadata, then return only this CP rank's rows.
+
+    The hash still resets at EOS and physical document boundaries. Adjacent
+    rows in the local zigzag buffer are not necessarily adjacent global tokens.
+    """
+    layout = PackedContextParallelLayout(cu_seqlens, cp_group.size(), cp_group.rank())
+    full_tokens = layout.gather(tokens, cp_group)
+    contexts = build_ngram_contexts_packed(full_tokens, cu_seqlens, ngram_size, eos_token_id)
+    return layout.local(contexts)
+
+
 _state = threading.local()
 
 
@@ -167,7 +181,7 @@ def _readinto_exact(file, destination: memoryview, name: str) -> None:
 class Qwen38NextFrozenNGramEmbedding(MegatronModule):
     """Frozen host-resident n-gram table, row-sharded over TP."""
 
-    def __init__(self, config: TransformerConfig, layer_number: int, tp_group=None):
+    def __init__(self, config: TransformerConfig, layer_number: int, tp_group=None, cp_group=None):
         super().__init__(config)
         self.layer_number = layer_number
         self.hf_layer_index = layer_number - 1
@@ -178,6 +192,7 @@ class Qwen38NextFrozenNGramEmbedding(MegatronModule):
         self._heads_per_ngram = config.qwen3_8_next_heads_per_ngram
         self.eos_token_id = getattr(config, "qwen3_8_next_eos_token_id", 0)
         self.tp_group = tp_group
+        self.cp_group = cp_group
 
         tp_size = tp_group.size() if tp_group is not None else 1
         tp_rank = tp_group.rank() if tp_group is not None else 0
@@ -295,7 +310,7 @@ class Qwen38NextFrozenNGramEmbedding(MegatronModule):
 class Qwen38NextPLE(MegatronModule):
     """PLE increment for the hyper-connection state."""
 
-    def __init__(self, config: TransformerConfig, layer_number: int, tp_group=None):
+    def __init__(self, config: TransformerConfig, layer_number: int, tp_group=None, cp_group=None):
         super().__init__(config)
         self.layer_number = layer_number
         self.n = config.num_residual_streams
@@ -304,9 +319,14 @@ class Qwen38NextPLE(MegatronModule):
         self.ngram_size = config.qwen3_8_next_ngram_size
         self.heads_per_ngram = config.qwen3_8_next_heads_per_ngram
         self.embed_dim = config.qwen3_8_next_ple_embed_dim
+        self.cp_group = cp_group
+        if config.context_parallel_size > 1 and (cp_group is None or cp_group.size() != config.context_parallel_size):
+            raise ValueError("PLE CP requires the matching context-parallel process group")
         wide = self.n * self.hidden_size
 
-        self.ple_embedding = Qwen38NextFrozenNGramEmbedding(config, layer_number=layer_number, tp_group=tp_group)
+        self.ple_embedding = Qwen38NextFrozenNGramEmbedding(
+            config, layer_number=layer_number, tp_group=tp_group, cp_group=cp_group
+        )
 
         self.key_proj = TELinear(
             self.embed_dim,
@@ -361,6 +381,13 @@ class Qwen38NextPLE(MegatronModule):
                 f"{self.n * self.hidden_size}, got {hc_state.shape[-1]}"
             )
 
+        halo = None
+        if self.cp_group is not None and self.cp_group.size() > 1:
+            if cu_seqlens is None:
+                raise ValueError("PLE CP requires physical packed sequence boundaries")
+            layout = PackedContextParallelLayout(cu_seqlens, self.cp_group.size(), self.cp_group.rank())
+            halo = PackedCPHalo(layout, (self.conv1d_weight.shape[-1] - 1) * self.conv_dilation)
+
         return ple_gate_conv_triton(
             hc_state,
             key,
@@ -373,4 +400,6 @@ class Qwen38NextPLE(MegatronModule):
             self.norm_eps,
             self.conv_dilation,
             cu_seqlens,
+            halo=halo,
+            cp_group=self.cp_group,
         )

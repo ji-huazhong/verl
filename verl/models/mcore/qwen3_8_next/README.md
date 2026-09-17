@@ -120,8 +120,10 @@ opt-in skips; the production-backward GPU fixture passed three tests.
 
 The trainer fixture also accepts `QWEN38_SMOKE_GPUS=2` (or 8) with exactly that
 many visible devices. It validates fixture dimensions and at least 10 GiB free
-on every device before launch. Ray CPU slots scale as `max(16, 3 * GPUs + 8)`:
-the actual resource pool reserves three CPU slots per GPU. TP2/EP2 actor/reference with TP2 vLLM completed
+on every device before launch. Ray CPU slots scale as `3 * GPUs + 16`:
+the actual resource pool reserves three CPU slots per GPU, and the tested
+trainer/queue services already occupy nine slots before its placement group.
+TP2/EP2 actor/reference with TP2 vLLM completed
 two real trainer steps, including multi-bucket adapter sync and full checkpoint
 saves. PP2/TP1 actor/reference with TP2 vLLM also completed two steps using the
 same wrapper with explicit actor/ref TP/EP=1 and PP=2 overrides. Both runs saved
@@ -129,11 +131,14 @@ optimizer/scheduler step 2. A separate PP2 resume restored adapter, optimizer,
 scheduler and RNG from step 1, completed step 2 and saved both optimizer shards
 at step 2 with scheduler step 2. These are random-model integration results,
 not full-model learning, trajectory equivalence or performance benchmarks.
-The eight-GPU trainer remains unvalidated: its initial attempt was stopped at
-placement-group scheduling because the earlier fixed 16-CPU quota was too
-small; the corrected 32-CPU logical placement test passed without GPU compute,
-but a subsequent GPU headroom check prevented a trainer rerun. Do not count
-that scheduling probe as eight-GPU training acceptance.
+The eight-GPU trainer subsequently completed two steps with TP8/EP8 actor/ref
+and TP8/EP1 vLLM, using the 40-CPU reservation. Its 184 TensorBoard scalars were
+finite; each saved checkpoint has world_size=8 and 16 optimizer fragments,
+all with the matching step (1 or 2), alongside scheduler step 1/2. A 32-CPU
+placement-only probe had passed but omitted the nine occupied service slots;
+the complete trainer still waited with only 23 of the required 24 slots free.
+Eight-GPU actual checkpoint restoration remains untested. These are random
+four-layer results, not full-model execution or effective learning.
 
 Non-interleaved PP now requires `variable_seq_lengths=True`: Core's existing
 P2P protocol exchanges all three tensor dimensions, including HC's wider
@@ -233,7 +238,41 @@ sparse/full-coverage budgets and full recompute. Forward gaps were zero; the
 largest relative LoRA gradient L2 error was 8.59e-6. Existing elementwise
 tolerances were not relaxed. This is not a full-model, DDP optimizer, hybrid
 TP/PP/EP/CP/VPP, or rollout CP test. Provider-level CP remains rejected until
-PLE's cross-shard n-gram/convolution boundaries and full integration pass.
+the complete PLE/GDN/QSA model and combined schedule pass integration.
+
+### PLE context-parallel component gate
+
+```bash
+RUN_QWEN38_PLE_CP_TESTS=1 QWEN38_TINY_EXPORT_DIR=/path/to/tiny-export \
+  torchrun --standalone --nproc-per-node=2 -m pytest -s -q \
+  tests/models/mcore/test_qwen38_next_ple_cp.py
+```
+
+The same gate supports four processes. Only integer token metadata is globally
+gathered for document/EOS-aware n-gram hashing. Gates and grouped normalization
+remain local; normalized FP32 rows in the left convolution halo are exchanged
+with variable-size all-to-all. Each peer receives a requested remote row once;
+locally owned rows are copied without network traffic. Each expanded chunk is
+clipped at its document boundary. Backward reverses the exchange and sums all
+halo consumers into the owner in FP32 before the local norm/gate backward.
+This introduces halo buffers and communication; it is not a measured speedup.
+
+CP2 and CP4 each passed 11 tests per rank, including zero/asymmetric exchanges,
+halos longer than a chunk, empty documents, independent EOS/hash calculations,
+FP32/BF16 kernel forward/backward against an independent Torch formula, and
+dilation 1/3 with full recompute. CP/CP1 kernel forward gaps were zero; maximum
+gradient relative L2 errors were 6.14e-5 (CP2) and 5.22e-5 (CP4), with unchanged
+elementwise gates. The derivative oracle uses FP32 replicated norm/conv weights
+to avoid conflating communication with BF16 partial-weight-gradient rounding.
+The real frozen BF16 PLE/HC component separately tests context hooks and two
+different queued microbatches under recompute, deliberately replacing the live
+side channel with unusable metadata. Its input-gradient relative L2 gaps were
+zero in these fixtures, and queues were fully consumed. The recipe freezes
+PLE/HC; this does not validate training their BF16 weights or table.
+
+The original CP1 GPU model suite still passes three tests, including vision,
+LoRA export and recompute. CP2 whole-model/optimizer/rollout and mixed TP/EP/PP/
+VPP are not covered by the PLE component gate. The provider CP guard remains.
 
 The GPU suites enforce memory headroom and
 per-process allocation caps. Never evict another job to run them.
