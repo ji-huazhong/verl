@@ -32,7 +32,9 @@ def parallel_context():
         pytest.skip("Need 8 GiB free headroom; never evict another job")
     torch.cuda.set_per_process_memory_fraction(min(0.04, 5 * 1024**3 / total))
     torch.backends.cuda.matmul.allow_tf32 = False
-    torch.distributed.init_process_group("nccl", timeout=timedelta(seconds=120))
+    torch.distributed.init_process_group(
+        "nccl", timeout=timedelta(seconds=120), device_id=torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    )
     world = torch.distributed.get_world_size()
     tp = int(os.environ.get("QWEN38_TEST_TP", world))
     ep = int(os.environ.get("QWEN38_TEST_EP", world))
@@ -57,6 +59,7 @@ def test_hf_import_roundtrip_and_parallel_forward(parallel_context):
     from safetensors.torch import load_file, save_file
 
     from verl.models.mcore.bridge import AutoBridge
+    from verl.models.mcore.model_forward import gptmodel_forward_model_engine
     from verl.models.mcore.qwen3_8_next.bridge import Qwen38NextBridge
 
     fixture = Path(os.environ["QWEN38_TINY_EXPORT_DIR"])
@@ -120,6 +123,27 @@ def test_hf_import_roundtrip_and_parallel_forward(parallel_context):
     print(f"QWEN38_PARALLEL_LOGPROB_GAP_MAX={gap.max().item():.8f}")
     assert gap.mean() < 0.005 and gap.max() < 0.05
 
+    # Exercise verl's actual nested-input/VL packing entry, not just direct
+    # calls with hand-built PackedSeqParams. Unequal lengths require TP padding.
+    documents = [ids[0, :13], ids[0, 5:12]]
+
+    def engine_logits(docs):
+        nested = torch.nested.nested_tensor(docs, layout=torch.jagged)
+        outputs = gptmodel_forward_model_engine(model, nested, multi_modal_inputs={}, vision_model=True, pad_token_id=0)
+        return [
+            gather_from_tensor_model_parallel_region(value, group=parallel_state.get_tensor_model_parallel_group())
+            for value in outputs.unbind()
+        ]
+
+    with torch.no_grad():
+        packed_outputs = engine_logits(documents)
+        for document, packed_output in zip(documents, packed_outputs, strict=True):
+            standalone = engine_logits([document])[0]
+            assert packed_output.shape == standalone.shape == (document.numel(), 256)
+            gap = (packed_output.float().log_softmax(-1) - standalone.float().log_softmax(-1)).abs()
+            assert bool(gap.isfinite().all()) and gap.mean() < 0.005 and gap.max() < 0.05
+    print(f"QWEN38_VERL_PACKED_FORWARD_PASSED TP={tp} EP={ep}")
+
     # Use real Megatron DDP gradient synchronization, including TP/SP handling.
     # The small AdamW step below is a component check, not the verl optimizer or
     # GRPO schedule. Configure recompute before PEFT installs its input hooks.
@@ -127,8 +151,8 @@ def test_hf_import_roundtrip_and_parallel_forward(parallel_context):
     provider.recompute_method = "uniform"
     provider.recompute_num_layers = 1
     peft = LoRA(
-        dim=4,
-        alpha=8,
+        dim=int(reference.get("lora_rank", torch.tensor(4))),
+        alpha=int(reference.get("lora_alpha", torch.tensor(8))),
         target_modules=[
             "language_model.decoder.layers.*.self_attention.in_proj",
             "language_model.decoder.layers.*.self_attention.out_proj",
@@ -189,7 +213,13 @@ def test_hf_import_roundtrip_and_parallel_forward(parallel_context):
         save_file(original, str(destination / "model" / "model.safetensors"))
         save_file(tensors, str(destination / "raw_adapter.safetensors"))
         save_file(
-            {"input_ids": ids.cpu(), "base_logits": logits.cpu(), "adapter_logits": updated.cpu()},
+            {
+                "input_ids": ids.cpu(),
+                "base_logits": logits.cpu(),
+                "adapter_logits": updated.cpu(),
+                "lora_rank": torch.tensor(peft.dim),
+                "lora_alpha": torch.tensor(peft.alpha),
+            },
             str(destination / "reference.safetensors"),
         )
     torch.distributed.barrier()

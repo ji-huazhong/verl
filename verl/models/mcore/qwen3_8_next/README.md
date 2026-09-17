@@ -9,6 +9,18 @@ Transformer Engine 2.16.1. The provider reuses the Qwen3.5 GDN/MoE weight
 transformations and vision encoder; HC, QSA, PLE, block norms, and the output
 contraction are Flash-Next-specific. No global Core monkey patch is installed.
 
+The inspected Bridge 0.5.2 VL text constructor temporarily holds two complete
+decoders. An isolated dependency patch is provided at
+`examples/tuning/lora/patches/megatron_bridge_qwen_vl_decoder_peak.patch`, with
+application/validation instructions alongside it. It releases the temporary
+decoder while preserving its module registration slot. Do not silently patch
+shared site-packages; use a private dependency copy and verify its import path.
+The opt-in `test_qwen38_next_bridge_allocation.py` checks object lifetime and
+parameter traversal order. This does not itself validate GPU memory or GRPO.
+An additional real-shape one-layer TP4/EP4 probe reduced peak allocated memory
+from 3.424 to 2.282 GiB per rank, with identical final parameter SHA-256 on all
+four ranks. This is not a full-model memory measurement.
+
 ## Validation status
 
 CPU tests cover config translation, public-checkpoint source-key coverage,
@@ -20,8 +32,15 @@ cover FP32/BF16 HC
 forward/backward, a four-layer random VLM's construction and complete target
 mapping, zero-adapter equality, effective LoRA updates with frozen base weights,
 HF adapter export, native distributed adapter checkpoint round trip, and full
-recompute at one/two layers per group across packed microbatches. These do
-**not** prove full-checkpoint parity, multimodal execution,
+recompute at one/two layers per group across packed microbatches. The latest
+tiny test also runs actual image patches through the vision tower, checks that
+changed pixels affect logits, and verifies image-conditioned language LoRA
+gradients/recompute with the vision tower frozen. Use the real Float16Module
+precision contract exactly once: recasting after warmup changes lazy FP32
+vision RoPE buffers. The final image/text GPU suite passed 3 tests; the new
+export also passes the vLLM text/reload/decode gate (base/adapter mean logprob
+gaps 0.00060168/0.00066835). These do
+**not** prove full-checkpoint parity, cross-engine multimodal execution,
 effective GRPO learning, or trainer/optimizer resume.
 
 Run with the baseline packages installed:
@@ -42,8 +61,10 @@ canonical raw expert adapters through public packed-module mappings, the tiny
 TP1 base/adapter mean logprob gaps are 0.00044113/0.00056800. The existing mean
 < 0.005 and max < 0.05 gates pass without relaxed tolerances. This exercises the
 actual verl `TensorLoRARequest` loader, activation, disabling and remove/reload,
-not the PEFT ParamWrapper disk format or Ray/IPC transport. It checks short-text
-prefill, not multi-token decode, long-context QSA selection or vision inputs.
+not the PEFT ParamWrapper disk format or Ray/IPC transport. The latest test also
+compares six-token cached decode against teacher-forced prefill within vLLM,
+for both base and adapter. This is not cross-engine parity on the generated
+continuation, long-context QSA selection or vision execution.
 
 `test_qwen38_next_parallel.py` consumes the same exported fixture through the
 real AutoBridge HF import path. A 128-tensor exact round trip and TP1/TP2-EP2
@@ -57,8 +78,52 @@ component tests, not the complete trainer or IPC path. Set the optional
 `QWEN38_PARALLEL_EXPORT_DIR` to a new directory to save tiny artifacts for the
 independent vLLM gate. No artifacts are published automatically.
 
+For TP8/EP8, export a fresh fixture with `QWEN38_TINY_TP_CAPACITY=8` before
+launching eight workers. The fixture has eight experts and TP-divisible vision
+and language heads, with different routed/shared FFN widths. All eight ranks
+passed the 128-tensor round trip, actual verl unequal-length packing, DDP LoRA
+update and 78-tensor export. The TP8-to-TP1 base mean/max logprob gap was
+0.00045866/0.00207090; independent TP1 vLLM base/adapter mean gaps were
+0.00063046/0.00075272. PP and CP remained one for these passing model tests.
+
+The requested TP2/PP2/EP2/CP2/VPP2 topology has a separate opt-in gate:
+
+```bash
+RUN_QWEN38_HYBRID_TESTS=1 QWEN38_TINY_EXPORT_DIR=/path/to/tiny-fixture \
+  torchrun --standalone --nproc-per-node=8 -m pytest -s -q \
+  tests/models/mcore/test_qwen38_next_hybrid_parallel.py
+```
+
+ETP=1, dense DP=1, expert DP=2; VPP=2 means two chunks per physical stage.
+Actual group collectives and virtual layer partition checks passed. Both model
+construction cases **fail** at the provider's PP1 guard; CP and VPP are also
+explicitly unsupported. The red gates are not marked xfail and do not bypass
+the guards. No hybrid forward/backward, LoRA update or reload has run. Passing
+these construction tests in future will still not prove numerical or schedule
+correctness; HC P2P widths, global CP contexts and chunk/microbatch-keyed PLE
+recompute state need their own integration validation.
+
 The GPU suites enforce memory headroom and
 per-process allocation caps. Never evict another job to run them.
+
+`test_qwen38_next_ple_loading.py` exercises short reads, truncation, wrong
+dtype/byte ranges and failed-reload state using synthetic files on CPU. The
+direct reader validates BF16 table/I64 metadata and fills the existing pinned
+buffer without another table-sized allocation. A separate opt-in real-table
+test is available:
+
+```bash
+RUN_QWEN38_REAL_PLE_TESTS=1 QWEN38_MODEL_PATH=/path/to/checkpoint \
+  torchrun --standalone --nproc-per-node=4 -m pytest -s -q \
+  tests/models/mcore/test_qwen38_next_ple_real.py
+```
+
+All four ranks passed: all 128 real table shards (102,400,491,520 bytes) were
+loaded into TP-sharded pinned host memory; 496 lookup rows per rank matched an
+independent safetensors reader exactly after GPU gather/all-reduce. The rows
+cover every shard's start/middle/end and n-gram-derived lookups. This is not a
+full-table checksum, an all-element finiteness check, or full-model inference.
+The test has a 1 GiB per-process allocator cap and checks host/GPU headroom.
 
 The smoke recipe is `examples/tuning/lora/run_qwen38_flash_next_megatron.sh`.
 Its LoRA targets include language attention/GDN and routed/shared expert

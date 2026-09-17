@@ -82,26 +82,38 @@ def make_tiny_provider(tmp_path):
 
     from verl.models.mcore.qwen3_8_next.bridge import Qwen38NextBridge
 
+    # The default preserves the original fixture; capacity eight covers the
+    # target TP8/EP8 topology without substituting for a full-model run.
+    capacity = int(os.environ.get("QWEN38_TINY_TP_CAPACITY", "2"))
+    if capacity not in (2, 8):
+        raise ValueError("Tiny TP capacity must be 2 or 8")
+    experts = max(4, capacity)
+    shards = max(4, capacity)
     # Same architectural components, deliberately small random weights.
     config = Qwen4ExpConfig(
+        # Keep multimodal special tokens inside this fixture's tiny vocabulary.
+        image_token_id=252,
+        video_token_id=253,
+        vision_start_token_id=250,
+        vision_end_token_id=251,
         text_config=dict(
             vocab_size=256,
             hidden_size=128,
             num_hidden_layers=4,
-            num_attention_heads=4,
+            num_attention_heads=max(4, capacity),
             num_key_value_heads=1,
             head_dim=128,
             intermediate_size=256,
-            num_experts=4,
+            num_experts=experts,
             num_experts_per_tok=2,
-            moe_intermediate_size=64,
-            shared_expert_intermediate_size=64,
+            moe_intermediate_size=96 if capacity == 8 else 64,
+            shared_expert_intermediate_size=80 if capacity == 8 else 64,
             hc_count=2,
             hc_lowrank=16,
             layer_types=["linear_attention"] * 3 + ["full_attention"],
             full_attention_interval=4,
-            linear_num_key_heads=2,
-            linear_num_value_heads=4,
+            linear_num_key_heads=capacity,
+            linear_num_value_heads=2 * capacity,
             linear_key_head_dim=128,
             linear_value_head_dim=128,
             linear_conv_kernel_dim=4,
@@ -115,7 +127,7 @@ def make_tiny_provider(tmp_path):
             ngram_size=3,
             heads_per_ngram=2,
             ngram_vocab_size_base=32,
-            split_ngram_parts=4,
+            split_ngram_parts=shards,
             ple_conv_kernel_size=4,
             rope_parameters={
                 "rope_type": "default",
@@ -133,7 +145,7 @@ def make_tiny_provider(tmp_path):
             depth=1,
             hidden_size=128,
             intermediate_size=256,
-            num_heads=4,
+            num_heads=max(4, capacity),
             out_hidden_size=128,
             num_position_embeddings=64,
             patch_size=16,
@@ -149,13 +161,13 @@ def make_tiny_provider(tmp_path):
         ngram_vocab_size_base=32, ngram_heads=4, ple_dense_layer_id=0
     )
     divisor = config.text_config.make_ngram_vocab_size_divisible_by
-    rows_per_shard = ((total_rows + divisor - 1) // divisor * divisor) // 4
+    rows_per_shard = ((total_rows + divisor - 1) // divisor * divisor) // shards
     tensors = {
         f"{prefix}.layer_multipliers": torch.tensor([3, 5, 7]),
         f"{prefix}.ngram_heads_vocab_sizes": torch.tensor(sizes),
         f"{prefix}.ngram_heads_offsets": torch.tensor(offsets),
     }
-    for i in range(4):
+    for i in range(shards):
         tensors[f"{prefix}.ngram_embedding.shard_{i}.weight"] = torch.randn(rows_per_shard, 16).to(torch.bfloat16)
     save_file(tensors, str(tmp_path / "tiny-ple.safetensors"))
     (tmp_path / "model.safetensors.index.json").write_text(
@@ -180,6 +192,7 @@ def make_tiny_provider(tmp_path):
 def test_tiny_vlm_lora_update_export_and_recompute(tmp_path):
     from megatron.bridge.peft.lora import LoRA
     from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.module import Float16Module
 
     from verl.models.mcore.qwen3_8_next.bridge import Qwen38NextBridge
 
@@ -191,6 +204,11 @@ def test_tiny_vlm_lora_update_export_and_recompute(tmp_path):
     provider.recompute_method = "uniform"
     provider.recompute_num_layers = 1
     model = provider.provide(pre_process=True, post_process=True).cuda()
+    # Match verl's real mixed-precision path: raw provider construction leaves
+    # some vision parameters FP32, unlike the BF16 language embeddings. The
+    # wrapper applies the configured weight dtype and normal forward precision
+    # behavior; do not patch the VL model to work around a bare-provider test.
+    mixed_model = Float16Module(provider, model)
     registry = Qwen38NextBridge().mapping_registry()
     missing = [name for name, _ in model.named_parameters() if registry.megatron_to_hf_lookup(name) is None]
     assert not missing, f"Target parameters lacking mapping: {missing}"
@@ -221,9 +239,30 @@ def test_tiny_vlm_lora_update_export_and_recompute(tmp_path):
     handles.append(model.language_model.decoder.final_layernorm.register_forward_hook(record("trace.contraction")))
     model.eval()
     with torch.no_grad():
-        base = model(**inputs)
+        base = mixed_model(**inputs)
     for handle in handles:
         handle.remove()
+    # Exercise the actual vision tower and VL wrapper, not just processor
+    # metadata. Sixteen input patches merge into four image token embeddings.
+    image_ids = ids.clone()
+    image_ids[0, 3:9] = torch.tensor([250, 252, 252, 252, 252, 251], device="cuda")
+    image_pixels = torch.linspace(-0.25, 0.25, 16 * 1536, device="cuda", dtype=torch.float32).reshape(16, 1536)
+    image_grid = torch.tensor([[1, 4, 4]], device="cuda")
+    image_inputs = dict(inputs, input_ids=image_ids, pixel_values=image_pixels, image_grid_thw=image_grid)
+    vision_outputs = []
+    vision_hook = model.vision_model.register_forward_hook(
+        lambda _module, _args, output: vision_outputs.append(output[0].detach().cpu().clone())
+    )
+    with torch.no_grad():
+        image_base = mixed_model(**image_inputs)
+        changed_image = mixed_model(**dict(image_inputs, pixel_values=-image_pixels))
+        torch.testing.assert_close(mixed_model(**image_inputs), image_base, rtol=0, atol=0)
+    vision_hook.remove()
+    assert len(vision_outputs) == 3 and vision_outputs[0].shape == (4, 128)
+    assert bool(image_base.isfinite().all()) and bool(changed_image.isfinite().all())
+    assert not torch.equal(vision_outputs[0], vision_outputs[1]), "Vision encoder ignored changed pixels"
+    assert not torch.equal(image_base, changed_image), "Language output ignored changed vision embeddings"
+    print("QWEN38_TINY_VISION_FORWARD_PASSED image_tokens=4")
     fixture_dir = os.environ.get("QWEN38_TINY_EXPORT_DIR")
     if fixture_dir:
         from safetensors.torch import load_file, save_file
@@ -242,9 +281,10 @@ def test_tiny_vlm_lora_update_export_and_recompute(tmp_path):
         }
         exported_base.update(load_file(str(tmp_path / "tiny-ple.safetensors")))
         save_file(exported_base, str(model_path / "model.safetensors"))
+    lora_rank = max(4, provider.tensor_model_parallel_size, int(os.environ.get("QWEN38_TINY_TP_CAPACITY", "2")))
     peft = LoRA(
-        dim=4,
-        alpha=8,
+        dim=lora_rank,
+        alpha=2 * lora_rank,
         target_modules=[
             "language_model.decoder.layers.*.self_attention.in_proj",
             "language_model.decoder.layers.*.self_attention.out_proj",
@@ -254,11 +294,25 @@ def test_tiny_vlm_lora_update_export_and_recompute(tmp_path):
             "language_model.decoder.layers.*.mlp.*.linear_fc2",
         ],
     )
+    original_parameters = {id(p): p.detach().cpu().clone() for p in model.parameters()}
+    original_buffers = {name: value.detach().cpu().clone() for name, value in model.named_buffers()}
     model = peft([model])[0]
     peft.set_params_to_save([model])
+    # PEFT modifies this model in place. Do not wrap/cast a second time after
+    # warmup: dynamically created FP32 vision RoPE caches would be downcast.
+    assert mixed_model.module is model
+    assert original_parameters.keys() <= {id(p) for p in model.parameters()}
+    for name, param in model.named_parameters():
+        if id(param) in original_parameters:
+            torch.testing.assert_close(param.cpu(), original_parameters[id(param)], rtol=0, atol=0, msg=name)
+    for name, value in model.named_buffers():
+        if name in original_buffers:
+            torch.testing.assert_close(value.cpu(), original_buffers[name], rtol=0, atol=0, msg=name)
     model.eval()
     with torch.no_grad():
-        zero_lora = model(**inputs)
+        zero_lora = mixed_model(**inputs)
+        print(f"QWEN38_ZERO_LORA_TEXT_MAX_DIFF={(zero_lora - base).abs().max().item():.8f}")
+        torch.testing.assert_close(mixed_model(**image_inputs), image_base, atol=0, rtol=0)
     torch.testing.assert_close(zero_lora, base, atol=0, rtol=0)
     trainable = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
     assert trainable and all("adapter" in name for name, _ in trainable)
@@ -268,7 +322,7 @@ def test_tiny_vlm_lora_update_export_and_recompute(tmp_path):
     before = {name: p.detach().clone() for name, p in trainable}
     optimizer = torch.optim.AdamW([p for _, p in trainable], lr=1e-2)
     model.train()
-    logits = model(**inputs)
+    logits = mixed_model(**inputs)
     loss = logits.float().square().mean()
     assert bool(loss.isfinite())
     loss.backward()
@@ -281,10 +335,14 @@ def test_tiny_vlm_lora_update_export_and_recompute(tmp_path):
             torch.testing.assert_close(p.cpu(), frozen[name], rtol=0, atol=0)
     model.eval()
     with torch.no_grad():
-        updated = model(**inputs)
+        updated = mixed_model(**inputs)
     assert bool(updated.isfinite().all()) and not torch.equal(updated, zero_lora)
     with peft.disable_adapter([model]), torch.no_grad():
-        torch.testing.assert_close(model(**inputs), base, rtol=0, atol=0)
+        torch.testing.assert_close(mixed_model(**inputs), base, rtol=0, atol=0)
+        torch.testing.assert_close(mixed_model(**image_inputs), image_base, rtol=0, atol=0)
+    with torch.no_grad():
+        image_updated = mixed_model(**image_inputs)
+    assert bool(image_updated.isfinite().all()) and not torch.equal(image_updated, image_base)
 
     exports = list(Qwen38NextBridge().stream_adapter_weights_megatron_to_hf([model], cpu=True, show_progress=False))
     weights = {entry.param_name: entry.weight for entry in exports}
@@ -332,7 +390,20 @@ def test_tiny_vlm_lora_update_export_and_recompute(tmp_path):
             str(fixture_dir / "raw_adapter.safetensors"),
         )
         save_file(
-            {"input_ids": ids.cpu(), "base_logits": base.cpu(), "adapter_logits": updated.cpu(), **traces},
+            {
+                "input_ids": ids.cpu(),
+                "base_logits": base.cpu(),
+                "adapter_logits": updated.cpu(),
+                "lora_rank": torch.tensor(peft.dim),
+                "lora_alpha": torch.tensor(peft.alpha),
+                "vision_input_ids": image_ids.cpu(),
+                "vision_pixel_values": image_pixels.cpu(),
+                "vision_image_grid_thw": image_grid.cpu(),
+                "vision_embeddings": vision_outputs[0],
+                "vision_base_logits": image_base.cpu(),
+                "vision_adapter_logits": image_updated.cpu(),
+                **traces,
+            },
             str(fixture_dir / "reference.safetensors"),
         )
 
@@ -356,7 +427,7 @@ def test_tiny_vlm_lora_update_export_and_recompute(tmp_path):
     for name, p in trainable:
         torch.testing.assert_close(p, saved[name], rtol=0, atol=0)
     with torch.no_grad():
-        torch.testing.assert_close(model(**inputs), updated, rtol=0, atol=0)
+        torch.testing.assert_close(mixed_model(**inputs), updated, rtol=0, atol=0)
 
     # Compare two distinct microbatches, each containing two packed documents.
     # Frozen PLE context must survive backward replay but not leak to the next
@@ -383,7 +454,7 @@ def test_tiny_vlm_lora_update_export_and_recompute(tmp_path):
             decoder_config.recompute_method = "uniform" if chunk else None
             decoder_config.recompute_num_layers = chunk
             optimizer.zero_grad(set_to_none=True)
-            result = model(**batch)
+            result = mixed_model(**batch)
             result.float().square().mean().backward()
             grads = {name: p.grad.clone() for name, p in trainable if p.grad is not None}
             assert grads and all(bool(value.isfinite().all()) for value in grads.values())
@@ -397,3 +468,30 @@ def test_tiny_vlm_lora_update_export_and_recompute(tmp_path):
                 assert grads.keys() == reference_grads.keys()
                 for name, grad in grads.items():
                     torch.testing.assert_close(grad, reference_grads[name], rtol=0.02, atol=2e-5, msg=name)
+
+    # The vision tower is frozen by PEFT, but image-conditioned language LoRA
+    # must still receive gradients. Verify full recompute against no recompute.
+    image_reference, image_grads = None, None
+    for chunk in (None, 1):
+        decoder_config.recompute_granularity = "full" if chunk else None
+        decoder_config.recompute_method = "uniform" if chunk else None
+        decoder_config.recompute_num_layers = chunk
+        optimizer.zero_grad(set_to_none=True)
+        result = mixed_model(**image_inputs)
+        result.float().square().mean().backward()
+        grads = {name: p.grad.detach().clone() for name, p in trainable if p.grad is not None}
+        assert grads and all(bool(value.isfinite().all()) for value in grads.values())
+        for family in (".self_attention.", ".mlp.experts.", ".mlp.shared_experts."):
+            assert any(family in name and bool((grad != 0).any()) for name, grad in grads.items()), family
+        assert all(not p.requires_grad and p.grad is None for p in model.vision_model.parameters())
+        with pytest.raises(RuntimeError, match="no n-gram ids published"):
+            current_ple_batch()
+        assert all(not getattr(module, "_ple_recompute_fifo", []) for module in model.modules())
+        if chunk is None:
+            image_reference, image_grads = result.detach(), grads
+        else:
+            torch.testing.assert_close(result, image_reference, rtol=0, atol=0)
+            assert grads.keys() == image_grads.keys()
+            for name, grad in grads.items():
+                torch.testing.assert_close(grad, image_grads[name], rtol=0.02, atol=2e-5, msg=name)
+    print("QWEN38_TINY_VISION_LORA_RECOMPUTE_PASSED")

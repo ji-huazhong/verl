@@ -138,7 +138,7 @@ def _weight_map(hf_checkpoint: str) -> dict:
     return _WEIGHT_MAP_CACHE[hf_checkpoint]
 
 
-def _safetensors_slice(path: str, name: str, header_cache: dict) -> tuple[int, int, list[int]]:
+def _safetensors_slice(path: str, name: str, header_cache: dict, *, expected_dtype: str) -> tuple[int, int, list[int]]:
     """Byte range and shape of one tensor, from the safetensors header."""
     if path not in header_cache:
         with open(path, "rb") as f:
@@ -146,8 +146,22 @@ def _safetensors_slice(path: str, name: str, header_cache: dict) -> tuple[int, i
             header_cache[path] = (json.loads(f.read(n)), 8 + n)
     header, base = header_cache[path]
     meta = header[name]
+    if meta["dtype"] != expected_dtype:
+        raise ValueError(f"PLE tensor {name} must use {expected_dtype}, found {meta['dtype']}")
     start, end = meta["data_offsets"]
+    if start < 0 or end < start:
+        raise ValueError(f"PLE tensor {name} has an invalid byte range")
     return base + start, base + end, meta["shape"]
+
+
+def _readinto_exact(file, destination: memoryview, name: str) -> None:
+    """Fill the existing host allocation without a second table-sized copy."""
+    position = 0
+    while position < len(destination):
+        count = file.readinto(destination[position:])
+        if not count:
+            raise EOFError(f"Incomplete PLE tensor {name}: read {position} of {len(destination)} bytes")
+        position += count
 
 
 class Qwen38NextFrozenNGramEmbedding(MegatronModule):
@@ -187,7 +201,7 @@ class Qwen38NextFrozenNGramEmbedding(MegatronModule):
                 )
             name = f"model.language_model.layers.{layer_number - 1}.ple.ple_embedding.ngram_embedding.shard_0.weight"
             index = _weight_map(hf)
-            _, _, shape = _safetensors_slice(f"{hf}/{index[name]}", name, {})
+            _, _, shape = _safetensors_slice(f"{hf}/{index[name]}", name, {}, expected_dtype="BF16")
             self.rows_per_shard = int(shape[0])
         self.row_start = self.shard_ids[0] * self.rows_per_shard
         self.row_end = (self.shard_ids[-1] + 1) * self.rows_per_shard
@@ -216,7 +230,7 @@ class Qwen38NextFrozenNGramEmbedding(MegatronModule):
         for buf_name in ("layer_multipliers", "ngram_heads_vocab_sizes", "ngram_heads_offsets"):
             name = f"{prefix}.{buf_name}"
             path = f"{hf_checkpoint}/{index[name]}"
-            start, end, shape = _safetensors_slice(path, name, cache)
+            start, end, shape = _safetensors_slice(path, name, cache, expected_dtype="I64")
             with open(path, "rb") as f:
                 f.seek(start)
                 raw = f.read(end - start)
@@ -225,20 +239,23 @@ class Qwen38NextFrozenNGramEmbedding(MegatronModule):
 
     def load_from_hf(self, hf_checkpoint: str) -> None:
         """Fill the table from the HF safetensors."""
+        self._loaded = False  # A failed reload must not expose a partially overwritten table.
         index = _weight_map(hf_checkpoint)
         prefix = f"model.language_model.layers.{self.hf_layer_index}.ple.ple_embedding"
         cache: dict = {}
         for i, shard_id in enumerate(self.shard_ids):
             name = f"{prefix}.ngram_embedding.shard_{shard_id}.weight"
             path = f"{hf_checkpoint}/{index[name]}"
-            start, end, shape = _safetensors_slice(path, name, cache)
+            start, end, shape = _safetensors_slice(path, name, cache, expected_dtype="BF16")
             rows = i * self.rows_per_shard
             dst = self.table[rows : rows + shape[0]]
             assert tuple(dst.shape) == tuple(shape), f"{name}: {tuple(dst.shape)} vs {shape}"
+            if end - start != dst.numel() * dst.element_size():
+                raise ValueError(f"PLE tensor {name} byte range does not match its shape and dtype")
             with open(path, "rb") as f:
                 f.seek(start)
                 mv = memoryview(dst.view(torch.uint8).reshape(-1).numpy())  # type: ignore[arg-type]
-                f.readinto(mv)
+                _readinto_exact(f, mv, name)
 
         self._loaded = True
 

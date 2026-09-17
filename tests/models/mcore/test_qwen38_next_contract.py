@@ -279,3 +279,38 @@ def test_public_checkpoint_config_and_key_coverage():
         if registry.hf_to_megatron_lookup(key) is None:
             unmapped.append(key)
     assert not unmapped, f"Unmapped source tensors: {unmapped[:20]} (total={len(unmapped)})"
+
+
+def test_public_metadata_processor_and_agent_loop_positions():
+    checkpoint = os.environ.get("QWEN38_MODEL_PATH")
+    if not checkpoint:
+        pytest.skip("Set QWEN38_MODEL_PATH to the local public model metadata")
+    from PIL import Image
+
+    from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
+    from verl.workers.config.model import HFModelConfig
+
+    config = HFModelConfig(path=checkpoint, external_lib="verl.models.mcore.qwen3_8_next.bridge")
+    assert config.hf_config.architectures == ["Qwen4ExpForConditionalGeneration"]
+    assert config.processor is not None and config.tokenizer.pad_token_id is not None
+    processor = config.processor
+    for with_image in (False, True):
+        content = [{"type": "image"}] if with_image else []
+        content.append({"type": "text", "text": "Describe the image." if with_image else "What is two plus two?"})
+        prompt = processor.apply_chat_template(
+            [{"role": "user", "content": content}], tokenize=False, add_generation_prompt=True
+        )
+        images = [Image.new("RGB", (64, 64), (127, 127, 127))] if with_image else None
+        inputs = dict(processor(text=[prompt], images=images, return_tensors="pt"))
+        ids, mask = inputs.pop("input_ids"), inputs.pop("attention_mask")
+        assert ids.shape == mask.shape and ids.shape[0] == 1
+        if with_image:
+            assert bool(inputs["pixel_values"].isfinite().all())
+            assert inputs["image_grid_thw"].shape == (1, 3)
+        # Use the actual AgentLoop entry; transformers >= 5.3 requires
+        # mm_token_type_ids, which this entry derives and removes from payloads.
+        positions = AgentLoopWorker._compute_position_ids(SimpleNamespace(processor=processor), ids, mask, inputs)
+        assert positions.shape == (1, 4, ids.shape[-1])
+        assert bool((positions >= 0).all())
+        assert "mm_token_type_ids" not in inputs
+        torch.testing.assert_close(positions[0, 0], torch.arange(ids.shape[-1]))

@@ -29,6 +29,8 @@ def test_vllm_base_adapter_disable_and_reload():
     assert os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING") == "0", "Memory-bounded test must use the same process"
     fixture = Path(os.environ["QWEN38_TINY_EXPORT_DIR"])
     reference = load_file(str(fixture / "reference.safetensors"))
+    lora_rank = int(reference.get("lora_rank", torch.tensor(4)))
+    lora_alpha = int(reference.get("lora_alpha", torch.tensor(8)))
     ids = reference["input_ids"][0].tolist()
     assert reference["base_logits"].shape == (1, len(ids), 256)
     torch.cuda.set_device(0)
@@ -52,7 +54,7 @@ def test_vllm_base_adapter_disable_and_reload():
         max_logprobs=256,
         enable_prefix_caching=False,
         enable_lora=True,
-        max_lora_rank=8,
+        max_lora_rank=max(8, lora_rank),
         max_loras=1,
         max_cpu_loras=1,
         lora_dtype="bfloat16",
@@ -129,7 +131,7 @@ def test_vllm_base_adapter_disable_and_reload():
         lora_name="flash_next_tiny",
         lora_int_id=1,
         lora_path=str(fixture / "adapter"),
-        peft_config=build_peft_config_for_vllm({"rank": 4, "alpha": 8}),
+        peft_config=build_peft_config_for_vllm({"rank": lora_rank, "alpha": lora_alpha}),
         lora_tensors=load_file(str(fixture / "raw_adapter.safetensors")),
     )
     tuned = logprobs(adapter)
@@ -138,3 +140,28 @@ def test_vllm_base_adapter_disable_and_reload():
     assert llm.llm_engine.remove_lora(1)
     torch.testing.assert_close(logprobs(adapter), tuned, rtol=0, atol=0)
     assert_parity("adapter", tuned)
+
+    # Exercise recurrent/KV state over actual decode steps. Compare each
+    # generated distribution with teacher-forced prefill over the SAME sampled
+    # continuation, avoiding an assumption that BF16 argmax ties match engines.
+    # This is vLLM cache/prefill consistency, not yet Megatron parity on these
+    # newly generated continuations.
+    for label, request in (("base", None), ("adapter", adapter)):
+        sampled = llm.generate(
+            [{"prompt_token_ids": ids}],
+            SamplingParams(temperature=0, max_tokens=6, logprobs=256, ignore_eos=True, detokenize=False),
+            lora_request=request,
+            use_tqdm=False,
+        )[0].outputs[0]
+        assert len(sampled.token_ids) == len(sampled.logprobs) == 6
+        replay = llm.generate(
+            [{"prompt_token_ids": ids + list(sampled.token_ids)}], params, lora_request=request, use_tqdm=False
+        )[0]
+        cached = torch.tensor([[position[token].logprob for token in range(256)] for position in sampled.logprobs])
+        teacher = torch.tensor(
+            [[position[token].logprob for token in range(256)] for position in replay.prompt_logprobs[len(ids) :]]
+        )
+        gap = (cached - teacher).abs()
+        print(f"QWEN38_{label.upper()}_DECODE_PREFILL_GAP_MEAN={gap.mean().item():.8f}")
+        print(f"QWEN38_{label.upper()}_DECODE_PREFILL_GAP_MAX={gap.max().item():.8f}")
+        assert bool(gap.isfinite().all()) and gap.mean() < 0.005 and gap.max() < 0.05

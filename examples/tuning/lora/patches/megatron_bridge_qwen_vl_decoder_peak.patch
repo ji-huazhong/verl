@@ -1,0 +1,14 @@
+--- a/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
++++ b/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
+@@ -97,6 +97,11 @@
+         )
+ 
+         # rebuild the transformer block
++        # Release GPTModel's temporary decoder before allocating the VL block.
++        # Assignment alone keeps both complete decoders alive until the RHS
++        # finishes, roughly doubling construction-time parameter memory.
++        # Keep the registration slot: deleting changes parameter traversal order.
++        self.decoder = None
+         self.decoder = Qwen3VLTransformerBlock(
+             config=self.config,
+             spec=transformer_layer_spec,
