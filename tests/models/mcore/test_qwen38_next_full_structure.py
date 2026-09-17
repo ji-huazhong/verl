@@ -8,6 +8,8 @@ dispatch context redirects explicit device allocations missed by native meta
 initialization (Core embeddings/GDN and Bridge vision); every parameter must
 remain meta. NCCL/runtime allocation is still bounded and reported.
 Only checkpoint headers are read. No tensor payload, forward or update runs.
+Logical parameter and PLE bytes describe the constructed rank-local layout,
+not measured runtime peaks or a promise that training fits in that memory.
 """
 
 import json
@@ -253,10 +255,15 @@ def test_full_checkpoint_target_structure_and_shape_coverage():
         real_bytes = sum(size for _, size in nonmeta)
         if nonmeta:
             errors.insert(0, f"Unexpected real allocation: {nonmeta[:10]}, total bytes: {real_bytes}")
+        ple_host_bytes = 0
+        ple_tables = 0
         for model in models:
             for module in model.modules():
                 if isinstance(module, Qwen38NextFrozenNGramEmbedding):
                     assert module.table.is_meta and not module._loaded
+                    ple_host_bytes += module.table.numel() * module.table.element_size()
+                    ple_tables += 1
+        base_parameter_bytes = sum(task.param_weight.numel() * task.param_weight.element_size() for task in local_tasks)
         layers = [layer.layer_number for model in models for layer in model.language_model.decoder.layers]
         results = [None] * 8
         if errors:
@@ -297,6 +304,10 @@ def test_full_checkpoint_target_structure_and_shape_coverage():
                     mapping_counts=dict(mapping_counts),
                     fused_expert_sources=len(all_experts),
                     fused_expert_rows=sum(len(rows) for rows in all_experts.values()),
+                    logical_base_parameter_bytes=base_parameter_bytes,
+                    logical_ple_host_bytes=ple_host_bytes,
+                    local_ple_tables=ple_tables,
+                    free_cuda_bytes_before_audit=free,
                     real_parameter_bytes=real_bytes,
                     peak_cuda_mib=torch.cuda.max_memory_allocated() / 1024**2,
                     payload_loaded=False,

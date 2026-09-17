@@ -483,6 +483,11 @@ and requires 4 GiB free on every GPU; communication/runtime still use memory.
 It reads no weight payload and does not prove loading, packing order, hashes,
 forward/backward, refit, or training. Meta PLE instances explicitly reject
 loading/forward, including after `to_empty`; reconstruct a real model instead.
+The audit also reports logical rank-local base parameter bytes and pinned-host
+PLE table bytes for its actual topology. These are not a runtime fit estimate:
+adapters, gradients, optimizer, activations, construction/conversion temporaries,
+communication and rollout KV cache are additional. CP/expert-DP replication and
+PP imbalance mean checkpoint bytes divided by eight is not a sufficient budget.
 
 Ordinary base loading also validates its native Bridge conversion plan before
 fetching parameter payloads: every local parameter/persistent buffer must have
