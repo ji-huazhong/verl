@@ -10,9 +10,10 @@ set -euo pipefail
 export QWEN38_SMOKE_GPUS="${QWEN38_SMOKE_GPUS:-1}"
 case "$QWEN38_SMOKE_GPUS" in 1|2|8) ;; *) exit 2 ;; esac
 # The production pool reserves three CPU slots per GPU before any workers
-# launch. Leave additional slots for the trainer, queue and reward services.
-QWEN38_SMOKE_CPUS=$((3 * QWEN38_SMOKE_GPUS + 8))
-if (( QWEN38_SMOKE_CPUS < 16 )); then QWEN38_SMOKE_CPUS=16; fi
+# launch. The queue and trainer already consume nine CPU slots BEFORE the
+# placement group: 3*8+8 leaves only 23 for its required 24 and waits forever.
+# Reserve 16 additional slots for these and subsequent rollout/reward services.
+QWEN38_SMOKE_CPUS=$((3 * QWEN38_SMOKE_GPUS + 16))
 [[ ! -e "$QWEN38_SMOKE_OUTPUT" ]] || exit 3
 python3 - <<'PY'
 import json
