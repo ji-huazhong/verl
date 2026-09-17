@@ -79,7 +79,9 @@ class VLLMHijack:
                 hf_to_vllm_mapper = None
                 if hasattr(model, "hf_to_vllm_mapper") and model.hf_to_vllm_mapper is not None:
                     hf_to_vllm_mapper = model.hf_to_vllm_mapper
-                    if is_version_ge(minver="0.25.0"):
+                    if hasattr(hf_to_vllm_mapper, "get_rename_mapper"):
+                        hf_to_vllm_mapper = hf_to_vllm_mapper.get_rename_mapper()
+                    elif is_version_ge(minver="0.25.0"):
                         hf_to_vllm_mapper = hf_to_vllm_mapper.get_unstacked_mapper()
 
                 lora_request_kwargs = {
@@ -99,6 +101,13 @@ class VLLMHijack:
                         self.vocab_size + self.lora_config.lora_extra_vocab_size
                     )
                 if isinstance(lora_request, TensorLoRARequest):
+                    from verl.utils.vllm.lora_layout import expand_stacked_expert_lora
+
+                    lora_tensors = expand_stacked_expert_lora(
+                        lora_tensors,
+                        getattr(model, "packed_modules_mapping", {}),
+                        supported_expert_modules=packed_modules_mapping.get("experts", ()),
+                    )
                     lora = self._lora_model_cls.from_lora_tensors(
                         tensors=lora_tensors,
                         **lora_request_kwargs,

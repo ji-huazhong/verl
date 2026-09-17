@@ -6,7 +6,7 @@ Use the real Qwen4Exp config from vLLM, not a Qwen3.5 model-type alias.
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
-from megatron.bridge.models.conversion.param_mapping import ReplicatedMapping
+from megatron.bridge.models.conversion.param_mapping import ColumnParallelMapping, ReplicatedMapping
 from megatron.bridge.models.qwen.qwen35_bridge import Qwen35MoEBridge, _apply_qwen35_moe_config
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
 from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import _get_vision_mappings
@@ -67,6 +67,15 @@ class Qwen38NextBridge(MegatronModelBridge):
             "in_proj.layer_norm_weight",
         )
         mappings = [m for m in mappings if not m.megatron_param.endswith(absent_norms)]
+        # These head-wise vectors remain column-sharded in the GDN subclass.
+        # AutoMapping dispatches by concrete class name, not inheritance; encode
+        # their actual layout explicitly instead of registering a global alias.
+        mappings = [
+            ColumnParallelMapping(m.megatron_param, m.hf_param)
+            if m.megatron_param.endswith(("self_attention.A_log", "self_attention.dt_bias"))
+            else m
+            for m in mappings
+        ]
 
         def replicated(mcore, hf):
             mappings.append(ReplicatedMapping(megatron_param=mp + mcore, hf_param=hp + hf))

@@ -13,12 +13,15 @@ contraction are Flash-Next-specific. No global Core monkey patch is installed.
 
 CPU tests cover config translation, public-checkpoint source-key coverage,
 packed boundaries (including empty sequences), partial RoPE, PLE hook cleanup,
-and native GDN LoRA B export at TP1/TP2. Opt-in GPU tests cover FP32/BF16 HC
+and native GDN LoRA B export at TP1/TP2. They also cover the sigmoid GDN output
+gate (without changing the SiLU convolution/MLP activation), indexed/single-file
+PLE checkpoints, and canonical stacked-expert adapter layouts. Opt-in GPU tests
+cover FP32/BF16 HC
 forward/backward, a four-layer random VLM's construction and complete target
 mapping, zero-adapter equality, effective LoRA updates with frozen base weights,
 HF adapter export, native distributed adapter checkpoint round trip, and full
 recompute at one/two layers per group across packed microbatches. These do
-**not** prove full-checkpoint parity, vLLM adapter reload, multimodal execution,
+**not** prove full-checkpoint parity, multimodal execution,
 effective GRPO learning, or trainer/optimizer resume.
 
 Run with the baseline packages installed:
@@ -34,17 +37,36 @@ RUN_QWEN38_GPU_TESTS=1 torchrun --standalone --nproc-per-node=1 \
 For the separate vLLM text/reload gate, set `QWEN38_TINY_EXPORT_DIR` to a new
 directory during the GPU test, then run `test_qwen38_next_vllm.py` in a separate
 process with that directory, `RUN_QWEN38_VLLM_TESTS=1`, and
-`VLLM_ENABLE_V1_MULTIPROCESSING=0`. This gate currently **fails**: the tiny base's
-mean/max logprob gap is 0.02281671/0.18260384, and the packed-expert PEFT adapter
-has an incompatible layout in vLLM's MoE loader even with mixed-format enabled.
-Neither issue is fixed yet; exporting the fixture alone is not a pass.
-Both GPU suites enforce memory headroom and
+`VLLM_ENABLE_V1_MULTIPROCESSING=0`. After fixing the GDN output gate and converting
+canonical raw expert adapters through public packed-module mappings, the tiny
+TP1 base/adapter mean logprob gaps are 0.00044113/0.00056800. The existing mean
+< 0.005 and max < 0.05 gates pass without relaxed tolerances. This exercises the
+actual verl `TensorLoRARequest` loader, activation, disabling and remove/reload,
+not the PEFT ParamWrapper disk format or Ray/IPC transport. It checks short-text
+prefill, not multi-token decode, long-context QSA selection or vision inputs.
+
+`test_qwen38_next_parallel.py` consumes the same exported fixture through the
+real AutoBridge HF import path. A 128-tensor exact round trip and TP1/TP2-EP2
+base forward parity have passed (TP2 mean/max logprob gap 0.00033432/0.00201797).
+Use `RUN_QWEN38_PARALLEL_TESTS=1` under torchrun; `QWEN38_TEST_TP/EP` default to
+the process count, with ETP/PP/CP fixed to one. DDP LoRA updates with full
+recompute and a 78-tensor adapter export have also passed at TP2/EP2. Loading
+that adapter in independent TP1 vLLM passes (base/adapter mean logprob gaps
+0.00043296/0.00057397), including disabling and remove/reload. These are tiny
+component tests, not the complete trainer or IPC path. Set the optional
+`QWEN38_PARALLEL_EXPORT_DIR` to a new directory to save tiny artifacts for the
+independent vLLM gate. No artifacts are published automatically.
+
+The GPU suites enforce memory headroom and
 per-process allocation caps. Never evict another job to run them.
 
 The smoke recipe is `examples/tuning/lora/run_qwen38_flash_next_megatron.sh`.
 Its LoRA targets include language attention/GDN and routed/shared expert
 linears, not the HC architectural low-rank matrices, frozen QSA indexer, or
 vision encoder. Adapter-only reload is requested; no silent full-weight merge.
+The canonical stacked-expert conversion requires the active vLLM loader to
+advertise matching per-expert 2D targets. Native 3D/shared-stack-only layouts
+are not silently treated as equivalent; unsupported mappings fail explicitly.
 
 ## Important current boundaries
 

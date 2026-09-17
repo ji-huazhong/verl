@@ -22,7 +22,9 @@ pytestmark = pytest.mark.skipif(
 def test_vllm_base_adapter_disable_and_reload():
     from safetensors.torch import load_file
     from vllm import LLM, SamplingParams
-    from vllm.lora.request import LoRARequest
+
+    from verl.utils.megatron_peft_utils import build_peft_config_for_vllm
+    from verl.utils.vllm import TensorLoRARequest, VLLMHijack
 
     assert os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING") == "0", "Memory-bounded test must use the same process"
     fixture = Path(os.environ["QWEN38_TINY_EXPORT_DIR"])
@@ -50,14 +52,51 @@ def test_vllm_base_adapter_disable_and_reload():
         max_logprobs=256,
         enable_prefix_caching=False,
         enable_lora=True,
-        enable_mixed_moe_lora_format=True,
         max_lora_rank=8,
         max_loras=1,
         max_cpu_loras=1,
         lora_dtype="bfloat16",
         seed=123,
     )
+    VLLMHijack.hijack()
     params = SamplingParams(temperature=0, max_tokens=1, prompt_logprobs=256, detokenize=False)
+
+    def install_traces(model):
+        model._test_traces = {}
+
+        def save(name, value):
+            model._test_traces[name] = value.detach().reshape(-1, value.shape[-1]).cpu().contiguous().clone()
+
+        def wrap_hc(hc, prefix):
+            for method in ("mix", "combine_and_mix"):
+                original = getattr(hc, method)
+
+                def wrapped(*args, _original=original, **kwargs):
+                    output = _original(*args, **kwargs)
+                    save(f"{prefix}.input", output[1])
+                    save(f"{prefix}.residual", output[0])
+                    return output
+
+                setattr(hc, method, wrapped)
+
+        def hook(name):
+            def capture(_module, _args, output):
+                save(name, output[0] if isinstance(output, tuple) else output)
+
+            return capture
+
+        for i, layer in enumerate(model.language_model.model.layers):
+            wrap_hc(layer.attn_hyper_connection, f"trace.{i}.self_attention")
+            wrap_hc(layer.mlp_hyper_connection, f"trace.{i}.mlp")
+            attn = layer.linear_attn if layer.layer_type == "linear_attention" else layer.self_attn
+            attn.register_forward_hook(hook(f"trace.{i}.self_attention.output"))
+            layer.mlp.register_forward_hook(hook(f"trace.{i}.mlp.output"))
+            if layer.ple is not None:
+                layer.ple.register_forward_hook(hook(f"trace.{i}.ple"))
+        wrap_hc(model.language_model.model.hyper_connection_mixer, "trace.final")
+
+    if any(name.startswith("trace.") for name in reference):
+        llm.apply_model(install_traces)
 
     def logprobs(adapter=None):
         output = llm.generate([{"prompt_token_ids": ids}], params, lora_request=adapter, use_tqdm=False)[0]
@@ -74,8 +113,25 @@ def test_vllm_base_adapter_disable_and_reload():
         assert gap.mean() < 0.005 and gap.max() < 0.05, "Tiny cross-engine parity gate failed"
 
     base = logprobs()
+    if any(name.startswith("trace.") for name in reference):
+        trace = llm.apply_model(lambda model: model._test_traces)[0]
+        trace["trace.contraction"] = trace.pop("trace.final.input")
+        for name, expected in reference.items():
+            if name.startswith("trace."):
+                actual = trace[name][: len(ids)]
+                assert actual.shape == expected.shape, (name, actual.shape, expected.shape)
+                gap = (actual.float() - expected.float()).abs()
+                print(f"QWEN38_TRACE {name} mean={gap.mean():.8f} max={gap.max():.8f}")
     assert_parity("base", base)
-    adapter = LoRARequest("flash_next_tiny", 1, str(fixture / "adapter"), is_3d_lora_weight=True)
+    # Exercise the actual verl tensor loading contract, not a disk-only PEFT
+    # adapter or a base checkpoint with adapter weights silently merged in.
+    adapter = TensorLoRARequest(
+        lora_name="flash_next_tiny",
+        lora_int_id=1,
+        lora_path=str(fixture / "adapter"),
+        peft_config=build_peft_config_for_vllm({"rank": 4, "alpha": 8}),
+        lora_tensors=load_file(str(fixture / "raw_adapter.safetensors")),
+    )
     tuned = logprobs(adapter)
     assert not torch.equal(base, tuned), "Adapter was silently ignored"
     torch.testing.assert_close(logprobs(), base, rtol=0, atol=0)

@@ -47,6 +47,36 @@ def test_indexer_partial_rope_uses_absolute_composed_angles():
     assert torch.equal(out[..., 4:], x[..., 4:])
 
 
+@pytest.mark.parametrize("sharded", [False, True])
+def test_ple_weight_map_accepts_both_hf_safetensors_layouts(tmp_path, sharded):
+    pytest.importorskip("megatron.bridge")
+    from safetensors.torch import save_file
+
+    from verl.models.mcore.qwen3_8_next.ops.ple import _weight_map
+
+    name = "model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight"
+    filename = "model-00001-of-00001.safetensors" if sharded else "model.safetensors"
+    save_file({name: torch.ones(2, 3)}, str(tmp_path / filename))
+    if sharded:
+        (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {name: filename}}))
+    assert _weight_map(str(tmp_path)) == {name: filename}
+
+
+def test_gdn_output_gate_is_sigmoid_not_mlp_silu():
+    pytest.importorskip("megatron.bridge")
+    from verl.models.mcore.qwen3_8_next.ops.gated_delta_net import Qwen38NextGatedDeltaNet
+
+    config = SimpleNamespace(qwen3_8_next_output_gate_type="sigmoid", activation_func=torch.nn.functional.silu)
+    fake = SimpleNamespace(config=config, out_norm=torch.nn.Identity())
+    x = torch.ones(1, 2, 1, 3, requires_grad=True)
+    gate = torch.tensor([[[[-2.0, 0.0, 2.0]], [[-1.0, 0.5, 1.0]]]], requires_grad=True)
+    out = Qwen38NextGatedDeltaNet._apply_gated_norm(fake, x, gate)
+    torch.testing.assert_close(out, gate.reshape(-1, 3).sigmoid())
+    out.sum().backward()
+    torch.testing.assert_close(gate.grad, gate.sigmoid() * (1 - gate.sigmoid()))
+    assert config.activation_func is torch.nn.functional.silu
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -234,6 +264,10 @@ def test_public_checkpoint_config_and_key_coverage():
     assert provider.mtp_num_layers is None
     # No process group or GPU tensor allocation is needed to build a block spec.
     spec = build_flash_next_spec(provider, pp_rank=0)
+    from verl.models.mcore.qwen3_8_next.ops.gated_delta_net import Qwen38NextGatedDeltaNet
+
+    assert provider.qwen3_8_next_output_gate_type == "sigmoid"
+    assert sum(s.submodules.self_attention.module is Qwen38NextGatedDeltaNet for s in spec.layer_specs) == 36
     assert len(spec.layer_specs) == provider.num_layers
     assert sum(hasattr(s.submodules.self_attention.submodules, "linear_qkv") for s in spec.layer_specs) == 12
     registry = bridge.mapping_registry()

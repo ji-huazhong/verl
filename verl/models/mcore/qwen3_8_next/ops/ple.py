@@ -12,11 +12,13 @@ import json
 import logging
 import struct
 import threading
+from pathlib import Path
 
 import torch
 from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
+from safetensors import safe_open
 from torch import Tensor
 
 from verl.models.mcore.qwen3_8_next.ops.kernel.ple_gather import gather_ple_rows
@@ -124,8 +126,15 @@ _WEIGHT_MAP_CACHE: dict[str, dict] = {}
 def _weight_map(hf_checkpoint: str) -> dict:
     """The checkpoint's name->file map, parsed once per path per process."""
     if hf_checkpoint not in _WEIGHT_MAP_CACHE:
-        with open(f"{hf_checkpoint}/model.safetensors.index.json") as f:
-            _WEIGHT_MAP_CACHE[hf_checkpoint] = json.load(f)["weight_map"]
+        index = Path(hf_checkpoint) / "model.safetensors.index.json"
+        if index.is_file():
+            with index.open() as f:
+                _WEIGHT_MAP_CACHE[hf_checkpoint] = json.load(f)["weight_map"]
+        else:
+            # HF also supports one safetensors file without a shard index.
+            # Inspect only the header: never materialize the frozen PLE table.
+            with safe_open(str(Path(hf_checkpoint) / "model.safetensors"), framework="pt", device="cpu") as f:
+                _WEIGHT_MAP_CACHE[hf_checkpoint] = dict.fromkeys(f.keys(), "model.safetensors")
     return _WEIGHT_MAP_CACHE[hf_checkpoint]
 
 

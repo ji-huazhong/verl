@@ -199,9 +199,31 @@ def test_tiny_vlm_lora_update_export_and_recompute(tmp_path):
     cu = torch.tensor([0, 16], dtype=torch.int32, device="cuda")
     packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=16, max_seqlen_kv=16)
     inputs = dict(input_ids=ids, position_ids=positions, attention_mask=None, packed_seq_params=packed)
+    traces = {}
+    handles = []
+
+    def record(name, index=None):
+        def hook(_module, _args, output):
+            value = output[index] if index is not None else output
+            traces[name] = value.detach().reshape(-1, value.shape[-1]).cpu().contiguous().clone()
+
+        return hook
+
+    for i, layer in enumerate(model.language_model.decoder.layers):
+        for site in ("self_attention", "mlp"):
+            hc = getattr(layer, f"{site}_hyper_connection")
+            handles.append(hc.register_forward_hook(record(f"trace.{i}.{site}.input", 0)))
+            handles.append(hc.register_forward_hook(record(f"trace.{i}.{site}.residual", 3)))
+            handles.append(getattr(layer, site).register_forward_hook(record(f"trace.{i}.{site}.output", 0)))
+        ple = getattr(layer.self_attention_hyper_connection, "ple", None)
+        if ple is not None:
+            handles.append(ple.register_forward_hook(record(f"trace.{i}.ple")))
+    handles.append(model.language_model.decoder.final_layernorm.register_forward_hook(record("trace.contraction")))
     model.eval()
     with torch.no_grad():
         base = model(**inputs)
+    for handle in handles:
+        handle.remove()
     fixture_dir = os.environ.get("QWEN38_TINY_EXPORT_DIR")
     if fixture_dir:
         from safetensors.torch import load_file, save_file
@@ -306,7 +328,11 @@ def test_tiny_vlm_lora_update_export_and_recompute(tmp_path):
             str(adapter_dir / "adapter_model.safetensors"),
         )
         save_file(
-            {"input_ids": ids.cpu(), "base_logits": base.cpu(), "adapter_logits": updated.cpu()},
+            {name: value.detach().contiguous().clone() for name, value in weights.items()},
+            str(fixture_dir / "raw_adapter.safetensors"),
+        )
+        save_file(
+            {"input_ids": ids.cpu(), "base_logits": base.cpu(), "adapter_logits": updated.cpu(), **traces},
             str(fixture_dir / "reference.safetensors"),
         )
 

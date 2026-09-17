@@ -15,6 +15,7 @@ from .config import validate_runtime
 from .hyper_connection import Qwen38NextHCHeadContraction
 from .layer import Qwen38NextTransformerLayer
 from .ops.attention import Qwen38NextAttention
+from .ops.gated_delta_net import Qwen38NextGatedDeltaNet
 from .ops.ple import (
     Qwen38NextFrozenNGramEmbedding,
     build_ngram_contexts_packed,
@@ -37,6 +38,7 @@ def build_flash_next_spec(config, vp_stage=None, pp_rank=None):
             attention.module = Qwen38NextAttention
             attention.submodules.linear_qkv = TEColumnParallelLinear
         else:
+            attention.module = Qwen38NextGatedDeltaNet
             attention.submodules.in_proj = TEColumnParallelLinear
         # Remove aliases for layernorms that do not exist in Flash-Next.
         sub.sharded_state_dict_keys_map = {}

@@ -38,6 +38,7 @@ def apply_flash_next_config(provider, text_config, checkpoint):
     provider.qwen3_8_next_hf_checkpoint = str(checkpoint)
     if getattr(text_config, "output_gate_type", "sigmoid") != "sigmoid":
         raise ValueError("Only sigmoid attention output gates have been implemented")
+    provider.qwen3_8_next_output_gate_type = "sigmoid"
     # GRPO uses the main autoregressive policy, not the auxiliary MTP heads.
     provider.mtp_num_layers = None
 
