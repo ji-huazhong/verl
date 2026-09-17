@@ -66,6 +66,24 @@ compares six-token cached decode against teacher-forced prefill within vLLM,
 for both base and adapter. This is not cross-engine parity on the generated
 continuation, long-context QSA selection or vision execution.
 
+`test_qwen38_next_ipc.py` separately covers the production `ServerAdapter`,
+bucketed CUDA IPC transport, and colocate worker extension through a real Ray
+actor wrapping vLLM. Export a fresh capacity-eight fixture with
+`QWEN38_TINY_LORA_RANK=16`; its 78 BF16 adapter tensors total 1,610,752 bytes and
+must span multiple 1 MiB buckets. Run with exactly one visible GPU,
+`RUN_QWEN38_IPC_TESTS=1`, the fixture directory, and
+`VLLM_ENABLE_V1_MULTIPROCESSING=0`. Use a short `TMPDIR` for Ray sockets.
+The test corrupts the live LM head, restores the base over IPC, and verifies
+exact outputs and live base-parameter SHA-256. It then streams the trained
+adapter, a zero-B adapter, and the trained adapter again, checking activation,
+disable, stale-state replacement, exact repeatability, cache-reset/version
+callbacks, and unchanged base-parameter hashes. The latest run passed in
+42.93 seconds; base/adapter mean logprob gaps were 0.00060168/0.00067403.
+The test explicitly tears down its own engine/process groups and Ray cluster.
+This is TP1 text-only transport/loader integration, not the HTTP server, a live
+Megatron actor/optimizer, sleep/wake, distributed rollout, or complete GRPO.
+The hashes cover named base parameters, not every buffer or host PLE table.
+
 `test_qwen38_next_parallel.py` consumes the same exported fixture through the
 real AutoBridge HF import path. A 128-tensor exact round trip and TP1/TP2-EP2
 base forward parity have passed (TP2 mean/max logprob gap 0.00033432/0.00201797).

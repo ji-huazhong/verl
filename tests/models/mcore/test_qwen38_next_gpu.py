@@ -282,6 +282,8 @@ def test_tiny_vlm_lora_update_export_and_recompute(tmp_path):
         exported_base.update(load_file(str(tmp_path / "tiny-ple.safetensors")))
         save_file(exported_base, str(model_path / "model.safetensors"))
     lora_rank = max(4, provider.tensor_model_parallel_size, int(os.environ.get("QWEN38_TINY_TP_CAPACITY", "2")))
+    lora_rank = int(os.environ.get("QWEN38_TINY_LORA_RANK", str(lora_rank)))
+    assert lora_rank > 0 and lora_rank % provider.tensor_model_parallel_size == 0
     peft = LoRA(
         dim=lora_rank,
         alpha=2 * lora_rank,
