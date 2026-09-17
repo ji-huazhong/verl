@@ -7,6 +7,7 @@ and a fresh QWEN38_MODEL_CP_OUTPUT. Exported artifacts stay outside the repo.
 Optional QWEN38_MODEL_TP=2 / QWEN38_MODEL_EP=2 uses two/four workers for
 CP1/CP2, comparing each TP shard with its matching independent CP1 baseline.
 The production provider guard is never bypassed or monkey-patched here.
+Set QWEN38_MODEL_IMAGES=1 on BOTH independent runs for native image packing.
 """
 
 import os
@@ -80,6 +81,7 @@ def _run_model_case(tp_size, ep_size, cp_size):
     from megatron.core.transformer.module import Float16Module
     from safetensors.torch import load_file, save_file
 
+    from tests.models.mcore.qwen38_vision_fixture import make_packed_fixture_batches
     from verl.models.mcore.bridge import AutoBridge
     from verl.models.mcore.model_forward import gptmodel_forward_model_engine
     from verl.models.mcore.qwen3_8_next.bridge import Qwen38NextBridge
@@ -93,8 +95,10 @@ def _run_model_case(tp_size, ep_size, cp_size):
     comparison_name = "comparison.safetensors" if tp_size == 1 else f"comparison-tp{tp_rank}.safetensors"
     assert not output_dir.exists(), "Use a fresh output directory; never overwrite prior evidence"
     baseline = None
+    images = os.environ.get("QWEN38_MODEL_IMAGES") == "1"
     if cp_size > 1:
         baseline = load_file(str(Path(os.environ["QWEN38_MODEL_CP_REFERENCE"]) / comparison_name))
+        assert bool(baseline.get("fixture.images", torch.tensor(False))) == images, "Reference modality mismatch"
     bridge = AutoBridge.from_hf_pretrained(fixture / "model", local_files_only=True)
     assert isinstance(bridge._model_bridge, Qwen38NextBridge)
     config = bridge.to_megatron_provider(load_weights=False)
@@ -123,53 +127,57 @@ def _run_model_case(tp_size, ep_size, cp_size):
     model = config.provide(pre_process=True, post_process=True).cuda()
     bridge.load_hf_weights([model])
     mixed = Float16Module(config, model).eval()
-    docs_by_batch = []
-    for batch_index, lengths in enumerate(([13, 7, 23], [19, 9])):
-        docs = [
-            (torch.arange(n, device="cuda") + 17 * doc + 11 * batch_index) % 200 + 3 for doc, n in enumerate(lengths)
-        ]
-        for ids in docs:
-            ids[4::11] = config.qwen3_8_next_eos_token_id
-        docs_by_batch.append(docs)
+    docs_by_batch, mm_by_batch = make_packed_fixture_batches(config.qwen3_8_next_eos_token_id, images=images)
 
-    def forward(module, docs):
+    def forward(module, docs, multimodal=None):
         nested = torch.nested.nested_tensor(docs, layout=torch.jagged)
-        output = gptmodel_forward_model_engine(module, nested, multi_modal_inputs={}, vision_model=True, pad_token_id=0)
+        output = gptmodel_forward_model_engine(
+            module, nested, multi_modal_inputs=multimodal or {}, vision_model=True, pad_token_id=0
+        )
         assert [v.shape[0] for v in output.unbind()] == [v.numel() for v in docs]
         assert output.shape[-1] * tp_size == 256
         # Gather autograd splits the vocabulary gradient back to its owner;
         # the full-vocabulary mean below is already normalized exactly once.
         return gather_from_tensor_model_parallel_region(output.values(), group=config._pg_collection.tp)
 
-    recorded = {}
+    recorded = {"fixture.images": torch.tensor(images)}
 
     def record_or_compare(name, value, *, gradient=False, exact=False):
         detached = value.detach().float().cpu()
-        assert bool(detached.isfinite().all())
-        if baseline is not None:
-            expected = baseline[name]
-            if exact:
-                torch.testing.assert_close(detached, expected, rtol=0, atol=0)
-            elif gradient:
-                torch.testing.assert_close(detached, expected, rtol=0.03, atol=2e-3)
-                if expected.norm() > 1e-10:
-                    relative = (detached - expected).norm() / expected.norm()
-                    assert relative < 0.03, (name, relative.item())
+        error = None
+        try:
+            assert bool(detached.isfinite().all())
+            if baseline is not None:
+                expected = baseline[name]
+                if exact:
+                    torch.testing.assert_close(detached, expected, rtol=0, atol=0)
+                elif gradient:
+                    torch.testing.assert_close(detached, expected, rtol=0.03, atol=2e-3)
+                    if expected.norm() > 1e-10:
+                        relative = (detached - expected).norm() / expected.norm()
+                        assert relative < 0.03, (name, relative.item())
+                    else:
+                        assert detached.abs().max() < 1e-7
                 else:
-                    assert detached.abs().max() < 1e-7
-            else:
-                gap = (detached.log_softmax(-1) - expected.log_softmax(-1)).abs()
-                print(
-                    f"QWEN38_MODEL_CP TP={tp_size} EP={ep_size} CP={cp_size} NAME={name} "
-                    f"RANK={rank} GAP_MEAN={gap.mean():.9f} GAP_MAX={gap.max():.9f}",
-                    flush=True,
-                )
-                assert gap.mean() < 0.005 and gap.max() < 0.05
+                    gap = (detached.log_softmax(-1) - expected.log_softmax(-1)).abs()
+                    print(
+                        f"QWEN38_MODEL_CP TP={tp_size} EP={ep_size} CP={cp_size} NAME={name} "
+                        f"RANK={rank} GAP_MEAN={gap.mean():.9f} GAP_MAX={gap.max():.9f}",
+                        flush=True,
+                    )
+                    assert gap.mean() < 0.005 and gap.max() < 0.05
+        except (AssertionError, KeyError) as failure:
+            error = str(failure)
+        # All shards reach the same check before any enters another model
+        # collective. A single failing TP shard must not strand its peers.
+        valid = torch.tensor(int(error is None), device="cuda")
+        torch.distributed.all_reduce(valid, op=torch.distributed.ReduceOp.MIN)
+        assert valid.item(), (name, error or "another rank failed this comparison")
         recorded[name] = detached.contiguous()
 
     with torch.no_grad():
         for index, docs in enumerate(docs_by_batch):
-            record_or_compare(f"base.{index}", forward(mixed, docs))
+            record_or_compare(f"base.{index}", forward(mixed, docs, mm_by_batch[index]))
     peft = LoRA(
         dim=16,
         alpha=32,
@@ -205,7 +213,7 @@ def _run_model_case(tp_size, ep_size, cp_size):
         config.recompute_granularity = "full" if recompute else None
         ddp.zero_grad_buffer()
         for index, docs in enumerate(docs_by_batch):
-            output = forward(ddp, docs)
+            output = forward(ddp, docs, mm_by_batch[index])
             record_or_compare(f"adapter.{int(recompute)}.{index}", output)
             (output.float().square().mean() / len(docs_by_batch)).backward()
             with pytest.raises(RuntimeError, match="no n-gram ids published"):
@@ -232,12 +240,12 @@ def _run_model_case(tp_size, ep_size, cp_size):
     model.eval()
     with torch.no_grad():
         for index, docs in enumerate(docs_by_batch):
-            updated = forward(mixed, docs)
+            updated = forward(mixed, docs, mm_by_batch[index])
             record_or_compare(f"updated.{index}", updated)
             assert not torch.equal(updated.float().cpu(), recorded[f"adapter.1.{index}"])
             with peft.disable_adapter([model]):
                 torch.testing.assert_close(
-                    forward(mixed, docs).float().cpu(), recorded[f"base.{index}"], rtol=0, atol=0
+                    forward(mixed, docs, mm_by_batch[index]).float().cpu(), recorded[f"base.{index}"], rtol=0, atol=0
                 )
     for name, parameter in model.named_parameters():
         if name in frozen:
@@ -273,4 +281,7 @@ def _run_model_case(tp_size, ep_size, cp_size):
     if cp_rank == 0:
         save_file(recorded, str(output_dir / comparison_name))
     torch.distributed.barrier()
-    print(f"QWEN38_MODEL_CP_EXPORT_PASSED TP={tp_size} EP={ep_size} CP={cp_size} RANK={rank} TENSORS=78", flush=True)
+    print(
+        f"QWEN38_MODEL_CP_EXPORT_PASSED TP={tp_size} EP={ep_size} CP={cp_size} RANK={rank} IMAGES={images} TENSORS=78",
+        flush=True,
+    )

@@ -9,6 +9,25 @@ set -euo pipefail
 : "${CUDA_VISIBLE_DEVICES:?Select the test GPUs with sufficient free memory}"
 export QWEN38_SMOKE_GPUS="${QWEN38_SMOKE_GPUS:-1}"
 case "$QWEN38_SMOKE_GPUS" in 1|2|4|8) ;; *) exit 2 ;; esac
+hybrid_args=()
+if [[ "${QWEN38_SMOKE_HYBRID:-0}" == "1" ]]; then
+    [[ "$QWEN38_SMOKE_GPUS" == "8" ]] || {
+        echo "The TP2/PP2/EP2/CP2/VPP2 smoke needs exactly eight visible GPUs" >&2
+        exit 2
+    }
+    for role in actor ref; do
+        hybrid_args+=(
+            "actor_rollout_ref.$role.megatron.tensor_model_parallel_size=2"
+            "actor_rollout_ref.$role.megatron.pipeline_model_parallel_size=2"
+            "actor_rollout_ref.$role.megatron.virtual_pipeline_model_parallel_size=2"
+            "actor_rollout_ref.$role.megatron.expert_model_parallel_size=2"
+            "actor_rollout_ref.$role.megatron.expert_tensor_parallel_size=1"
+            "actor_rollout_ref.$role.megatron.context_parallel_size=2"
+            "actor_rollout_ref.$role.megatron.sequence_parallel=True"
+        )
+    done
+    hybrid_args+=(actor_rollout_ref.actor.loss_agg_mode=token-mean)
+fi
 # The production pool reserves three CPU slots per GPU before any workers
 # launch. The queue and trainer already consume nine CPU slots BEFORE the
 # placement group: 3*8+8 leaves only 23 for its required 24 and waits forever.
@@ -95,5 +114,6 @@ bash examples/tuning/lora/run_qwen38_flash_next_megatron.sh \
     "trainer.default_local_dir=$QWEN38_SMOKE_OUTPUT/checkpoints" \
     trainer.save_freq=1 \
     "${resume_args[@]}" \
+    "${hybrid_args[@]}" \
     "${image_args[@]}" \
     "$@"

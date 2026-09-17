@@ -53,3 +53,39 @@ def make_tiny_rgb():
 
     y, x = np.indices((64, 64))
     return np.stack(((3 * x + y) % 256, (x + 5 * y) % 256, (7 * x + 11 * y) % 256), axis=-1).astype(np.uint8)
+
+
+def make_packed_fixture_batches(eos_token_id, *, device="cuda", images=False):
+    """Shared unequal-length documents for CP and interleaved PP references.
+
+    Image mode deliberately mixes image and text-only documents, with two images
+    in the first microbatch and one in the second. Packing/CP cuts cross the image
+    span; all stages must use the original IDs to build the same three-axis RoPE.
+    """
+    import torch
+
+    if images:
+        from PIL import Image
+
+        processor, rgb = make_tiny_vision_processor(), make_tiny_rgb()
+    batches, multimodal = [], []
+    for batch_index, lengths in enumerate(([13, 7, 23], [19, 9])):
+        docs = [
+            (torch.arange(n, device=device) + 17 * doc + 11 * batch_index) % 200 + 3 for doc, n in enumerate(lengths)
+        ]
+        pictures = []
+        for doc_index, ids in enumerate(docs):
+            ids[4::11] = eos_token_id
+            if images and doc_index % 2 == 0:
+                ids[1:7] = torch.tensor([250, 252, 252, 252, 252, 251], device=device)
+                variant = 255 - rgb if (batch_index + doc_index // 2) % 2 else rgb
+                pictures.append(Image.fromarray(variant))
+        inputs = {}
+        if pictures:
+            values = processor.image_processor(images=pictures, return_tensors="pt")
+            inputs = {name: value.to(device) for name, value in values.items()}
+            assert inputs["image_grid_thw"].tolist() == [[1, 4, 4]] * len(pictures)
+            assert sum(int((ids == 252).sum()) for ids in docs) == 4 * len(pictures)
+        batches.append(docs)
+        multimodal.append(inputs)
+    return batches, multimodal

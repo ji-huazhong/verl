@@ -49,6 +49,26 @@ def test_image_positions_have_three_distinct_axes():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_packed_parallel_fixture_mixes_images_and_text_documents():
+    from tests.models.mcore.qwen38_vision_fixture import make_packed_fixture_batches
+
+    plain, empty = make_packed_fixture_batches(2, device="cpu")
+    batches, multimodal = make_packed_fixture_batches(2, device="cpu", images=True)
+    assert empty == [{}, {}]
+    assert [[len(ids) for ids in docs] for docs in batches] == [[13, 7, 23], [19, 9]]
+    for batch_index, (docs, inputs) in enumerate(zip(batches, multimodal, strict=True)):
+        count = 2 if batch_index == 0 else 1
+        assert inputs["pixel_values"].shape == (count * 16, 1536)
+        assert inputs["image_grid_thw"].tolist() == [[1, 4, 4]] * count
+        for doc_index, ids in enumerate(docs):
+            if doc_index % 2 == 0:
+                assert ids[1:7].tolist() == [250, 252, 252, 252, 252, 251]
+                assert int((ids == 252).sum()) == 4
+            else:
+                torch.testing.assert_close(ids, plain[batch_index][doc_index], rtol=0, atol=0)
+    assert not torch.equal(multimodal[0]["pixel_values"][:16], multimodal[1]["pixel_values"])
+
+
 def test_trainer_image_rows_preserve_pixels_and_placeholders():
     from io import BytesIO
 

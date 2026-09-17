@@ -7,6 +7,8 @@ PP1 test_qwen38_next_model_cp output), and a fresh QWEN38_HYBRID_OUTPUT.
 No production guard or communication operation is bypassed. The globally
 normalized synthetic objective isolates pipeline parity; production GRPO's
 token-count contract, optimizer resume and HTTP reload are separate gates.
+QWEN38_MODEL_IMAGES=1 requires an image-enabled independent reference and
+exercises mixed image/text documents without replacing the native vision tower.
 """
 
 import os
@@ -81,6 +83,7 @@ def _run_hybrid_case():
     from megatron.core.transformer.module import Float16Module
     from safetensors.torch import load_file, save_file
 
+    from tests.models.mcore.qwen38_vision_fixture import make_packed_fixture_batches
     from verl.models.mcore.bridge import AutoBridge
     from verl.models.mcore.model_forward import gptmodel_forward_model_engine
     from verl.models.mcore.qwen3_8_next.bridge import Qwen38NextBridge
@@ -95,6 +98,8 @@ def _run_hybrid_case():
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
     cp_rank = parallel_state.get_context_parallel_rank()
     reference = load_file(str(Path(os.environ["QWEN38_HYBRID_REFERENCE"]) / f"comparison-tp{tp_rank}.safetensors"))
+    images = os.environ.get("QWEN38_MODEL_IMAGES") == "1"
+    assert bool(reference.get("fixture.images", torch.tensor(False))) == images, "Reference modality mismatch"
     bridge = AutoBridge.from_hf_pretrained(fixture / "model", local_files_only=True)
     assert isinstance(bridge._model_bridge, Qwen38NextBridge)
     config = bridge.to_megatron_provider(load_weights=False)
@@ -138,23 +143,18 @@ def _run_hybrid_case():
     bridge.load_hf_weights(models)
     wrapped = [Float16Module(config, model).eval() for model in models]
 
+    docs_by_batch, mm_by_batch = make_packed_fixture_batches(config.qwen3_8_next_eos_token_id, images=images)
+    docs_by_batch.append([torch.arange(3, 19, device="cuda")])
+    mm_by_batch.append({})
     batches, local_token_counts = [], []
-    for batch_index, lengths in enumerate(([13, 7, 23], [19, 9], [16])):
-        docs = [
-            (torch.arange(n, device="cuda") + 17 * doc + 11 * batch_index) % 200 + 3 for doc, n in enumerate(lengths)
-        ]
-        if batch_index < 2:
-            for ids in docs:
-                ids[4::11] = config.qwen3_8_next_eos_token_id
-        else:
-            docs = [torch.arange(3, 19, device="cuda")]
+    for docs in docs_by_batch:
         batches.append(torch.nested.nested_tensor(docs, layout=torch.jagged))
         mask = torch.nested.nested_tensor([torch.ones_like(ids) for ids in docs], layout=torch.jagged)
         local_token_counts.append(preprocess_thd_engine(mask)[0].sum())
     torch.cuda.synchronize()
 
     observed = []
-    errors, recorded = [], {}
+    errors, recorded = [], {"fixture.images": torch.tensor(images)}
 
     def checkpoint(label):
         valid = torch.tensor(int(not errors), device="cuda")
@@ -185,7 +185,7 @@ def _run_hybrid_case():
     def forward_step(iterator, module):
         index = next(iterator)
         output = gptmodel_forward_model_engine(
-            module, batches[index], multi_modal_inputs={}, vision_model=True, pad_token_id=0
+            module, batches[index], multi_modal_inputs=mm_by_batch[index], vision_model=True, pad_token_id=0
         )
         if output.is_nested:
             output = gather_from_tensor_model_parallel_region(output.values(), group=config._pg_collection.tp)
@@ -345,4 +345,4 @@ def _run_hybrid_case():
                 str(output_dir / "reference.safetensors"),
             )
     torch.distributed.barrier()
-    print(f"QWEN38_HYBRID_MODEL_PASSED RANK={rank} TP2 PP2 EP2 CP2 VPP2 TENSORS=78", flush=True)
+    print(f"QWEN38_HYBRID_MODEL_PASSED RANK={rank} TP2 PP2 EP2 CP2 VPP2 IMAGES={images} TENSORS=78", flush=True)

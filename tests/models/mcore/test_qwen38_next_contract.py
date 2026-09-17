@@ -13,6 +13,32 @@ from verl.models.mcore.qwen3_8_next.config import validate_rollout, validate_run
 from verl.models.mcore.qwen3_8_next.ops.sequence import apply_indexer_rope, packed_token_segments
 
 
+@pytest.mark.parametrize("gpu_count", [1, 2, 4])
+def test_hybrid_smoke_rejects_incomplete_gpu_counts_before_python(tmp_path, gpu_count):
+    import subprocess
+
+    script = Path(__file__).with_name("run_qwen38_next_trainer_fixture.sh")
+    result = subprocess.run(
+        ["bash", str(script)],
+        env={
+            **os.environ,
+            "QWEN38_TRAINER_FIXTURE": str(tmp_path / "not_a_fixture"),
+            "QWEN38_SMOKE_OUTPUT": str(tmp_path / "not_created"),
+            "QWEN38_RAY_TEMP": str(tmp_path / "not_started"),
+            "CUDA_VISIBLE_DEVICES": ",".join(map(str, range(gpu_count))),
+            "QWEN38_SMOKE_GPUS": str(gpu_count),
+            "QWEN38_SMOKE_HYBRID": "1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 2 and "needs exactly eight visible GPUs" in result.stderr
+    assert not (tmp_path / "not_created").exists()
+    assert not (tmp_path / "not_started").exists()
+
+
 @pytest.mark.parametrize("bounds", [[0, 3, 5], [0, 0, 3, 3, 5, 5], [0, 0, 0]])
 def test_segments_include_empty_sequences(bounds):
     cu = torch.tensor(bounds, dtype=torch.int32)
