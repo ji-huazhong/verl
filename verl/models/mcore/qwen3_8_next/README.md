@@ -118,6 +118,35 @@ These runs do not establish bitwise trajectory equivalence, effective learning,
 or real-checkpoint acceptance. The combined CPU suite passed 132 tests with five
 opt-in skips; the production-backward GPU fixture passed three tests.
 
+The trainer fixture also accepts `QWEN38_SMOKE_GPUS=2` (or 8) with exactly that
+many visible devices. It validates fixture dimensions and at least 10 GiB free
+on every device before launch. Ray CPU slots scale as `max(16, 3 * GPUs + 8)`:
+the actual resource pool reserves three CPU slots per GPU. TP2/EP2 actor/reference with TP2 vLLM completed
+two real trainer steps, including multi-bucket adapter sync and full checkpoint
+saves. PP2/TP1 actor/reference with TP2 vLLM also completed two steps using the
+same wrapper with explicit actor/ref TP/EP=1 and PP=2 overrides. Both runs saved
+optimizer/scheduler step 2. A separate PP2 resume restored adapter, optimizer,
+scheduler and RNG from step 1, completed step 2 and saved both optimizer shards
+at step 2 with scheduler step 2. These are random-model integration results,
+not full-model learning, trajectory equivalence or performance benchmarks.
+The eight-GPU trainer remains unvalidated: its initial attempt was stopped at
+placement-group scheduling because the earlier fixed 16-CPU quota was too
+small; the corrected 32-CPU logical placement test passed without GPU compute,
+but a subsequent GPU headroom check prevented a trainer rerun. Do not count
+that scheduling probe as eight-GPU training acceptance.
+
+Non-interleaved PP now requires `variable_seq_lengths=True`: Core's existing
+P2P protocol exchanges all three tensor dimensions, including HC's wider
+residual dimension. Fixed-shape PP remains rejected; no shared Core patch is
+needed. The opt-in `test_qwen38_next_pipeline.py` runs the actual PP2 scheduler
+on three microbatches (16/13/7 tokens). It checks receive shapes of
+`[tokens, 1, 256]` and compares logprobs with the unpartitioned fixture reference;
+all three mean/max gaps were zero. Launch it under two torchrun workers with
+`RUN_QWEN38_PIPELINE_TESTS=1` and the original `QWEN38_TINY_EXPORT_DIR`.
+The tested PLE layer belongs to the first stage. This does not validate later
+PLE placement, PP>2, multimodal PP, CP, VPP or their combined topology.
+The final combined CPU regression passed 133 tests with six opt-in skips.
+
 `test_qwen38_next_parallel.py` consumes the same exported fixture through the
 real AutoBridge HF import path. A 128-tensor exact round trip and TP1/TP2-EP2
 base forward parity have passed (TP2 mean/max logprob gap 0.00033432/0.00201797).
@@ -148,8 +177,9 @@ RUN_QWEN38_HYBRID_TESTS=1 QWEN38_TINY_EXPORT_DIR=/path/to/tiny-fixture \
 
 ETP=1, dense DP=1, expert DP=2; VPP=2 means two chunks per physical stage.
 Actual group collectives and virtual layer partition checks passed. Both model
-construction cases **fail** at the provider's PP1 guard; CP and VPP are also
-explicitly unsupported. The red gates are not marked xfail and do not bypass
+construction cases previously failed at the provider's PP1 guard. Dynamic-shape
+non-interleaved PP2 is now separately tested, but CP and VPP remain explicitly
+unsupported and the requested hybrid model gate is still red. It is not marked xfail and does not bypass
 the guards. No hybrid forward/backward, LoRA update or reload has run. Passing
 these construction tests in future will still not prove numerical or schedule
 correctness; HC P2P widths, global CP contexts and chunk/microbatch-keyed PLE
@@ -187,8 +217,9 @@ are not silently treated as equivalent; unsupported mappings fail explicitly.
 
 ## Important current boundaries
 
-- PP1/CP1 only; TP/EP are retained for the real-model validation target. HC
-  residual width is not the ordinary hidden width used by Core's PP scheduler.
+- CP1 and no VPP; non-interleaved PP requires dynamic P2P shapes, with PP2 tested
+  on the random fixture. TP/EP and complete-model PP still require full-model
+  validation; HC residual width is not the ordinary hidden width.
 - Full-layer recompute only; no selective attention recompute, CUDA graphs,
   or activation offloading in this first implementation.
 - One packed stream per microbatch; independently keyed multiple PLE layers,

@@ -97,6 +97,28 @@ def test_unsupported_runtime_fails_early(field, value):
         validate_runtime(config)
 
 
+def test_non_interleaved_pipeline_requires_dynamic_shape_protocol():
+    config = SimpleNamespace(
+        num_residual_streams=4,
+        qwen3_8_next_indexer_kv_heads=1,
+        pipeline_model_parallel_size=2,
+        context_parallel_size=1,
+        variable_seq_lengths=True,
+    )
+    validate_runtime(config)
+    config.variable_seq_lengths = False
+    with pytest.raises(NotImplementedError, match="HC P2P shapes"):
+        validate_runtime(config)
+    config.variable_seq_lengths = True
+    config.context_parallel_size = 2
+    with pytest.raises(NotImplementedError, match="context_parallel_size"):
+        validate_runtime(config)
+    config.context_parallel_size = 1
+    config.virtual_pipeline_model_parallel_size = 2
+    with pytest.raises(NotImplementedError, match="interleaved"):
+        validate_runtime(config)
+
+
 @pytest.mark.parametrize("load_format", ["dummy", "pt", None])
 def test_frozen_ple_rejects_non_checkpoint_rollout(load_format):
     hf = SimpleNamespace(model_type="qwen4_exp", text_config=SimpleNamespace(ple_layer_ids=[2]))

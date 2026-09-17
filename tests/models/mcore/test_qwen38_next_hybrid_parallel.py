@@ -7,7 +7,7 @@ ETP=1; VPP=2 means two model chunks per physical pipeline stage, not two
 layers per chunk. Expert groups reuse ranks rather than multiplying world size.
 
 The topology check is not a model numerical/schedule test. The construction
-gates deliberately fail while the provider rejects PP/CP/VPP: no xfail, skipped
+gates deliberately fail while the provider rejects CP/VPP: no xfail, skipped
 unsupported topology, or bypass of production guards may imply model support.
 Even if construction passes later, interleaved forward/backward, CP parity,
 LoRA updates and cross-engine reload still need their own acceptance tests.
@@ -106,6 +106,7 @@ def hybrid_provider():
     provider.expert_model_parallel_size = 2
     provider.expert_tensor_parallel_size = 1
     provider.sequence_parallel = True
+    provider.variable_seq_lengths = True  # Match the real engine's dynamic P2P contract.
     provider.moe_router_load_balancing_type = "none"
     provider.moe_token_dispatcher_type = "alltoall"
     provider.moe_permute_fusion = False

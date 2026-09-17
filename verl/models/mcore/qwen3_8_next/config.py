@@ -46,12 +46,15 @@ def apply_flash_next_config(provider, text_config, checkpoint):
 def validate_runtime(config):
     """Fail before allocating a model for unsupported execution contracts.
 
-    These checks are temporary boundaries, not claims that other topologies are
-    unnecessary. PP needs wide P2P buffers; CP needs global QSA and PLE contexts.
+    PP uses Core's dynamic P2P shape exchange for the wide HC residual stream.
+    Fixed-shape PP and CP's global QSA/PLE contexts are not implemented.
     """
-    for name in ("pipeline_model_parallel_size", "context_parallel_size"):
-        if (getattr(config, name, 1) or 1) != 1:
-            raise NotImplementedError(f"Flash-Next currently requires {name}=1")
+    if (getattr(config, "pipeline_model_parallel_size", 1) or 1) > 1 and not getattr(
+        config, "variable_seq_lengths", False
+    ):
+        raise NotImplementedError("Flash-Next PP requires variable_seq_lengths=True for HC P2P shapes")
+    if (getattr(config, "context_parallel_size", 1) or 1) != 1:
+        raise NotImplementedError("Flash-Next currently requires context_parallel_size=1")
     if getattr(config, "virtual_pipeline_model_parallel_size", None):
         raise NotImplementedError("Flash-Next interleaved pipeline scheduling is not implemented")
     if getattr(config, "mtp_num_layers", None):
