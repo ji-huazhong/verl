@@ -56,6 +56,7 @@ def test_hf_import_roundtrip_and_parallel_forward(parallel_context):
     from megatron.core.packed_seq_params import PackedSeqParams
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
+    from megatron.core.transformer.module import Float16Module
     from safetensors.torch import load_file, save_file
 
     from verl.models.mcore.bridge import AutoBridge
@@ -81,6 +82,10 @@ def test_hf_import_roundtrip_and_parallel_forward(parallel_context):
     provider.finalize()
     provider._pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     model = provider.provide(pre_process=True, post_process=True).cuda()
+    # Match the production mixed-precision boundary before loading/exporting
+    # BF16 fixture weights. The bare VL provider leaves some vision parameters
+    # FP32 even when the language configuration is BF16.
+    mixed_model = Float16Module(provider, model)
     bridge.load_hf_weights([model])
 
     original = load_file(str(fixture / "model" / "model.safetensors"))
@@ -115,7 +120,7 @@ def test_hf_import_roundtrip_and_parallel_forward(parallel_context):
         # The VL provider intentionally returns vocab-parallel logits. Gather
         # the vocabulary before applying log_softmax, as the TP1 reference is
         # a full-vocabulary distribution, not independent shard distributions.
-        logits = full_logits(model)
+        logits = full_logits(mixed_model)
     assert logits.shape == reference["base_logits"].shape
     assert bool(logits.isfinite().all())
     gap = (logits.float().cpu().log_softmax(-1) - reference["base_logits"].float().log_softmax(-1)).abs()
@@ -163,12 +168,13 @@ def test_hf_import_roundtrip_and_parallel_forward(parallel_context):
         ],
     )
     model = peft([model])[0]
+    assert mixed_model.module is model
     peft.set_params_to_save([model])
     frozen = {name: p.detach().cpu().clone() for name, p in model.named_parameters() if not p.requires_grad}
     trainable = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
     assert trainable and all("adapter" in name for name, _ in trainable)
     with torch.no_grad():
-        torch.testing.assert_close(full_logits(model), logits, rtol=0, atol=0)
+        torch.testing.assert_close(full_logits(mixed_model), logits, rtol=0, atol=0)
     ddp = DistributedDataParallel(
         config=provider,
         ddp_config=DistributedDataParallelConfig(grad_reduce_in_fp32=True, overlap_grad_reduce=False),
@@ -192,10 +198,10 @@ def test_hf_import_roundtrip_and_parallel_forward(parallel_context):
     optimizer.step()
     model.eval()
     with torch.no_grad():
-        updated = full_logits(model)
+        updated = full_logits(mixed_model)
         assert bool(updated.isfinite().all()) and not torch.equal(updated, logits)
         with peft.disable_adapter([model]):
-            torch.testing.assert_close(full_logits(model), logits, rtol=0, atol=0)
+            torch.testing.assert_close(full_logits(mixed_model), logits, rtol=0, atol=0)
     for name, p in model.named_parameters():
         if name in frozen:
             torch.testing.assert_close(p.cpu(), frozen[name], rtol=0, atol=0)

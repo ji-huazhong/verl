@@ -484,6 +484,16 @@ It reads no weight payload and does not prove loading, packing order, hashes,
 forward/backward, refit, or training. Meta PLE instances explicitly reject
 loading/forward, including after `to_empty`; reconstruct a real model instead.
 
+Ordinary base loading also validates its native Bridge conversion plan before
+fetching parameter payloads: every local parameter/persistent buffer must have
+one correct owning task, all referenced sources and configured frozen PLE
+shards/hash tensors must exist, and unconsumed source keys fail (except disabled
+MTP). Remote PP placeholders, native tied-output handling and adapter exclusions
+are preserved. A caller-supplied streaming-import plan cannot bypass coverage
+checks or reuse the config-only export exception without a source catalog.
+This is a coverage guard, not a checksum or an all-rank transactional load;
+native shape/conversion errors and numerical validation remain separate.
+
 - CP1, or CP2 with TP1/EP1/PP1, TP2/EP2/PP1 or the exact
   TP2/PP2/EP2/VPP2/ETP1 combination above. Other CP/pipeline combinations remain
   guarded. PP requires dynamic P2P shapes, and VPP additionally requires overlap.
