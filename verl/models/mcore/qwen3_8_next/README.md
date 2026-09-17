@@ -204,12 +204,13 @@ RUN_QWEN38_HYBRID_TESTS=1 QWEN38_TINY_EXPORT_DIR=/path/to/tiny-fixture \
 ETP=1, dense DP=1, expert DP=2; VPP=2 means two chunks per physical stage.
 Actual group collectives and virtual layer partition checks passed. Both model
 construction cases previously failed at the provider's PP1 guard. Dynamic-shape
-PP2/VPP2 is now separately tested with CP1 and overlap P2P, but CP remains explicitly
-unsupported and the requested hybrid model gate is still red. It is not marked xfail and does not bypass
+PP2/VPP2 is now separately tested with CP1 and overlap P2P. Standalone CP2 has
+the separate evidence below, but CP with TP/PP/EP remains explicitly guarded
+and the requested hybrid model gate is still red. It is not marked xfail and does not bypass
 the guards. No hybrid forward/backward, LoRA update or reload has run. Passing
 these construction tests in future will still not prove numerical or schedule
-correctness; global CP contexts and the full combined schedule still need their
-own integration validation. The per-layer PLE FIFO is not shared across chunks.
+correctness; the full combined schedule still needs its own integration
+validation. The per-layer PLE FIFO is not shared across chunks.
 
 ### QSA context-parallel component gate
 
@@ -237,8 +238,8 @@ against an independent mixed-precision Torch reference, and CP2/CP1 QSA with
 sparse/full-coverage budgets and full recompute. Forward gaps were zero; the
 largest relative LoRA gradient L2 error was 8.59e-6. Existing elementwise
 tolerances were not relaxed. This is not a full-model, DDP optimizer, hybrid
-TP/PP/EP/CP/VPP, or rollout CP test. Provider-level CP remains rejected until
-the complete PLE/GDN/QSA model and combined schedule pass integration.
+TP/PP/EP/CP/VPP, or rollout CP test. The standalone full-model CP2 gate below
+provides separate evidence; combined schedules remain guarded.
 
 ### PLE context-parallel component gate
 
@@ -272,7 +273,62 @@ PLE/HC; this does not validate training their BF16 weights or table.
 
 The original CP1 GPU model suite still passes three tests, including vision,
 LoRA export and recompute. CP2 whole-model/optimizer/rollout and mixed TP/EP/PP/
-VPP are not covered by the PLE component gate. The provider CP guard remains.
+VPP are not covered by the PLE component gate. See the separate model gate below.
+
+### Native GDN and complete random-model CP gates
+
+`test_qwen38_next_gdn_cp.py` uses Core's native packed context/head all-to-all,
+not a replacement GDN implementation. With `RUN_QWEN38_GDN_CP_TESTS=1` and the
+original tiny fixture, two/four torchrun ranks each passed two tests. Unequal
+documents, input gradients, four LoRA gradients and full recompute match CP1;
+forward gaps are zero and maximum gradient relative L2 errors are 1.40e-6/1.41e-6.
+Initial compilation is included in elapsed test time, not measured throughput.
+
+`test_qwen38_next_model_cp.py` compares independent CP1 and CP2 processes:
+
+```bash
+RUN_QWEN38_MODEL_CP_TESTS=1 QWEN38_TINY_EXPORT_DIR=/path/to/tiny-export \
+  QWEN38_MODEL_CP_OUTPUT=/path/to/new-cp1-output \
+  torchrun --standalone --nproc-per-node=1 -m pytest -s -q \
+  tests/models/mcore/test_qwen38_next_model_cp.py
+
+RUN_QWEN38_MODEL_CP_TESTS=1 QWEN38_TINY_EXPORT_DIR=/path/to/tiny-export \
+  QWEN38_MODEL_CP_REFERENCE=/path/to/new-cp1-output \
+  QWEN38_MODEL_CP_OUTPUT=/path/to/new-cp2-output \
+  torchrun --standalone --nproc-per-node=2 -m pytest -s -q \
+  tests/models/mcore/test_qwen38_next_model_cp.py
+```
+
+The gate uses the production provider and jagged packing path, actual Core DDP,
+two unequal-length document batches, all 48 LoRA gradient tensors, an AdamW
+update, frozen-base checks, adapter disabling and 78-tensor HF export. It does
+not bypass the provider guard: the initial CP2 attempt failed that guard before
+the candidate was enabled. Base and initial-adapter logprobs match CP1 exactly.
+Normal/recompute gradient maximum relative L2 is 0.00059369; after the update,
+the two batches' mean logprob gaps are 0.00051237/0.00051043 (maximum 0.00371314).
+Independent TP1 vLLM accepts the CP2 export, including disable/remove/reload and
+six-token decode/prefill checks: base/adapter mean logprob gaps are
+0.00059145/0.00069111. No numerical thresholds were relaxed.
+
+Standalone CP2 is enabled only with TP/PP/EP=1, `calculate_per_token_loss=True`
+and CP-divisible GDN key/value head counts. CP4 is a component result only;
+CP>2 and combined TP/PP/EP/CP remain rejected. The DDP gate uses an explicitly
+globally normalized synthetic objective and SUM reduction; it is not the
+production trainer's token-count normalization or effective RL learning.
+These are four-layer random text-model results, not full-checkpoint or visual CP
+validation. The current Flash-Next CPU collection passes 68 tests with 34
+opt-in skips; skipped tests are not passing execution evidence.
+
+Separately, the real GRPO fixture completed two steps and full checkpoint
+saves with actor/reference TP1/EP1/PP1/CP2 and vLLM TP2/EP1. Use the two-GPU
+wrapper above, overriding actor and ref TP/EP to 1 and CP to 2, with
+`actor_rollout_ref.actor.loss_agg_mode=token-mean`. This executes the production
+token-count normalization, HTTP rollout, full recompute, sleep/wake and adapter
+sync, not the synthetic squared-logits objective in the numerical gate.
+All 184 TensorBoard scalar samples were finite; grad norms were 0.28595847 and
+0.28534076. The saved checkpoints contain model/optimizer/extra at steps 1/2.
+This is still a random-model smoke with synthetic rewards, not evidence of
+learning quality, full-checkpoint correctness or bitwise resume equivalence.
 
 The GPU suites enforce memory headroom and
 per-process allocation caps. Never evict another job to run them.
@@ -306,7 +362,7 @@ are not silently treated as equivalent; unsupported mappings fail explicitly.
 
 ## Important current boundaries
 
-- CP1; PP requires dynamic P2P shapes, and VPP additionally requires overlap
+- CP1, or standalone CP2 with the restrictions above; PP requires dynamic P2P shapes, and VPP additionally requires overlap
   P2P. PP2/VPP2 is tested on the random fixture. TP/EP and complete-model PP still require full-model
   validation; HC residual width is not the ordinary hidden width.
 - Full-layer recompute only; no selective attention recompute, CUDA graphs,

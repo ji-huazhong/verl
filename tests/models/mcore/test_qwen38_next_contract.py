@@ -81,7 +81,7 @@ def test_gdn_output_gate_is_sigmoid_not_mlp_silu():
     "field,value",
     [
         ("pipeline_model_parallel_size", 2),
-        ("context_parallel_size", 2),
+        ("context_parallel_size", 4),
         ("virtual_pipeline_model_parallel_size", 2),
         ("mtp_num_layers", 1),
         ("recompute_granularity", "selective"),
@@ -111,7 +111,7 @@ def test_pipeline_requires_dynamic_shapes_and_vpp_overlap():
         validate_runtime(config)
     config.variable_seq_lengths = True
     config.context_parallel_size = 2
-    with pytest.raises(NotImplementedError, match="context_parallel_size"):
+    with pytest.raises(NotImplementedError, match="combined TP/PP/EP"):
         validate_runtime(config)
     config.context_parallel_size = 1
     config.virtual_pipeline_model_parallel_size = 2
@@ -125,6 +125,34 @@ def test_pipeline_requires_dynamic_shapes_and_vpp_overlap():
     config.pipeline_model_parallel_size = 1
     with pytest.raises(NotImplementedError, match="two physical stages"):
         validate_runtime(config)
+
+
+def test_cp_requires_valid_head_partition_and_per_token_loss():
+    config = SimpleNamespace(
+        num_residual_streams=4,
+        qwen3_8_next_indexer_kv_heads=1,
+        context_parallel_size=2,
+        calculate_per_token_loss=True,
+        linear_num_key_heads=8,
+        linear_num_value_heads=16,
+    )
+    validate_runtime(config)
+    config.calculate_per_token_loss = False
+    with pytest.raises(ValueError, match="calculate_per_token_loss"):
+        validate_runtime(config)
+    config.calculate_per_token_loss = True
+    for name in ("linear_num_key_heads", "linear_num_value_heads"):
+        original = getattr(config, name)
+        setattr(config, name, 3)
+        with pytest.raises(ValueError, match=name):
+            validate_runtime(config)
+        setattr(config, name, original)
+    for name in ("tensor_model_parallel_size", "pipeline_model_parallel_size", "expert_model_parallel_size"):
+        setattr(config, name, 2)
+        config.variable_seq_lengths = True
+        with pytest.raises(NotImplementedError, match="combined TP/PP/EP"):
+            validate_runtime(config)
+        setattr(config, name, 1)
 
 
 def test_provider_preserves_virtual_chunk_identity(monkeypatch):

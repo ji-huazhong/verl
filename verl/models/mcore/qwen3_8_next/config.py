@@ -47,14 +47,28 @@ def validate_runtime(config):
     """Fail before allocating a model for unsupported execution contracts.
 
     PP uses Core's dynamic P2P shape exchange for the wide HC residual stream.
-    Fixed-shape PP and CP's global QSA/PLE contexts are not implemented.
+    Fixed-shape PP and unvalidated combinations of CP with other model-parallel
+    axes remain guarded. Packed CP requires the per-token gradient contract.
     """
     if (getattr(config, "pipeline_model_parallel_size", 1) or 1) > 1 and not getattr(
         config, "variable_seq_lengths", False
     ):
         raise NotImplementedError("Flash-Next PP requires variable_seq_lengths=True for HC P2P shapes")
-    if (getattr(config, "context_parallel_size", 1) or 1) != 1:
-        raise NotImplementedError("Flash-Next currently requires context_parallel_size=1")
+    cp_size = getattr(config, "context_parallel_size", 1) or 1
+    if cp_size != 1:
+        if cp_size != 2:
+            raise NotImplementedError("Flash-Next model validation currently covers context_parallel_size=1 or 2")
+        if any(
+            (getattr(config, name, 1) or 1) != 1
+            for name in ("tensor_model_parallel_size", "pipeline_model_parallel_size", "expert_model_parallel_size")
+        ):
+            raise NotImplementedError("Flash-Next CP2 combined TP/PP/EP execution still requires validation")
+        if not getattr(config, "calculate_per_token_loss", False):
+            raise ValueError("Flash-Next CP requires calculate_per_token_loss=True")
+        for name in ("linear_num_key_heads", "linear_num_value_heads"):
+            count = getattr(config, name, 0)
+            if count < cp_size or count % cp_size:
+                raise ValueError(f"Flash-Next CP requires {name} to be divisible by context_parallel_size")
     if (
         getattr(config, "virtual_pipeline_model_parallel_size", None)
         and (getattr(config, "pipeline_model_parallel_size", 1) or 1) < 2
