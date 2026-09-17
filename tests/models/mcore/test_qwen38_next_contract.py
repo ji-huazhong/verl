@@ -168,6 +168,41 @@ def test_cp_requires_valid_head_partition_and_per_token_loss():
         setattr(config, name, original)
 
 
+def test_cp_hybrid_requires_exact_validated_schedule():
+    config = SimpleNamespace(
+        num_residual_streams=4,
+        qwen3_8_next_indexer_kv_heads=1,
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=2,
+        expert_model_parallel_size=2,
+        expert_tensor_parallel_size=1,
+        context_parallel_size=2,
+        virtual_pipeline_model_parallel_size=2,
+        sequence_parallel=True,
+        variable_seq_lengths=True,
+        overlap_p2p_comm=True,
+        calculate_per_token_loss=True,
+        linear_num_key_heads=8,
+        linear_num_value_heads=16,
+    )
+    validate_runtime(config)
+    for field, value, error, message in (
+        ("virtual_pipeline_model_parallel_size", None, NotImplementedError, "combined TP/PP/EP"),
+        ("pipeline_model_parallel_size", 4, NotImplementedError, "combined TP/PP/EP"),
+        ("expert_model_parallel_size", 1, NotImplementedError, "combined TP/PP/EP"),
+        ("expert_tensor_parallel_size", 2, NotImplementedError, "combined TP/PP/EP"),
+        ("sequence_parallel", False, NotImplementedError, "sequence_parallel"),
+        ("variable_seq_lengths", False, NotImplementedError, "HC P2P shapes"),
+        ("overlap_p2p_comm", False, NotImplementedError, "overlap_p2p_comm"),
+        ("calculate_per_token_loss", False, ValueError, "calculate_per_token_loss"),
+    ):
+        original = getattr(config, field)
+        setattr(config, field, value)
+        with pytest.raises(error, match=message):
+            validate_runtime(config)
+        setattr(config, field, original)
+
+
 def test_provider_preserves_virtual_chunk_identity(monkeypatch):
     pytest.importorskip("megatron.bridge")
     from verl.models.mcore.qwen3_8_next import provider

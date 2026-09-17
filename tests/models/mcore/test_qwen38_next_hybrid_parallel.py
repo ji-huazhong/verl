@@ -6,11 +6,10 @@ torchrun workers, RUN_QWEN38_HYBRID_TESTS=1 and QWEN38_TINY_EXPORT_DIR set.
 ETP=1; VPP=2 means two model chunks per physical pipeline stage, not two
 layers per chunk. Expert groups reuse ranks rather than multiplying world size.
 
-The topology check is not a model numerical/schedule test. The construction
-gates deliberately fail while the provider rejects CP/VPP: no xfail, skipped
-unsupported topology, or bypass of production guards may imply model support.
-Even if construction passes later, interleaved forward/backward, CP parity,
-LoRA updates and cross-engine reload still need their own acceptance tests.
+The topology check is not a model numerical/schedule test. Construction alone
+does not imply model support: interleaved forward/backward, gradient parity,
+LoRA updates and cross-engine reload have separate acceptance tests. Never
+bypass production guards or interpret an unsupported topology skip as passing.
 """
 
 import os
@@ -107,6 +106,8 @@ def hybrid_provider():
     provider.expert_tensor_parallel_size = 1
     provider.sequence_parallel = True
     provider.variable_seq_lengths = True  # Match the real engine's dynamic P2P contract.
+    provider.overlap_p2p_comm = True
+    provider.calculate_per_token_loss = True
     provider.moe_router_load_balancing_type = "none"
     provider.moe_token_dispatcher_type = "alltoall"
     provider.moe_permute_fusion = False
@@ -142,8 +143,7 @@ def test_hybrid_provider_build(hybrid_provider, vp_stage):
     from megatron.core import parallel_state
 
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-    # Keep the production fail-closed validation. This is intentionally a red
-    # acceptance gate today, not an assertion that unsupported execution works.
+    # Keep the production fail-closed validation, including schedule settings.
     model = hybrid_provider.provide(
         pre_process=pp_rank == 0 and vp_stage == 0,
         post_process=pp_rank == 1 and vp_stage == 1,

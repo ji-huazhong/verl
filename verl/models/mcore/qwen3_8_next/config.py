@@ -61,8 +61,14 @@ def validate_runtime(config):
         tp_size = getattr(config, "tensor_model_parallel_size", 1) or 1
         ep_size = getattr(config, "expert_model_parallel_size", 1) or 1
         pp_size = getattr(config, "pipeline_model_parallel_size", 1) or 1
-        if pp_size != 1 or (tp_size, ep_size) not in ((1, 1), (2, 2)):
-            raise NotImplementedError("Flash-Next CP2 combined TP/PP/EP requires PP1 and TP1/EP1 or TP2/EP2")
+        vp_size = getattr(config, "virtual_pipeline_model_parallel_size", None)
+        standalone = pp_size == 1 and (tp_size, ep_size) in ((1, 1), (2, 2))
+        etp_size = getattr(config, "expert_tensor_parallel_size", 1) or 1
+        hybrid = (tp_size, pp_size, ep_size, vp_size, etp_size) == (2, 2, 2, 2, 1)
+        if not (standalone or hybrid):
+            raise NotImplementedError(
+                "Flash-Next CP2 combined TP/PP/EP requires PP1 and TP1/EP1 or TP2/EP2, or TP2/PP2/EP2/VPP2/ETP1"
+            )
         if tp_size > 1 and not getattr(config, "sequence_parallel", False):
             raise NotImplementedError("Flash-Next TP2/CP2 requires sequence_parallel=True")
         if not getattr(config, "calculate_per_token_loss", False):
