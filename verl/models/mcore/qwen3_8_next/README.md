@@ -43,6 +43,25 @@ rollout resident trades host memory for GPU residency, with a smaller 1024-token
 per-GPU microbatch budget. This is not a disabled Ray memory monitor or a smaller
 checkpoint; this configuration still requires independent end-to-end validation.
 
+An explicitly reduced **12-layer real-weight prefix** is now a separate test:
+`tests/models/mcore/prepare_qwen38_next_layer_subset.py --source <original> --output <new> --layers 12`
+copies the first nine GDN / three QSA layers, retaining all original widths,
+experts, vocabulary, vision and frozen PLE. It never changes the source. The
+763 tensors total 168,136,383,672 payload bytes; PLE alone remains
+102,400,491,800 bytes. Each output shard is read back and SHA-256 checked.
+`examples/tuning/lora/run_qwen38_flash_next_12layer_smoke.sh` uses the same
+TP2/PP2/EP2/CP2/VPP2/ETP1 -> TP8 layout, real GSM8K, native adapter-only
+**level-1 sleep**, two steps and a checkpoint each step. Set fresh
+`QWEN38_SUBSET_OUTPUT` / `QWEN38_RAY_TEMP`; `QWEN38_RESUME_FROM` supports a
+separate resume gate. This truncated network is NOT an accuracy benchmark or
+full-model acceptance. Its preflight requires 50 GiB/GPU, 512 GiB available host
+memory and 400 GiB free disk; these thresholds do not guarantee runtime peaks.
+An initial shared-GPU attempt with a 32 GiB threshold failed during actor weight
+loading with CUDA OOM, before rollout/sleep or any completed training step.
+Level-2 work is parked: a tiny actual reload gate restored logical parameter
+hashes but changed outputs, first observed at the PLE embedding. No level-2
+implementation is enabled by this reduced-layer launcher.
+
 CPU tests cover config translation, public-checkpoint source-key coverage,
 packed boundaries (including empty sequences), partial RoPE, PLE hook cleanup,
 and native GDN LoRA B export at TP1/TP2. They also cover the sigmoid GDN output
