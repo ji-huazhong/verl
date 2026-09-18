@@ -3,6 +3,8 @@
 
 Run after the full numerical Megatron job has released all GPUs. Requires
 RUN_QWEN38_FULL_VLLM=1, QWEN38_MODEL_PATH, QWEN38_FULL_NUMERICAL_OUTPUT.
+Set VLLM_ENABLE_V1_MULTIPROCESSING=0 for the diagnostic driver; its TP8
+executor still uses eight real GPU worker processes. Production HTTP is separate.
 Private artifacts retain per-token and full-vocabulary differences. This test
 does not replace the separate production HTTP/GRPO/save/resume run.
 """
@@ -41,11 +43,13 @@ def test_full_checkpoint_text_image_adapter_disable_and_reload():
     from PIL import Image
     from safetensors.torch import load_file
     from vllm import LLM, SamplingParams
+    from vllm.lora.request import LoRARequest
 
     from verl.utils.megatron_peft_utils import build_peft_config_for_vllm
     from verl.utils.vllm import TensorLoRARequest
 
     source = Path(os.environ["QWEN38_MODEL_PATH"])
+    assert os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING") == "0"
     output = Path(os.environ["QWEN38_FULL_NUMERICAL_OUTPUT"])
     config = full_checkpoint_config(source)
     manifest = json.loads((output / "manifest.json").read_text())
@@ -99,6 +103,7 @@ def test_full_checkpoint_text_image_adapter_disable_and_reload():
             peft_config=build_peft_config_for_vllm({"rank": 16, "alpha": 32}),
             lora_tensors=weights,
         )
+        active_request = LoRARequest("full48_numerical_probe", 1, str(output / "adapter"))
         params = SamplingParams(temperature=0, max_tokens=1, prompt_logprobs=vocab, detokenize=False)
 
         def evaluate(case, adapter=None):
@@ -135,10 +140,12 @@ def test_full_checkpoint_text_image_adapter_disable_and_reload():
             assert any(name.startswith("visual.") for name in rank_hash), "Vision weights were not loaded"
             assert any(name.endswith("ngram_embedding.weight") for name in rank_hash), "PLE table not covered"
             assert any(name.endswith("ngram_heads_offsets") for name in rank_hash), "PLE hash metadata not covered"
+        # Send the multi-GiB tensors once, not with every generation request.
+        assert llm.llm_engine.add_lora(request)
         tuned = {}
         for case in manifest["cases"]:
             compare(case, "base", base[case])
-            tuned[case] = evaluate(case, request)
+            tuned[case] = evaluate(case, active_request)
             compare(case, "adapter", tuned[case])
             if torch.equal(base[case], tuned[case]):
                 errors.append(f"adapter ignored: {case}")
@@ -146,8 +153,9 @@ def test_full_checkpoint_text_image_adapter_disable_and_reload():
         assert not torch.equal(base["image"], base["changed_image"]), "Image was ignored"
         assert not torch.equal(tuned["image"], tuned["changed_image"]), "Adapted model ignored image"
         assert llm.llm_engine.remove_lora(1)
+        assert llm.llm_engine.add_lora(request)
         for case in manifest["cases"]:
-            torch.testing.assert_close(evaluate(case, request), tuned[case], rtol=0, atol=0)
+            torch.testing.assert_close(evaluate(case, active_request), tuned[case], rtol=0, atol=0)
         assert llm.apply_model(frozen_vllm_hashes) == original_hashes, "LoRA reload changed frozen weights"
         (output / "vllm-frozen-hashes.json").write_text(json.dumps(original_hashes, sort_keys=True))
         assert not errors, errors

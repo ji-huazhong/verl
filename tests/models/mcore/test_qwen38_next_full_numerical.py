@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opt-in full48 hybrid LoRA, frozen-weight and recompute numerical probe.
 
-RUN_QWEN38_FULL_NUMERICAL=1 QWEN38_MODEL_PATH=<original full checkpoint>
+CUDA_DEVICE_MAX_CONNECTIONS=1 RUN_QWEN38_FULL_NUMERICAL=1
+QWEN38_MODEL_PATH=<original full checkpoint>
 QWEN38_FULL_NUMERICAL_OUTPUT=<fresh private directory> torchrun --standalone
 --nproc-per-node=8 -m pytest -s -q <this file>
 
