@@ -52,6 +52,16 @@ def full_checkpoint_config(checkpoint):
     return config
 
 
+def check_recompute_gradient(actual, expected):
+    """An absolute tolerance alone can incorrectly accept erased small gradients."""
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=2e-5)
+    norm = expected.double().norm().item()
+    delta = (actual.double() - expected.double()).norm().item()
+    relative = delta / norm if norm else (0.0 if delta == 0 else float("inf"))
+    assert relative < 0.02, f"Recompute gradient relative L2={relative}"
+    return relative
+
+
 def make_full_cases(checkpoint):
     """Real tokenizer/native processor, text and two different image pixels."""
     from PIL import Image

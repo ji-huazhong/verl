@@ -21,7 +21,12 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.models.mcore.qwen38_full_validation import full_checkpoint_config, make_full_cases, tensor_sha256
+from tests.models.mcore.qwen38_full_validation import (
+    check_recompute_gradient,
+    full_checkpoint_config,
+    make_full_cases,
+    tensor_sha256,
+)
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RUN_QWEN38_FULL_NUMERICAL") != "1", reason="explicit full48 eight-GPU opt-in required"
@@ -269,12 +274,13 @@ def test_actual_full_model_lora_recompute_frozen_base_and_export():
             current_ple_batch()
         assert all(not getattr(m, "_ple_recompute_fifo", []) for model in models for m in model.modules())
         grads = {name: p.main_grad.detach().cpu().clone() for name, p in trainable.items()}
+        relative_errors = []
         for name, value in grads.items():
             if not bool(value.isfinite().all()):
                 errors.append(f"nonfinite gradient: {name}")
             if normal_grads is not None:
                 try:
-                    torch.testing.assert_close(value, normal_grads[name], rtol=0.02, atol=2e-5)
+                    relative_errors.append(check_recompute_gradient(value, normal_grads[name]))
                 except AssertionError as error:
                     errors.append(f"recompute gradient {name}: {error}")
         for family in (".self_attention.", ".mlp.experts.", ".mlp.shared_experts."):
@@ -287,7 +293,8 @@ def test_actual_full_model_lora_recompute_frozen_base_and_export():
         agree(f"gradients recompute={recompute}")
         normal_grads, normal_outputs = grads, dict(observed)
         print(
-            f"FULL48_GRADS rank={rank} recompute={recompute} tensors={len(grads)} checkpoint_calls={replay_calls[0]}",
+            f"FULL48_GRADS rank={rank} recompute={recompute} tensors={len(grads)} "
+            f"checkpoint_calls={replay_calls[0]} max_relative_l2={max(relative_errors, default=0.0):.9g}",
             flush=True,
         )
     del normal_grads, normal_outputs, grads

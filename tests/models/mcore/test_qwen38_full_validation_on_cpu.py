@@ -8,7 +8,27 @@ import os
 import pytest
 import torch
 
-from tests.models.mcore.qwen38_full_validation import full_checkpoint_config, logprob_differences, tensor_sha256
+from tests.models.mcore.qwen38_full_validation import (
+    check_recompute_gradient,
+    full_checkpoint_config,
+    logprob_differences,
+    tensor_sha256,
+)
+
+
+def test_recompute_gradient_does_not_accept_erased_small_gradient():
+    expected = torch.full((4,), 1e-8)
+    actual = torch.zeros_like(expected)
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=2e-5)
+    with pytest.raises(AssertionError, match="relative L2"):
+        check_recompute_gradient(actual, expected)
+
+
+def test_recompute_gradient_handles_zero_and_matching_gradients():
+    assert check_recompute_gradient(torch.zeros(3), torch.zeros(3)) == 0
+    assert check_recompute_gradient(torch.ones(3), torch.ones(3)) == 0
+    with pytest.raises(AssertionError, match="relative L2"):
+        check_recompute_gradient(torch.full((3,), 1e-20), torch.zeros(3))
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.int64])
