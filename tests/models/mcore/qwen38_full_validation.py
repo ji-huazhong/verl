@@ -13,6 +13,14 @@ from pathlib import Path
 import torch
 
 
+def probe_inference(modules, forward):
+    """PEFT installation resets train mode; no_grad alone does not disable Core checkpoints."""
+    for module in modules:
+        module.eval()
+    with torch.no_grad():
+        return forward()
+
+
 def agree_probe_checks(errors, label, group):
     """Keep diagnostic control traffic off the model's CUDA/NCCL streams."""
     assert group is not None and torch.distributed.get_backend(group) == "gloo"

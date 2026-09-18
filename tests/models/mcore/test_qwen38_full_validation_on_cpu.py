@@ -7,6 +7,7 @@ import json
 import os
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -16,8 +17,56 @@ from tests.models.mcore.qwen38_full_validation import (
     check_recompute_gradient,
     full_checkpoint_config,
     logprob_differences,
+    probe_inference,
     tensor_sha256,
 )
+
+
+def test_peft_train_reset_needs_eval_not_only_no_grad_for_ple(monkeypatch):
+    from megatron.bridge.peft.base import PEFT
+    from megatron.core.tensor_parallel import random as tensor_random
+
+    from verl.models.mcore.qwen3_8_next.hyper_connection import Qwen38NextPLEHyperConnection
+    from verl.models.mcore.qwen3_8_next.ops.ple import clear_ple_batch, publish_ple_batch
+
+    # Real PEFT mode handling, Core checkpoint context, and PLE queue resolver;
+    # no large model/table or CUDA RNG allocation is needed for this contract.
+    monkeypatch.setattr(tensor_random, "_get_all_rng_states", lambda: ())
+
+    class ModeOnlyPEFT(PEFT):
+        def transform(self, module, name=None, prefix=None):
+            return module
+
+    class Probe(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.context = SimpleNamespace(_ple_recompute_fifo=[])
+
+        def forward(self, value):
+            def layer(hidden):
+                Qwen38NextPLEHyperConnection._resolve_ple_batch(self.context)
+                return hidden + 1
+
+            return tensor_random.checkpoint(layer, False, value) if self.training else layer(value)
+
+    value = torch.ones(3, requires_grad=True)
+    try:
+        unsafe = ModeOnlyPEFT()([Probe().eval()])[0]
+        assert unsafe.training
+        publish_ple_batch(torch.ones(3, 1, dtype=torch.long))
+        with torch.no_grad():
+            unsafe(value)
+        assert len(unsafe.context._ple_recompute_fifo) == 1, "Negative control must reproduce the stale queue"
+
+        safe = ModeOnlyPEFT()([Probe().eval()])[0]
+        assert safe.training
+        result = probe_inference([safe], lambda: safe(value))
+        assert torch.equal(result, value.detach() + 1)
+        assert not result.requires_grad and not safe.training
+        assert not safe.context._ple_recompute_fifo
+        assert torch.is_grad_enabled() and not tensor_random.is_checkpointing()
+    finally:
+        clear_ple_batch()
 
 
 @pytest.mark.parametrize("failure", [None, "local", "remote"])

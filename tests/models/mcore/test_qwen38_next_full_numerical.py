@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import shutil
+import traceback
 from datetime import timedelta
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from tests.models.mcore.qwen38_full_validation import (
     check_recompute_gradient,
     full_checkpoint_config,
     make_full_cases,
+    probe_inference,
     tensor_sha256,
 )
 
@@ -80,15 +82,27 @@ def full_context():
         apply_patch_megatron_recomputation_backward()
         yield diagnostic_group
     finally:
-        faulthandler.cancel_dump_traceback_later()
-        tensor_random.CheckpointFunction.backward = staticmethod(old_backward)
-        parallel_state.destroy_model_parallel()
-        if diagnostic_group is not None:
-            torch.distributed.destroy_process_group(diagnostic_group)
-        torch.distributed.destroy_process_group()
+        try:
+            tensor_random.CheckpointFunction.backward = staticmethod(old_backward)
+            parallel_state.destroy_model_parallel()
+            if diagnostic_group is not None:
+                torch.distributed.destroy_process_group(diagnostic_group)
+            torch.distributed.destroy_process_group()
+        finally:
+            faulthandler.cancel_dump_traceback_later()
 
 
 def test_actual_full_model_lora_recompute_frozen_base_and_export(full_context):
+    try:
+        _run_full_model_case(full_context)
+    except BaseException:
+        # Pytest normally reports after fixture teardown. A peer waiting for
+        # diagnostics can otherwise hide the original failure behind cleanup.
+        traceback.print_exc()
+        raise
+
+
+def _run_full_model_case(full_context):
     from megatron.bridge.peft.lora import LoRA
     from megatron.core import parallel_state
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig, finalize_model_grads
@@ -200,8 +214,7 @@ def test_actual_full_model_lora_recompute_frozen_base_and_export(full_context):
             collect_non_loss_data=forward_only,
         )
 
-    with torch.no_grad():
-        base = [value.cpu() for value in schedule(wrapped, True)]
+    base = [value.cpu() for value in probe_inference(wrapped, lambda: schedule(wrapped, True))]
     stage("base_forward_done")
     peft = LoRA(
         dim=16,
@@ -225,8 +238,10 @@ def test_actual_full_model_lora_recompute_frozen_base_and_export(full_context):
         if p.requires_grad
     }
     assert trainable and all("adapter" in name for name in trainable)
-    with torch.no_grad():
-        initial = [value.cpu() for value in schedule(wrapped, True)]
+    # Bridge PEFT deliberately switches the wrapped modules back to train mode.
+    # A no-grad forward in that mode would enqueue PLE checkpoint contexts with
+    # no backward consumer. Restore eval, do not silently clear the queue.
+    initial = [value.cpu() for value in probe_inference(wrapped, lambda: schedule(wrapped, True))]
     if pp == 1:
         assert len(base) == len(initial) == len(cases)
         for expected, actual in zip(base, initial, strict=True):
@@ -291,10 +306,20 @@ def test_actual_full_model_lora_recompute_frozen_base_and_export(full_context):
         stage(f"finalize_grads_done_recompute_{recompute}")
         observed = {index: value.cpu() for index, value in observed.items()}
         stage(f"logits_to_host_done_recompute_{recompute}")
-        assert bool(replay_calls[0]) == recompute, "Recompute toggle never reached the decoder"
-        with pytest.raises(RuntimeError, match="no n-gram ids published"):
+        if bool(replay_calls[0]) != recompute:
+            errors.append(f"Recompute toggle mismatch: expected={recompute}, checkpoint_calls={replay_calls[0]}")
+        try:
             current_ple_batch()
-        assert all(not getattr(m, "_ple_recompute_fifo", []) for model in models for m in model.modules())
+        except RuntimeError as error:
+            if "no n-gram ids published" not in str(error):
+                errors.append(f"Unexpected PLE context error: {error}")
+        else:
+            errors.append("PLE batch context remains active after schedule")
+        for vp, model in enumerate(models):
+            for name, module in model.named_modules():
+                pending = getattr(module, "_ple_recompute_fifo", [])
+                if pending:
+                    errors.append(f"Pending PLE recompute contexts: chunk={vp}, module={name}, count={len(pending)}")
         grads = {name: p.main_grad.detach().cpu().clone() for name, p in trainable.items()}
         stage(f"grads_to_host_done_recompute_{recompute}")
         relative_errors = []
@@ -313,7 +338,9 @@ def test_actual_full_model_lora_recompute_frozen_base_and_export(full_context):
             for index, actual in observed.items():
                 if not torch.equal(actual, normal_outputs[index]):
                     errors.append(f"recompute changed logits case={index}")
-        stage(f"local_gradient_checks_done_recompute_{recompute}")
+        stage(f"local_gradient_checks_done_recompute_{recompute}_errors_{len(errors)}")
+        if errors:
+            print(f"FULL48_LOCAL_ERRORS rank={rank} errors={errors}", flush=True)
         agree(f"gradients recompute={recompute}")
         normal_grads, normal_outputs = grads, dict(observed)
         print(
@@ -329,12 +356,9 @@ def test_actual_full_model_lora_recompute_frozen_base_and_export(full_context):
     optimizer.step()
     assert any(before_adapter[name] != tensor_sha256(p) for name, p in trainable.items())
     del optimizer
-    for module in wrapped:
-        module.eval()
-    with torch.no_grad():
-        tuned = [value.cpu() for value in schedule(wrapped, True)]
-        with peft.disable_adapter(models):
-            disabled = [value.cpu() for value in schedule(wrapped, True)]
+    tuned = [value.cpu() for value in probe_inference(wrapped, lambda: schedule(wrapped, True))]
+    with peft.disable_adapter(models):
+        disabled = [value.cpu() for value in probe_inference(wrapped, lambda: schedule(wrapped, True))]
     if pp == 1:
         for index, (actual, original) in enumerate(zip(tuned, disabled, strict=True)):
             if torch.equal(actual, base[index]):
