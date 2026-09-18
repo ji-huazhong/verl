@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Real 48-layer checkpoint: TP2/PP2/EP2/CP2/VPP2 -> TP8 vLLM, two GRPO steps.
+# Real 48-layer checkpoint: TP2/PP2/EP2/CP2/VPP2 -> TP8/EP8/DP1 vLLM.
 # This is a short integration/resume gate, not an accuracy benchmark.
 # Use the validated dependencies/private Bridge overlay documented by the model plugin.
 set -euo pipefail
@@ -63,14 +63,21 @@ for role in actor ref; do
     )
 done
 
-# Keep rollout resident: level-1 sleep otherwise creates another full host
-# weight copy on top of actor offload and frozen PLE tables. The smaller token
-# budget leaves device headroom for the simultaneously resident actor/rollout.
+# EP spans the same TP x DP ranks, not another eight-GPU dimension. PLE and
+# attention remain TP8-sharded; routed experts use EP8 with expert TP1.
+# Native adapter-only level-1 sleep needs an additional host weight copy.
+# Monitor host peaks; the preflight is not a fit guarantee. Override
+# free_cache_engine=False to reproduce the earlier resident-rollout probe.
+# vLLM 0.29 EP LoRA requires this all-to-all backend and non-fully-sharded LoRA.
 bash examples/tuning/lora/run_qwen38_flash_next_megatron.sh \
     "${hybrid_args[@]}" \
     actor_rollout_ref.actor.loss_agg_mode=token-mean \
-    actor_rollout_ref.rollout.expert_parallel_size=1 \
-    actor_rollout_ref.rollout.free_cache_engine=False \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=8 \
+    actor_rollout_ref.rollout.data_parallel_size=1 \
+    actor_rollout_ref.rollout.expert_parallel_size=8 \
+    actor_rollout_ref.rollout.free_cache_engine=True \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.all2all_backend=allgather_reducescatter \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.fully_sharded_loras=False \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.35 \
     actor_rollout_ref.rollout.max_model_len=1024 \
     actor_rollout_ref.rollout.max_num_batched_tokens=1024 \

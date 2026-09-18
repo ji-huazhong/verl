@@ -35,20 +35,26 @@ at `examples/tuning/lora/run_qwen38_flash_next_hybrid_smoke.sh`. Set `MODEL_PATH
 `TRAIN_FILE`, `VAL_FILE`, `CUDA_VISIBLE_DEVICES`, a fresh `QWEN38_FULL_OUTPUT`, and
 a short fresh `QWEN38_RAY_TEMP`; run it from the repository root with the validated
 dependencies/private Bridge overlay. It uses TP2/PP2/EP2/CP2/VPP2/ETP1 actor/ref
-and TP8 vLLM, two real-data GRPO steps, console/TensorBoard, and one checkpoint per
+and TP8/EP8/DP1 vLLM, two real-data GRPO steps, console/TensorBoard, and one checkpoint per
 step (keeping two). A separate output/Ray directory plus `QWEN38_RESUME_FROM`
 resumes the step-1 checkpoint to step 2. It rejects reduced fixtures, missing
 shards/data and existing output directories. The 100 GiB/GPU, 1 TiB host and
 100 GiB disk checks are conservative launch prerequisites, not fit guarantees.
 The full-model run must pass independently; the launcher and its preflight do
 not turn the random-model results below into full-checkpoint acceptance.
-The full smoke keeps rollout weights resident (`free_cache_engine=False`): the
-initial sleep-enabled attempt loaded both real models but exhausted host memory
-at its first level-1 sleep, before step 1. Actor offload and frozen PLE already
-occupy substantial host memory; sleeping creates another weight copy. Keeping
-rollout resident trades host memory for GPU residency, with a smaller 1024-token
-per-GPU microbatch budget. This is not a disabled Ray memory monitor or a smaller
-checkpoint; this configuration still requires independent end-to-end validation.
+The full smoke now uses native adapter-only **level-1 sleep**
+(`free_cache_engine=True`) on the dedicated eight-GPU test host. EP spans the
+same TP x DP ranks: this is eight GPUs, not 64. Attention and PLE remain TP8
+sharded, while routed experts use EP8 with expert TP1. vLLM 0.29 EP LoRA uses
+`all2all_backend=allgather_reducescatter` and `fully_sharded_loras=False`;
+the launcher pins both compatibility settings. This topology change still
+requires independent full-model execution, numerical and resume validation.
+The earlier full-model level-1 attempt exhausted host memory before step 1.
+Actor offload, frozen PLE and sleeping rollout weights coexist in host memory;
+available memory must be monitored during loading and sleep, not inferred from
+one checkpoint's size. Passing `actor_rollout_ref.rollout.free_cache_engine=False`
+reproduces the resident-rollout alternative without disabling Ray's memory
+monitor. Neither setting nor the 1024-token microbatch budget guarantees fit.
 
 An explicitly reduced **12-layer real-weight prefix** is now a separate test:
 `tests/models/mcore/prepare_qwen38_next_layer_subset.py --source <original> --output <new> --layers 12`
