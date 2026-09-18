@@ -13,6 +13,8 @@ import pytest
 import torch
 
 from tests.models.mcore.qwen38_full_validation import (
+    ProbeActivationTrace,
+    activation_trace_differences,
     agree_probe_checks,
     check_recompute_gradient,
     full_checkpoint_config,
@@ -20,6 +22,55 @@ from tests.models.mcore.qwen38_full_validation import (
     probe_inference,
     tensor_sha256,
 )
+
+
+def test_activation_trace_preserves_values_and_skips_replays():
+    class Layer(torch.nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states.square(), None
+
+    layer = Layer()
+    trace = ProbeActivationTrace(max_bytes=128)
+    handles = trace.attach("layer1", layer)
+    value = torch.arange(4.0, requires_grad=True)
+    trace.case = 0
+    output, _ = layer(hidden_states=value)
+    trace.case = None
+    output.sum().backward()
+    layer(value)  # A checkpoint replay outside the original-forward scope.
+    with torch.no_grad():
+        value.add_(10)
+        output.add_(20)
+    saved = trace.to_host_and_clear()
+    assert list(saved) == ["case0/layer1/input", "case0/layer1/output"]
+    assert torch.equal(saved["case0/layer1/input"], torch.arange(4.0))
+    assert torch.equal(saved["case0/layer1/output"], torch.arange(4.0).square())
+    assert all(not item.requires_grad for item in saved.values())
+    assert not trace.values and trace.bytes == 0
+    assert activation_trace_differences(saved, saved) == {}
+    changed = dict(saved)
+    changed["case0/layer1/output"] = changed["case0/layer1/output"] + 1
+    report = activation_trace_differences(changed, saved)
+    assert list(report) == ["case0/layer1/output"]
+    assert report["case0/layer1/output"]["max_abs"] == 1
+    for handle in handles:
+        handle.remove()
+
+
+def test_activation_trace_enforces_budget_scope_and_shape():
+    trace = ProbeActivationTrace(max_bytes=16)
+    trace.case = 0
+    trace.capture("a", torch.ones(4))
+    with pytest.raises(RuntimeError, match="memory budget"):
+        trace.capture("b", torch.ones(1))
+    with pytest.raises(AssertionError, match="Duplicate"):
+        trace.capture("a", torch.ones(4))
+    with pytest.raises(AssertionError, match="scheduled forward"):
+        trace.to_host_and_clear()
+    with pytest.raises(AssertionError, match="keys differ"):
+        activation_trace_differences({}, {"a": torch.ones(1)})
+    with pytest.raises(AssertionError, match="metadata differs"):
+        activation_trace_differences({"a": torch.ones(2)}, {"a": torch.ones(1)})
 
 
 def test_peft_train_reset_needs_eval_not_only_no_grad_for_ple(monkeypatch):

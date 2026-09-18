@@ -25,6 +25,8 @@ import pytest
 import torch
 
 from tests.models.mcore.qwen38_full_validation import (
+    ProbeActivationTrace,
+    activation_trace_differences,
     agree_probe_checks,
     check_recompute_gradient,
     full_checkpoint_config,
@@ -182,6 +184,7 @@ def _run_full_model_case(full_context):
         for case in cases
     ]
     observed, errors = {}, []
+    trace = ProbeActivationTrace()
 
     def stage(label):
         print(f"FULL48_STAGE rank={rank} phase={label}", flush=True)
@@ -191,9 +194,13 @@ def _run_full_model_case(full_context):
 
     def forward_step(iterator, module):
         index = next(iterator)
-        value = gptmodel_forward_model_engine(
-            module, batches[index], multi_modal_inputs=multimodal[index], vision_model=True, pad_token_id=0
-        )
+        trace.case = index
+        try:
+            value = gptmodel_forward_model_engine(
+                module, batches[index], multi_modal_inputs=multimodal[index], vision_model=True, pad_token_id=0
+            )
+        finally:
+            trace.case = None
         if value.is_nested:
             value = gather_from_tensor_model_parallel_region(value.values(), group=config._pg_collection.tp)
 
@@ -284,6 +291,13 @@ def _run_full_model_case(full_context):
         for model in models
     ]
     stage("ddp_ready")
+    trace_handles = []
+    for model in models:
+        for layer in model.language_model.decoder.layers:
+            name = f"layer{layer.layer_number:02d}"
+            trace_handles.extend(trace.attach(name, layer))
+            for child in ("self_attention_hyper_connection", "self_attention", "mlp_hyper_connection", "mlp"):
+                trace_handles.extend(trace.attach(f"{name}/{child}", getattr(layer, child)))
     adapter_before = {name: tensor_sha256(parameter) for name, parameter in trainable.items()}
     replay_calls = [0]
     for model in models:
@@ -295,7 +309,7 @@ def _run_full_model_case(full_context):
             return _original(*args, **kwargs)
 
         decoder._checkpointed_forward = replay
-    normal_grads, normal_outputs = None, None
+    normal_grads, normal_outputs, normal_trace = None, None, None
     fixed_rng = copy.deepcopy(tensor_random._get_all_rng_states())
     for phase, recompute in (("normal_reference", False), ("normal_repeat", False), ("recompute", True)):
         tensor_random._set_all_rng_states(*copy.deepcopy(fixed_rng))
@@ -314,6 +328,11 @@ def _run_full_model_case(full_context):
         stage(f"forward_backward_done_{phase}")
         finalize_model_grads(ddp, pg_collection=config._pg_collection)
         stage(f"finalize_grads_done_{phase}")
+        activations = trace.to_host_and_clear()
+        activation_differences = (
+            activation_trace_differences(activations, normal_trace) if normal_trace is not None else {}
+        )
+        stage(f"activation_trace_done_{phase}_different_{len(activation_differences)}")
         observed = {index: value.cpu() for index, value in observed.items()}
         stage(f"logits_to_host_done_{phase}")
         if bool(replay_calls[0]) != recompute:
@@ -380,6 +399,8 @@ def _run_full_model_case(full_context):
             "logits": logits_report,
             "changed_adapters": changed_adapters,
             "changed_frozen_on_failure": changed_frozen,
+            "activation_trace_count": len(activations),
+            "activation_differences": activation_differences,
         }
         (output / f"{phase}-rank{rank}.json").write_text(json.dumps(report, indent=2, allow_nan=False))
         stage(f"local_gradient_checks_done_{phase}_errors_{len(errors)}")
@@ -391,12 +412,15 @@ def _run_full_model_case(full_context):
         agree(f"gradients phase={phase}")
         if normal_grads is None:
             normal_grads, normal_outputs = grads, dict(observed)
+            normal_trace = activations
         print(
             f"FULL48_GRADS rank={rank} phase={phase} recompute={recompute} tensors={len(grads)} "
             f"checkpoint_calls={replay_calls[0]} max_relative_l2={max(relative_errors, default=0.0):.9g}",
             flush=True,
         )
-    del normal_grads, normal_outputs, grads
+    for handle in trace_handles:
+        handle.remove()
+    del normal_grads, normal_outputs, normal_trace, activations, grads
     optimizer = torch.optim.AdamW(list(trainable.values()), lr=1e-3, foreach=False)
     before_adapter = {name: tensor_sha256(p) for name, p in trainable.items()}
     for p in trainable.values():

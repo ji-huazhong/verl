@@ -13,6 +13,77 @@ from pathlib import Path
 import torch
 
 
+class ProbeActivationTrace:
+    """Bounded, detached snapshots of original forwards, never checkpoint replays.
+
+    Set ``case`` only around the scheduled model forward. Hooks do no host
+    copies or scalar reads; materialize/compare only after the pipeline drains.
+    This is a diagnostic, not an alternative numerical acceptance criterion.
+    """
+
+    def __init__(self, max_bytes=512 * 1024**2):
+        self.max_bytes = max_bytes
+        self.case = None
+        self.values = {}
+        self.bytes = 0
+
+    def capture(self, name, value):
+        if self.case is None:
+            return
+        # Layer/attention/HC outputs can be tuples with an optional bias/context.
+        if isinstance(value, tuple):
+            value = value[0]
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"Expected primary activation tensor: {name}")
+        key = f"case{self.case}/{name}"
+        if key in self.values:
+            raise AssertionError(f"Duplicate original-forward trace: {key}")
+        size = value.numel() * value.element_size()
+        if self.bytes + size > self.max_bytes:
+            raise RuntimeError("Activation diagnostic exceeded its memory budget")
+        self.values[key] = value.detach().clone()
+        self.bytes += size
+
+    def attach(self, name, module):
+        def before(_module, args, kwargs):
+            self.capture(f"{name}/input", kwargs.get("hidden_states", args[0] if args else None))
+
+        def after(_module, _args, output):
+            self.capture(f"{name}/output", output)
+
+        return [module.register_forward_pre_hook(before, with_kwargs=True), module.register_forward_hook(after)]
+
+    def to_host_and_clear(self):
+        assert self.case is None, "Never copy diagnostics during a scheduled forward"
+        result = {key: value.cpu() for key, value in self.values.items()}
+        self.values.clear()
+        self.bytes = 0
+        return result
+
+
+def activation_trace_differences(actual, expected):
+    """Ordered first-divergence evidence from CPU snapshots; retain shape errors."""
+    if actual.keys() != expected.keys():
+        raise AssertionError("Activation trace keys differ")
+    result = {}
+    for name, value in actual.items():
+        reference = expected[name]
+        if value.device.type != "cpu" or reference.device.type != "cpu":
+            raise ValueError("Compare activation traces only after transfer to host")
+        if value.shape != reference.shape or value.dtype != reference.dtype:
+            raise AssertionError(f"Activation metadata differs: {name}")
+        if torch.equal(value, reference):
+            continue
+        delta = (value.double() - reference.double()).abs()
+        norm = reference.double().norm().item()
+        result[name] = {
+            "mean_abs": delta.mean().item(),
+            "max_abs": delta.max().item(),
+            "relative_l2": delta.norm().item() / norm if norm else None,
+        }
+    return result
+
+
 def probe_inference(modules, forward):
     """PEFT installation resets train mode; no_grad alone does not disable Core checkpoints."""
     for module in modules:
