@@ -1001,6 +1001,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 extended_args[sig] = mbridge_config[sig]
         return extended_args
 
+    @torch.no_grad()
     def _save_model_as_hf_via_bridge(self, hf_ckpt_path: str):
         """Save model weights through megatron-bridge."""
         if self.vanilla_bridge:

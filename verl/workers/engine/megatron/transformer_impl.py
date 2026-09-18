@@ -87,6 +87,20 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+@torch.no_grad()
+def _iter_detached_export_weights(weights):
+    """Keep lazy Bridge collectives out of the next training autograd graph.
+
+    Decorating a generator scopes grad mode to each iteration and restores it
+    before yielding to an async sender. A no_grad context spanning an await, or
+    decorating only the factory/async consumer, does not provide that boundary.
+    Detach leaves/views too: no_grad alone does not clear their requires_grad.
+    Already detached payloads (including quantization metadata) stay unchanged.
+    """
+    for name, weight in weights:
+        yield name, weight.detach() if weight.requires_grad or weight.grad_fn is not None else weight
+
+
 def _resolve_fused_temperature(temperature: float | torch.Tensor) -> float:
     """Return the scalar temperature required by fused linear cross entropy."""
     values = torch.as_tensor(temperature).detach().flatten()
@@ -1030,6 +1044,7 @@ class MegatronEngine(BaseEngine):
             self._hf_export_tasks = self.bridge.get_conversion_tasks(self.module)
         return self._hf_export_tasks
 
+    @torch.no_grad()
     def get_per_tensor_param(self, base_sync_done=False, **kwargs):
         peft_config = None
         non_merge_lora_sync = self.peft_cls is not None and not self.model_config.lora.get("merge", False)
@@ -1060,7 +1075,7 @@ class MegatronEngine(BaseEngine):
 
             per_tensor_param = export_qat_weights(per_tensor_param, self.module, self._qat_config.mode, self.bridge)
 
-        return per_tensor_param, peft_config
+        return _iter_detached_export_weights(per_tensor_param), peft_config
 
     def _mcore_export_index(self):
         """Build (once) the per-parameter delta export index: geometry specs and
