@@ -21,6 +21,13 @@ An additional real-shape one-layer TP4/EP4 probe reduced peak allocated memory
 from 3.424 to 2.282 GiB per rank, with identical final parameter SHA-256 on all
 four ranks. This is not a full-model memory measurement.
 
+Rebuilding the baseline from public sources also needs the isolated Core
+`megatron_core_optional_fa4_import.patch` documented in the same patches directory:
+the optional FA4 probe can raise `AttributeError` with CUTLASS DSL 4.6.2, blocking
+Core/Bridge import even on the FA2/TE path. The explicit four-case source-guard
+test distinguishes success, missing/incompatible optional imports and unrelated
+errors. This does not enable FA4 or substitute for actual CUDA/model validation.
+
 ## Validation status
 
 For the **real 48-layer checkpoint**, a separate short-run launcher is available

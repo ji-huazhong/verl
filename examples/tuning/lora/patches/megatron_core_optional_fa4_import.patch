@@ -1,0 +1,11 @@
+--- a/megatron/core/transformer/attention.py
++++ b/megatron/core/transformer/attention.py
+@@ -85,7 +85,7 @@
+     from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+ 
+     HAVE_FA4 = True
+-except ImportError:
++except (ImportError, AttributeError):
+     HAVE_FA4 = False
+ 
+ try:
