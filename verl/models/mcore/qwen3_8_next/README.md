@@ -49,7 +49,7 @@ copies the first nine GDN / three QSA layers, retaining all original widths,
 experts, vocabulary, vision and frozen PLE. It never changes the source. The
 763 tensors total 168,136,383,672 payload bytes; PLE alone remains
 102,400,491,800 bytes. Each output shard is read back and SHA-256 checked.
-`examples/tuning/lora/run_qwen38_flash_next_12layer_smoke.sh` uses the same
+`examples/tuning/lora/run_qwen38_flash_next_layer_subset_smoke.sh` uses the same
 TP2/PP2/EP2/CP2/VPP2/ETP1 -> TP8 layout, real GSM8K, native adapter-only
 **level-1 sleep**, two steps and a checkpoint each step. Set fresh
 `QWEN38_SUBSET_OUTPUT` / `QWEN38_RAY_TEMP`; `QWEN38_RESUME_FROM` supports a
@@ -61,6 +61,13 @@ loading with CUDA OOM, before rollout/sleep or any completed training step.
 Level-2 work is parked: a tiny actual reload gate restored logical parameter
 hashes but changed outputs, first observed at the PLE embedding. No level-2
 implementation is enabled by this reduced-layer launcher.
+
+The latest requested gate uses **8 layers** (six GDN / two QSA), still with all
+frozen PLE state and the same parallel layout / level-1 sleep. Materialize it
+separately with `--layers 8`; the subset launcher defaults to
+`QWEN38_SUBSET_LAYERS=8` and requires a matching completion manifest. Set it to
+12 only to reproduce the earlier reduced-layer experiment. Neither changes the
+48-layer full-checkpoint acceptance requirement.
 
 CPU tests cover config translation, public-checkpoint source-key coverage,
 packed boundaries (including empty sequences), partial RoPE, PLE hook cleanup,

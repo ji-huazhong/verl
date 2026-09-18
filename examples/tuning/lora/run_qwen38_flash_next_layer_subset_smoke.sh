@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Explicit REAL-WEIGHT 12-layer prefix integration test, NOT the full model.
+# Explicit REAL-WEIGHT 8/12-layer prefix integration test, NOT the full model.
 # Retains PLE/width/experts/vocabulary; use level-1 sleep for this gate.
 set -euo pipefail
-: "${MODEL_PATH:?Set the separately materialized 12-layer checkpoint}"
+: "${MODEL_PATH:?Set the separately materialized reduced-layer checkpoint}"
 : "${TRAIN_FILE:?Set the training parquet}"
 : "${VAL_FILE:?Set the validation parquet}"
 : "${QWEN38_SUBSET_OUTPUT:?Set a fresh output directory}"
 : "${QWEN38_RAY_TEMP:?Set a short unique Ray temp directory}"
 : "${CUDA_VISIBLE_DEVICES:?Select eight GPUs}"
+export QWEN38_SUBSET_LAYERS="${QWEN38_SUBSET_LAYERS:-8}"
+[[ "$QWEN38_SUBSET_LAYERS" == 8 || "$QWEN38_SUBSET_LAYERS" == 12 ]] || exit 2
 [[ ! -e "$QWEN38_SUBSET_OUTPUT" && ! -e "$QWEN38_RAY_TEMP" ]] || exit 3
 [[ -r "$TRAIN_FILE" && -r "$VAL_FILE" ]] || exit 4
 python3 - <<'PY'
@@ -21,10 +23,11 @@ import torch
 model = Path(os.environ["MODEL_PATH"])
 manifest = json.loads((model / "subset_manifest.json").read_text())
 config = json.loads((model / "config.json").read_text())
-assert manifest["complete"] and manifest["layers"] == 12 and manifest["source_layers"] == 48
+layers = int(os.environ["QWEN38_SUBSET_LAYERS"])
+assert manifest["complete"] and manifest["layers"] == layers and manifest["source_layers"] == 48
 assert manifest["kind"] == "real_checkpoint_decoder_prefix_integration_only"
-assert config["model_type"] == "qwen4_exp" and config["text_config"]["num_hidden_layers"] == 12
-assert config["text_config"]["layer_types"].count("full_attention") == 3
+assert config["model_type"] == "qwen4_exp" and config["text_config"]["num_hidden_layers"] == layers
+assert config["text_config"]["layer_types"].count("full_attention") == layers // 4
 index = json.loads((model / "model.safetensors.index.json").read_text())
 assert all((model / name).is_file() for name in set(index["weight_map"].values()))
 assert torch.cuda.device_count() == 8
@@ -36,7 +39,7 @@ available_kib = int(next(
 ))
 assert available_kib >= 512 * 1024**2, "Need 512 GiB available host memory; frozen PLE is NOT reduced"
 assert shutil.disk_usage(Path(os.environ["QWEN38_SUBSET_OUTPUT"]).parent).free >= 400 * 1024**3
-print("QWEN38_12_LAYER_PREFLIGHT passed; sleep=1; resource thresholds are not peak guarantees")
+print(f"QWEN38_LAYER_SUBSET_PREFLIGHT layers={layers} passed; sleep=1; thresholds are not peak guarantees")
 PY
 
 resume_args=(trainer.resume_mode=disable)
@@ -84,7 +87,7 @@ bash examples/tuning/lora/run_qwen38_flash_next_megatron.sh \
     +ray_kwargs.ray_init.num_gpus=8 \
     +ray_kwargs.ray_init.address=local \
     "+ray_kwargs.ray_init._temp_dir=$QWEN38_RAY_TEMP" \
-    trainer.experiment_name=real_12layer_level1_hybrid_smoke \
+    "trainer.experiment_name=real_${QWEN38_SUBSET_LAYERS}layer_level1_hybrid_smoke" \
     "trainer.default_local_dir=$QWEN38_SUBSET_OUTPUT/checkpoints" \
     trainer.save_freq=1 \
     trainer.max_actor_ckpt_to_keep=2 \

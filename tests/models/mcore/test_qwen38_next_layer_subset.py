@@ -21,7 +21,7 @@ def test_subset_launcher_preserves_existing_evidence(tmp_path, existing):
         target = output if existing == "output" else ray
         target.mkdir()
         (target / "keep.txt").write_text("previous evidence")
-    script = Path(__file__).resolve().parents[3] / "examples/tuning/lora/run_qwen38_flash_next_12layer_smoke.sh"
+    script = Path(__file__).resolve().parents[3] / "examples/tuning/lora/run_qwen38_flash_next_layer_subset_smoke.sh"
     result = subprocess.run(
         ["bash", str(script)],
         env={
@@ -55,13 +55,14 @@ def config():
     }
 
 
-def test_prefix_changes_only_depth_and_preserves_ple():
+@pytest.mark.parametrize("layers", [8, 12])
+def test_prefix_changes_only_depth_and_preserves_ple(layers):
     source = config()
     source["text_config"]["layer_types"] *= 12
-    subset = reduce_config(source, 12)
+    subset = reduce_config(source, layers)
     assert source["text_config"]["num_hidden_layers"] == 48
-    assert subset["text_config"]["num_hidden_layers"] == 12
-    assert subset["text_config"]["layer_types"].count("full_attention") == 3
+    assert subset["text_config"]["num_hidden_layers"] == layers
+    assert subset["text_config"]["layer_types"].count("full_attention") == layers // 4
     assert subset["text_config"]["ple_layer_ids"] == [2]
     assert subset["text_config"]["hidden_size"] == 2560
     for invalid in (0, 10, 48, 52):
@@ -81,7 +82,8 @@ def test_prefix_selection_keeps_vision_and_global_state():
     assert not keep_tensor("mtp.layers.0.weight", 12)
 
 
-def test_materialized_payload_round_trip_and_source_unchanged(tmp_path, monkeypatch):
+@pytest.mark.parametrize("layers", [8, 12])
+def test_materialized_payload_round_trip_and_source_unchanged(tmp_path, monkeypatch, layers):
     from tests.models.mcore import prepare_qwen38_next_layer_subset as builder
 
     monkeypatch.setattr(builder.shutil, "disk_usage", lambda path: SimpleNamespace(free=2**50))
@@ -102,22 +104,22 @@ def test_materialized_payload_round_trip_and_source_unchanged(tmp_path, monkeypa
     (source / "model.safetensors.index.json").write_text(
         json.dumps({"weight_map": dict.fromkeys(names, "model.safetensors")})
     )
-    prepare(source, output, 12)
+    prepare(source, output, layers)
     assert (source / "model.safetensors").read_bytes() == original
     assert json.loads((source / "config.json").read_text()) == source_config
     copied = (output / "model.safetensors").read_bytes()
     header_len = struct.unpack("<Q", copied[:8])[0]
     result_header = json.loads(copied[8 : 8 + header_len])
     result_payload = copied[8 + header_len :]
-    expected_names = {name for name in names if keep_tensor(name, 12)}
+    expected_names = {name for name in names if keep_tensor(name, layers)}
     assert set(result_header) - {"__metadata__"} == expected_names
     for name in expected_names:
         start, end = result_header[name]["data_offsets"]
         before_start, before_end = header[name]["data_offsets"]
         assert result_payload[start:end] == payload[before_start:before_end]
     manifest = json.loads((output / "subset_manifest.json").read_text())
-    assert manifest["complete"] and manifest["layers"] == 12 and manifest["source_layers"] == 48
+    assert manifest["complete"] and manifest["layers"] == layers and manifest["source_layers"] == 48
     assert manifest["shards"]["model.safetensors"]["payload_sha256"] == hashlib.sha256(result_payload).hexdigest()
     with pytest.raises(FileExistsError):
-        prepare(source, output, 12)
+        prepare(source, output, layers)
     assert (output / "model.safetensors").read_bytes() == copied
