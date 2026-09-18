@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU/metadata contracts only, not full-checkpoint numerical acceptance."""
 
+import ast
 import hashlib
 import json
 import os
+from pathlib import Path
 
 import pytest
 import torch
@@ -14,6 +16,22 @@ from tests.models.mcore.qwen38_full_validation import (
     logprob_differences,
     tensor_sha256,
 )
+
+
+def test_full_probe_callback_does_not_synchronize_with_host():
+    # Static guard only: the full hybrid GPU run is the runtime acceptance gate.
+    # An interleaved loss callback must not wait for pending P2P receives before
+    # it has returned the loss required to produce the peer's backward send.
+    source = Path(__file__).with_name("test_qwen38_next_full_numerical.py").read_text()
+    callbacks = [
+        node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.FunctionDef) and node.name == "collect"
+    ]
+    assert len(callbacks) == 1
+    forbidden = {"cpu", "numpy", "item", "tolist", "synchronize"}
+    assert not any(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in forbidden
+        for node in ast.walk(callbacks[0])
+    ), "Do not materialize probe logits on the host inside the pipeline loss callback"
 
 
 def test_recompute_gradient_does_not_accept_erased_small_gradient():

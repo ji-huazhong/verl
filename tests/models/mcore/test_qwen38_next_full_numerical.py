@@ -11,6 +11,7 @@ synthetic objective is a numerical probe, not GRPO or a learning benchmark.
 The actual production trainer/save/resume gate is separate.
 """
 
+import faulthandler
 import hashlib
 import json
 import os
@@ -60,6 +61,9 @@ def full_context():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.distributed.init_process_group("nccl", timeout=timedelta(minutes=20), device_id=device)
     old_backward = tensor_random.CheckpointFunction.backward
+    # Private stderr only. Preserve a Python stack if a stage stops producing
+    # markers; this does not require ptrace or suppress NCCL's timeout handling.
+    faulthandler.dump_traceback_later(300, repeat=True)
     try:
         parallel_state.initialize_model_parallel(
             tensor_model_parallel_size=2,
@@ -73,6 +77,7 @@ def full_context():
         apply_patch_megatron_recomputation_backward()
         yield
     finally:
+        faulthandler.cancel_dump_traceback_later()
         tensor_random.CheckpointFunction.backward = staticmethod(old_backward)
         parallel_state.destroy_model_parallel()
         torch.distributed.destroy_process_group()
@@ -152,6 +157,9 @@ def test_actual_full_model_lora_recompute_frozen_base_and_export():
     ]
     observed, errors = {}, []
 
+    def stage(label):
+        print(f"FULL48_STAGE rank={rank} phase={label}", flush=True)
+
     def agree(label):
         valid = torch.tensor(int(not errors), device="cuda")
         torch.distributed.all_reduce(valid, op=torch.distributed.ReduceOp.MIN)
@@ -167,8 +175,11 @@ def test_actual_full_model_lora_recompute_frozen_base_and_export():
 
         def collect(tensor, non_loss_data=False):
             if non_loss_data:
-                return tensor.detach().float().cpu()
-            observed[index] = tensor.detach().float().cpu()
+                return tensor.detach().float()
+            # A blocking D2H copy here can wait on outstanding P2P work before
+            # this loss returns and enables the peer's backward send. Keep the
+            # small diagnostic snapshots on GPU until the schedule has ended.
+            observed[index] = tensor.detach().float()
             loss = tensor.float().square().mean() / len(cases)
             return loss, counts[index], {"loss": loss.detach()}
 
@@ -187,7 +198,8 @@ def test_actual_full_model_lora_recompute_frozen_base_and_export():
         )
 
     with torch.no_grad():
-        base = schedule(wrapped, True)
+        base = [value.cpu() for value in schedule(wrapped, True)]
+    stage("base_forward_done")
     peft = LoRA(
         dim=16,
         alpha=32,
@@ -211,7 +223,7 @@ def test_actual_full_model_lora_recompute_frozen_base_and_export():
     }
     assert trainable and all("adapter" in name for name in trainable)
     with torch.no_grad():
-        initial = schedule(wrapped, True)
+        initial = [value.cpu() for value in schedule(wrapped, True)]
     if pp == 1:
         assert len(base) == len(initial) == len(cases)
         for expected, actual in zip(base, initial, strict=True):
@@ -220,6 +232,7 @@ def test_actual_full_model_lora_recompute_frozen_base_and_export():
         if torch.equal(base[2], base[3]):
             errors.append("full language model ignores changed image pixels")
     agree("initial LoRA and native image")
+    stage("zero_lora_and_image_done")
 
     def frozen_hashes():
         hashes = {}
@@ -245,6 +258,7 @@ def test_actual_full_model_lora_recompute_frozen_base_and_export():
         )
         for model in models
     ]
+    stage("ddp_ready")
     replay_calls = [0]
     for model in models:
         decoder = model.language_model.decoder
@@ -267,8 +281,12 @@ def test_actual_full_model_lora_recompute_frozen_base_and_export():
         for module in ddp:
             module.train()
             module.zero_grad_buffer()
+        stage(f"forward_backward_start_recompute_{recompute}")
         schedule(ddp, False)
+        stage(f"forward_backward_done_recompute_{recompute}")
         finalize_model_grads(ddp, pg_collection=config._pg_collection)
+        stage(f"finalize_grads_done_recompute_{recompute}")
+        observed = {index: value.cpu() for index, value in observed.items()}
         assert bool(replay_calls[0]) == recompute, "Recompute toggle never reached the decoder"
         with pytest.raises(RuntimeError, match="no n-gram ids published"):
             current_ple_batch()
@@ -308,9 +326,9 @@ def test_actual_full_model_lora_recompute_frozen_base_and_export():
     for module in wrapped:
         module.eval()
     with torch.no_grad():
-        tuned = schedule(wrapped, True)
+        tuned = [value.cpu() for value in schedule(wrapped, True)]
         with peft.disable_adapter(models):
-            disabled = schedule(wrapped, True)
+            disabled = [value.cpu() for value in schedule(wrapped, True)]
     if pp == 1:
         for index, (actual, original) in enumerate(zip(tuned, disabled, strict=True)):
             if torch.equal(actual, base[index]):
