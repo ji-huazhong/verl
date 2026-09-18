@@ -13,6 +13,14 @@ from pathlib import Path
 import torch
 
 
+def agree_probe_checks(errors, label, group):
+    """Keep diagnostic control traffic off the model's CUDA/NCCL streams."""
+    assert group is not None and torch.distributed.get_backend(group) == "gloo"
+    valid = torch.tensor(int(not errors), dtype=torch.int32, device="cpu")
+    torch.distributed.all_reduce(valid, op=torch.distributed.ReduceOp.MIN, group=group)
+    assert valid.item(), (label, errors or "Another rank failed this check")
+
+
 def tensor_sha256(tensor, *, chunk_bytes=64 * 1024**2):
     if tensor.is_meta or tensor.layout != torch.strided:
         raise ValueError("Hash requires materialized strided tensors")

@@ -5,17 +5,70 @@ import ast
 import hashlib
 import json
 import os
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
 import torch
 
 from tests.models.mcore.qwen38_full_validation import (
+    agree_probe_checks,
     check_recompute_gradient,
     full_checkpoint_config,
     logprob_differences,
     tensor_sha256,
 )
+
+
+@pytest.mark.parametrize("failure", [None, "local", "remote"])
+def test_probe_agreement_uses_explicit_cpu_group_and_propagates_failure(monkeypatch, failure):
+    group = object()
+    calls = []
+    monkeypatch.setattr(
+        torch.distributed, "get_backend", lambda actual_group: "gloo" if actual_group is group else "nccl"
+    )
+
+    def reduce(valid, *, op, group):
+        assert valid.device.type == "cpu" and valid.dtype == torch.int32
+        assert op == torch.distributed.ReduceOp.MIN
+        calls.append(group)
+        if failure == "remote":
+            valid.zero_()
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+    if failure is None:
+        agree_probe_checks([], "probe", group)
+    else:
+        errors = ["local failure"] if failure == "local" else []
+        with pytest.raises(AssertionError, match="local failure" if errors else "Another rank"):
+            agree_probe_checks(errors, "probe", group)
+    assert calls == [group]
+
+
+def test_probe_agreement_rejects_default_or_cuda_control_group(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda group: "nccl")
+    for group in (None, object()):
+        with pytest.raises(AssertionError):
+            agree_probe_checks([], "probe", group)
+
+
+def _gloo_probe_worker(rank, store_path):
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"file://{store_path}", rank=rank, world_size=2, timeout=timedelta(seconds=60)
+    )
+    try:
+        group = torch.distributed.group.WORLD
+        agree_probe_checks([], "all ranks pass", group)
+        errors = ["rank-one sentinel"] if rank == 1 else []
+        with pytest.raises(AssertionError, match="rank-one sentinel" if errors else "Another rank"):
+            agree_probe_checks(errors, "one rank fails", group)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo required for real control-plane check")
+def test_real_gloo_probe_propagates_one_rank_failure(tmp_path):
+    torch.multiprocessing.spawn(_gloo_probe_worker, args=(str(tmp_path / "control.store"),), nprocs=2, join=True)
 
 
 def test_full_probe_callback_does_not_synchronize_with_host():

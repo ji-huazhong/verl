@@ -23,6 +23,7 @@ import pytest
 import torch
 
 from tests.models.mcore.qwen38_full_validation import (
+    agree_probe_checks,
     check_recompute_gradient,
     full_checkpoint_config,
     make_full_cases,
@@ -61,10 +62,12 @@ def full_context():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.distributed.init_process_group("nccl", timeout=timedelta(minutes=20), device_id=device)
     old_backward = tensor_random.CheckpointFunction.backward
+    diagnostic_group = None
     # Private stderr only. Preserve a Python stack if a stage stops producing
     # markers; this does not require ptrace or suppress NCCL's timeout handling.
     faulthandler.dump_traceback_later(300, repeat=True)
     try:
+        diagnostic_group = torch.distributed.new_group(backend="gloo", timeout=timedelta(minutes=5))
         parallel_state.initialize_model_parallel(
             tensor_model_parallel_size=2,
             pipeline_model_parallel_size=2,
@@ -75,15 +78,17 @@ def full_context():
         )
         model_parallel_cuda_manual_seed(123)
         apply_patch_megatron_recomputation_backward()
-        yield
+        yield diagnostic_group
     finally:
         faulthandler.cancel_dump_traceback_later()
         tensor_random.CheckpointFunction.backward = staticmethod(old_backward)
         parallel_state.destroy_model_parallel()
+        if diagnostic_group is not None:
+            torch.distributed.destroy_process_group(diagnostic_group)
         torch.distributed.destroy_process_group()
 
 
-def test_actual_full_model_lora_recompute_frozen_base_and_export():
+def test_actual_full_model_lora_recompute_frozen_base_and_export(full_context):
     from megatron.bridge.peft.lora import LoRA
     from megatron.core import parallel_state
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig, finalize_model_grads
@@ -161,9 +166,7 @@ def test_actual_full_model_lora_recompute_frozen_base_and_export():
         print(f"FULL48_STAGE rank={rank} phase={label}", flush=True)
 
     def agree(label):
-        valid = torch.tensor(int(not errors), device="cuda")
-        torch.distributed.all_reduce(valid, op=torch.distributed.ReduceOp.MIN)
-        assert valid.item(), (label, errors or "Another rank failed this check")
+        agree_probe_checks(errors, label, full_context)
 
     def forward_step(iterator, module):
         index = next(iterator)
@@ -287,11 +290,13 @@ def test_actual_full_model_lora_recompute_frozen_base_and_export():
         finalize_model_grads(ddp, pg_collection=config._pg_collection)
         stage(f"finalize_grads_done_recompute_{recompute}")
         observed = {index: value.cpu() for index, value in observed.items()}
+        stage(f"logits_to_host_done_recompute_{recompute}")
         assert bool(replay_calls[0]) == recompute, "Recompute toggle never reached the decoder"
         with pytest.raises(RuntimeError, match="no n-gram ids published"):
             current_ple_batch()
         assert all(not getattr(m, "_ple_recompute_fifo", []) for model in models for m in model.modules())
         grads = {name: p.main_grad.detach().cpu().clone() for name, p in trainable.items()}
+        stage(f"grads_to_host_done_recompute_{recompute}")
         relative_errors = []
         for name, value in grads.items():
             if not bool(value.isfinite().all()):
@@ -308,6 +313,7 @@ def test_actual_full_model_lora_recompute_frozen_base_and_export():
             for index, actual in observed.items():
                 if not torch.equal(actual, normal_outputs[index]):
                     errors.append(f"recompute changed logits case={index}")
+        stage(f"local_gradient_checks_done_recompute_{recompute}")
         agree(f"gradients recompute={recompute}")
         normal_grads, normal_outputs = grads, dict(observed)
         print(
@@ -359,7 +365,7 @@ def test_actual_full_model_lora_recompute_frozen_base_and_export():
             "index_sha256": hashlib.sha256((source / "model.safetensors.index.json").read_bytes()).hexdigest(),
         }
         (output / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    torch.distributed.barrier()
+    torch.distributed.barrier(group=full_context)
     (output / f"frozen-rank{rank}.json").write_text(json.dumps(frozen_before, sort_keys=True))
     if pp == 1 and tp == cp == 0:
         reference = {}
@@ -373,5 +379,5 @@ def test_actual_full_model_lora_recompute_frozen_base_and_export():
             if case["rgb"] is not None:
                 reference[f"{prefix}.rgb"] = case["rgb"]
         save_file(reference, str(output / "reference.safetensors"))
-    torch.distributed.barrier()
+    torch.distributed.barrier(group=full_context)
     print(f"QWEN38_FULL48_MCORE_NUMERICAL_PASS rank={rank}; vLLM parity is still separate", flush=True)
