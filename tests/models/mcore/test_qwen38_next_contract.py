@@ -13,6 +13,39 @@ from verl.models.mcore.qwen3_8_next.config import validate_rollout, validate_run
 from verl.models.mcore.qwen3_8_next.ops.sequence import apply_indexer_rope, packed_token_segments
 
 
+@pytest.mark.parametrize("existing", ["output", "ray", "missing_data"])
+def test_full_model_smoke_preserves_paths_before_gpu_initialization(tmp_path, existing):
+    import subprocess
+
+    root = Path(__file__).resolve().parents[3]
+    output, ray = tmp_path / "output", tmp_path / "ray"
+    if existing != "missing_data":
+        target = output if existing == "output" else ray
+        target.mkdir()
+        (target / "keep.txt").write_text("previous evidence")
+    result = subprocess.run(
+        ["bash", str(root / "examples/tuning/lora/run_qwen38_flash_next_hybrid_smoke.sh")],
+        env={
+            **os.environ,
+            "MODEL_PATH": str(tmp_path / "not_loaded"),
+            "TRAIN_FILE": str(tmp_path / "missing.parquet"),
+            "VAL_FILE": str(tmp_path / "missing.parquet"),
+            "QWEN38_FULL_OUTPUT": str(output),
+            "QWEN38_RAY_TEMP": str(ray),
+            "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == (4 if existing == "missing_data" else 3)
+    assert output.exists() == (existing == "output")
+    assert ray.exists() == (existing == "ray")
+    if existing != "missing_data":
+        assert (target / "keep.txt").read_text() == "previous evidence"
+
+
 @pytest.mark.parametrize("gpu_count", [1, 2, 4])
 def test_hybrid_smoke_rejects_incomplete_gpu_counts_before_python(tmp_path, gpu_count):
     import subprocess

@@ -23,6 +23,19 @@ four ranks. This is not a full-model memory measurement.
 
 ## Validation status
 
+For the **real 48-layer checkpoint**, a separate short-run launcher is available
+at `examples/tuning/lora/run_qwen38_flash_next_hybrid_smoke.sh`. Set `MODEL_PATH`,
+`TRAIN_FILE`, `VAL_FILE`, `CUDA_VISIBLE_DEVICES`, a fresh `QWEN38_FULL_OUTPUT`, and
+a short fresh `QWEN38_RAY_TEMP`; run it from the repository root with the validated
+dependencies/private Bridge overlay. It uses TP2/PP2/EP2/CP2/VPP2/ETP1 actor/ref
+and TP8 vLLM, two real-data GRPO steps, console/TensorBoard, and one checkpoint per
+step (keeping two). A separate output/Ray directory plus `QWEN38_RESUME_FROM`
+resumes the step-1 checkpoint to step 2. It rejects reduced fixtures, missing
+shards/data and existing output directories. The 100 GiB/GPU, 1 TiB host and
+100 GiB disk checks are conservative launch prerequisites, not fit guarantees.
+The full-model run must pass independently; the launcher and its preflight do
+not turn the random-model results below into full-checkpoint acceptance.
+
 CPU tests cover config translation, public-checkpoint source-key coverage,
 packed boundaries (including empty sequences), partial RoPE, PLE hook cleanup,
 and native GDN LoRA B export at TP1/TP2. They also cover the sigmoid GDN output
