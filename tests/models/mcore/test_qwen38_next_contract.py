@@ -13,6 +13,21 @@ from verl.models.mcore.qwen3_8_next.config import validate_rollout, validate_run
 from verl.models.mcore.qwen3_8_next.ops.sequence import apply_indexer_rope, packed_token_segments
 
 
+@pytest.mark.parametrize("method", ["sleep", "release_kv_cache", "resume_kv_cache"])
+def test_resident_rollout_does_not_call_sleep_backend(method):
+    import asyncio
+
+    pytest.importorskip("vllm")
+    from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
+
+    server = object.__new__(vLLMHttpServer)
+    server.node_rank = 0
+    server.config = SimpleNamespace(free_cache_engine=False)
+    # No engine is installed: touching a sleep/wake backend must fail this gate.
+    # This checks the existing production guard, not full-model memory/parity.
+    assert asyncio.run(getattr(server, method)()) is None
+
+
 @pytest.mark.parametrize("existing", ["output", "ray", "missing_data"])
 def test_full_model_smoke_preserves_paths_before_gpu_initialization(tmp_path, existing):
     import subprocess

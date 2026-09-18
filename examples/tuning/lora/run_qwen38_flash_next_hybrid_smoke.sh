@@ -63,10 +63,14 @@ for role in actor ref; do
     )
 done
 
+# Keep rollout resident: level-1 sleep otherwise creates another full host
+# weight copy on top of actor offload and frozen PLE tables. The smaller token
+# budget leaves device headroom for the simultaneously resident actor/rollout.
 bash examples/tuning/lora/run_qwen38_flash_next_megatron.sh \
     "${hybrid_args[@]}" \
     actor_rollout_ref.actor.loss_agg_mode=token-mean \
     actor_rollout_ref.rollout.expert_parallel_size=1 \
+    actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.35 \
     actor_rollout_ref.rollout.max_model_len=1024 \
     actor_rollout_ref.rollout.max_num_batched_tokens=1024 \
@@ -80,9 +84,9 @@ bash examples/tuning/lora/run_qwen38_flash_next_megatron.sh \
     data.dataloader_num_workers=0 \
     +data.apply_chat_template_kwargs.enable_thinking=False \
     actor_rollout_ref.actor.ppo_mini_batch_size=4 \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=2048 \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=2048 \
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=2048 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=1024 \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=1024 \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=1024 \
     reward.num_workers=1 \
     ray_kwargs.ray_init.num_cpus=40 \
     +ray_kwargs.ray_init.num_gpus=8 \

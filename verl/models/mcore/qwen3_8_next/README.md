@@ -35,6 +35,13 @@ shards/data and existing output directories. The 100 GiB/GPU, 1 TiB host and
 100 GiB disk checks are conservative launch prerequisites, not fit guarantees.
 The full-model run must pass independently; the launcher and its preflight do
 not turn the random-model results below into full-checkpoint acceptance.
+The full smoke keeps rollout weights resident (`free_cache_engine=False`): the
+initial sleep-enabled attempt loaded both real models but exhausted host memory
+at its first level-1 sleep, before step 1. Actor offload and frozen PLE already
+occupy substantial host memory; sleeping creates another weight copy. Keeping
+rollout resident trades host memory for GPU residency, with a smaller 1024-token
+per-GPU microbatch budget. This is not a disabled Ray memory monitor or a smaller
+checkpoint; this configuration still requires independent end-to-end validation.
 
 CPU tests cover config translation, public-checkpoint source-key coverage,
 packed boundaries (including empty sequences), partial RoPE, PLE hook cleanup,
