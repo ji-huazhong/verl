@@ -511,6 +511,27 @@ The canonical stacked-expert conversion requires the active vLLM loader to
 advertise matching per-expert 2D targets. Native 3D/shared-stack-only layouts
 are not silently treated as equivalent; unsupported mappings fail explicitly.
 
+## Public runtime preflight
+
+Before loading the real checkpoint on another host, check the public runtime
+independently from Megatron/TE and the isolated Bridge patch:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=1 \
+  python tests/models/mcore/check_qwen38_public_cuda_runtime.py
+```
+
+This standalone diagnostic (not an automatically collected pytest test) targets
+the verified Torch 2.13/CUDA 13.0, vLLM 0.29.0, NCCL 2.29.7 and CUTLASS DSL 4.6.2
+combination. It checks the actual NCCL runtime version, matching CUTLASS libraries,
+eight-rank exact all-reduce, native vLLM BF16 RMSNorm against an FP32 reference,
+and finite matrix multiplication. Each GPU must have at least 2 GiB free; only
+small tensors are allocated, with no model/checkpoint access. Do not evict jobs.
+
+The same committed script passed on both H200 and H20, eight ranks each and exit
+code 0. This is an ABI/collective sanity gate, not a test of Megatron, LoRA, model
+numerics, training throughput, sleep/wake or resume. Those gates remain required.
+
 ## Important current boundaries
 
 Full-size structural inspection is available separately from numerical tests:
