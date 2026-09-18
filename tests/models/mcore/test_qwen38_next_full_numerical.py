@@ -11,6 +11,7 @@ synthetic objective is a numerical probe, not GRPO or a learning benchmark.
 The actual production trainer/save/resume gate is separate.
 """
 
+import copy
 import faulthandler
 import hashlib
 import json
@@ -109,6 +110,7 @@ def _run_full_model_case(full_context):
     from megatron.core.enums import ModelType
     from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
     from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.tensor_parallel import random as tensor_random
     from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
     from megatron.core.transformer.module import Float16Module
     from safetensors.torch import save_file
@@ -123,6 +125,9 @@ def _run_full_model_case(full_context):
     source = Path(os.environ["QWEN38_MODEL_PATH"])
     output = Path(os.environ["QWEN38_FULL_NUMERICAL_OUTPUT"])
     rank = torch.distributed.get_rank()
+    if rank == 0:
+        output.mkdir(parents=True, exist_ok=False, mode=0o700)
+    torch.distributed.barrier(group=full_context)
     pp = parallel_state.get_pipeline_model_parallel_rank()
     tp = parallel_state.get_tensor_model_parallel_rank()
     cp = parallel_state.get_context_parallel_rank()
@@ -154,6 +159,8 @@ def _run_full_model_case(full_context):
     )
     assert config.num_layers == 48 and config.hidden_size == 2560
     config._pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    assert config.hidden_dropout == config.attention_dropout == 0.0
+    assert config.moe_input_jitter_eps is None and not config.moe_router_force_load_balancing
     models = [
         config.provide(pre_process=pp == 0 and vp == 0, post_process=pp == 1 and vp == 1, vp_stage=vp).cuda()
         for vp in range(2)
@@ -277,6 +284,7 @@ def _run_full_model_case(full_context):
         for model in models
     ]
     stage("ddp_ready")
+    adapter_before = {name: tensor_sha256(parameter) for name, parameter in trainable.items()}
     replay_calls = [0]
     for model in models:
         decoder = model.language_model.decoder
@@ -288,7 +296,9 @@ def _run_full_model_case(full_context):
 
         decoder._checkpointed_forward = replay
     normal_grads, normal_outputs = None, None
-    for recompute in (False, True):
+    fixed_rng = copy.deepcopy(tensor_random._get_all_rng_states())
+    for phase, recompute in (("normal_reference", False), ("normal_repeat", False), ("recompute", True)):
+        tensor_random._set_all_rng_states(*copy.deepcopy(fixed_rng))
         for model in models:
             dc = model.language_model.decoder.config
             dc.recompute_granularity = "full" if recompute else None
@@ -299,13 +309,13 @@ def _run_full_model_case(full_context):
         for module in ddp:
             module.train()
             module.zero_grad_buffer()
-        stage(f"forward_backward_start_recompute_{recompute}")
+        stage(f"forward_backward_start_{phase}")
         schedule(ddp, False)
-        stage(f"forward_backward_done_recompute_{recompute}")
+        stage(f"forward_backward_done_{phase}")
         finalize_model_grads(ddp, pg_collection=config._pg_collection)
-        stage(f"finalize_grads_done_recompute_{recompute}")
+        stage(f"finalize_grads_done_{phase}")
         observed = {index: value.cpu() for index, value in observed.items()}
-        stage(f"logits_to_host_done_recompute_{recompute}")
+        stage(f"logits_to_host_done_{phase}")
         if bool(replay_calls[0]) != recompute:
             errors.append(f"Recompute toggle mismatch: expected={recompute}, checkpoint_calls={replay_calls[0]}")
         try:
@@ -321,8 +331,9 @@ def _run_full_model_case(full_context):
                 if pending:
                     errors.append(f"Pending PLE recompute contexts: chunk={vp}, module={name}, count={len(pending)}")
         grads = {name: p.main_grad.detach().cpu().clone() for name, p in trainable.items()}
-        stage(f"grads_to_host_done_recompute_{recompute}")
+        stage(f"grads_to_host_done_{phase}")
         relative_errors = []
+        gradient_failures = {}
         for name, value in grads.items():
             if not bool(value.isfinite().all()):
                 errors.append(f"nonfinite gradient: {name}")
@@ -330,21 +341,58 @@ def _run_full_model_case(full_context):
                 try:
                     relative_errors.append(check_recompute_gradient(value, normal_grads[name]))
                 except AssertionError as error:
-                    errors.append(f"recompute gradient {name}: {error}")
+                    errors.append(f"{phase} gradient {name}: {error}")
+                    expected = normal_grads[name].double()
+                    delta = value.double() - expected
+                    norm = expected.norm().item()
+                    gradient_failures[name] = {
+                        "max_abs": delta.abs().max().item(),
+                        "relative_l2": delta.norm().item() / norm if norm else None,
+                        "reference_l2": norm,
+                    }
         for family in (".self_attention.", ".mlp.experts.", ".mlp.shared_experts."):
             if not any(family in name and bool((value != 0).any()) for name, value in grads.items()):
                 errors.append(f"missing nonzero gradient: {family}")
+        logits_report = {}
         if normal_outputs is not None:
             for index, actual in observed.items():
+                delta = (actual.double() - normal_outputs[index].double()).abs()
+                logits_report[cases[index]["name"]] = {"mean_abs": delta.mean().item(), "max_abs": delta.max().item()}
                 if not torch.equal(actual, normal_outputs[index]):
-                    errors.append(f"recompute changed logits case={index}")
-        stage(f"local_gradient_checks_done_recompute_{recompute}_errors_{len(errors)}")
+                    errors.append(f"{phase} changed logits case={index}")
+        adapter_after = {name: tensor_sha256(parameter) for name, parameter in trainable.items()}
+        changed_adapters = [name for name in adapter_before if adapter_before[name] != adapter_after[name]]
+        if changed_adapters:
+            errors.append(f"Adapter weights changed before optimizer step: {phase}")
+        changed_frozen = None
         if errors:
-            print(f"FULL48_LOCAL_ERRORS rank={rank} errors={errors}", flush=True)
-        agree(f"gradients recompute={recompute}")
-        normal_grads, normal_outputs = grads, dict(observed)
+            frozen_after = frozen_hashes()
+            changed_frozen = [name for name in frozen_before if frozen_before[name] != frozen_after.get(name)]
+            if changed_frozen:
+                errors.append(f"Frozen weights changed before optimizer step: {phase}")
+        report = {
+            "rank": rank,
+            "phase": phase,
+            "recompute": recompute,
+            "checkpoint_calls": replay_calls[0],
+            "errors": errors,
+            "gradient_failures": gradient_failures,
+            "logits": logits_report,
+            "changed_adapters": changed_adapters,
+            "changed_frozen_on_failure": changed_frozen,
+        }
+        (output / f"{phase}-rank{rank}.json").write_text(json.dumps(report, indent=2, allow_nan=False))
+        stage(f"local_gradient_checks_done_{phase}_errors_{len(errors)}")
+        if errors:
+            # Full details stay in the private JSON; bound console/traceback size.
+            summaries = [error.splitlines()[0][:240] for error in errors[:3]]
+            print(f"FULL48_LOCAL_ERRORS rank={rank} count={len(errors)} first={summaries}", flush=True)
+            errors[:] = [f"{phase}: {len(errors)} failed checks; details in the private rank report", *summaries]
+        agree(f"gradients phase={phase}")
+        if normal_grads is None:
+            normal_grads, normal_outputs = grads, dict(observed)
         print(
-            f"FULL48_GRADS rank={rank} recompute={recompute} tensors={len(grads)} "
+            f"FULL48_GRADS rank={rank} phase={phase} recompute={recompute} tensors={len(grads)} "
             f"checkpoint_calls={replay_calls[0]} max_relative_l2={max(relative_errors, default=0.0):.9g}",
             flush=True,
         )
@@ -372,7 +420,6 @@ def _run_full_model_case(full_context):
         tensors = dict(_iter_detached_export_weights(bridge.export_adapter_weights(ddp, cpu=True, show_progress=False)))
     assert len(tensors) == 936 and all(bool(x.isfinite().all()) for x in tensors.values())
     if rank == 0:
-        output.mkdir(parents=True, exist_ok=False, mode=0o700)
         (output / "adapter").mkdir()
         save_file(
             {name: value.detach().cpu().contiguous() for name, value in tensors.items()},
