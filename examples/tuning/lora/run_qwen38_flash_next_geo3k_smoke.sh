@@ -10,6 +10,8 @@ export VAL_FILE="$GEO3K_DIR/test.parquet"
 # Keep original images and answers. The production dataset loader filters
 # overlong prompts without truncation; do not train on the evaluation split.
 # Two steps exercise an adapter update and its use in subsequent rollout.
+# Level 2 reloads the complete frozen checkpoint before each adapter update;
+# bounded runner-state backup preserves constants outside model.named_buffers().
 bash examples/tuning/lora/run_qwen38_flash_next_hybrid_smoke.sh \
     trainer.experiment_name=bridge_geo3k_smoke \
     trainer.total_training_steps=2 \
@@ -17,4 +19,6 @@ bash examples/tuning/lora/run_qwen38_flash_next_hybrid_smoke.sh \
     data.val_max_samples=8 \
     data.filter_overlong_prompts_workers=1 \
     actor_rollout_ref.rollout.calculate_log_probs=True \
+    actor_rollout_ref.rollout.free_cache_engine=True \
+    actor_rollout_ref.rollout.lora_sleep_level=2 \
     "$@"

@@ -156,6 +156,8 @@ class vLLMHttpServer:
             os.environ["VLLM_BATCH_INVARIANT"] = "1"
 
         self.rollout_mode = rollout_mode
+        self._lora_base_reload_pending = False
+        self._validate_lora_sleep_config()
         self.workers = workers
 
         self.replica_rank = replica_rank
@@ -570,6 +572,8 @@ class vLLMHttpServer:
         Args:
             kv_transfer_params: vLLM KV-transfer payload for PD requests.
         """
+        if getattr(self, "_lora_base_reload_pending", False):
+            raise RuntimeError("Cannot generate before level-2 LoRA base weights are restored")
         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
             return await self._pd_dispatch(
                 prompt_ids,
@@ -838,7 +842,11 @@ class vLLMHttpServer:
             # engine.wake_up() broadcasts via the DP coordinator to ALL EngineCore
             # processes across all DP shards (unlike collective_rpc which only reaches
             # TP workers within a single shard).
-            await self.engine.wake_up(tags=tags or self._get_wake_up_tags())
+            wake_tags = tags or self._get_wake_up_tags()
+            if getattr(self, "_lora_base_reload_pending", False) and "weights" not in wake_tags:
+                raise RuntimeError("Level-2 LoRA sleep requires weights reload before KV cache wake-up")
+            await self.engine.wake_up(tags=wake_tags)
+            await self._reload_lora_base_after_wake()
             await self.engine.reset_prefix_cache(reset_connector=True)
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
@@ -880,8 +888,9 @@ class vLLMHttpServer:
             return
         if self.rollout_mode == RolloutMode.COLOCATED:
             return
-        await self.engine.sleep(level=self._resolve_sleep_level())
+        await self._sleep_hybrid()
         await self.engine.wake_up(tags=["weights"])
+        await self._reload_lora_base_after_wake()
 
     async def resume_kv_cache(self):
         """Restore kv_cache GPU memory after a weight sync. Counterpart to release_kv_cache()."""
@@ -889,6 +898,8 @@ class vLLMHttpServer:
             return
         if self.rollout_mode == RolloutMode.COLOCATED:
             return
+        if getattr(self, "_lora_base_reload_pending", False):
+            raise RuntimeError("Level-2 LoRA base weights have not been restored")
         await self.engine.wake_up(tags=["kv_cache"])
         await self.engine.reset_prefix_cache(reset_connector=True)
 
@@ -1253,7 +1264,7 @@ class vLLMHttpServer:
 
         MTP drafter-only weights are initialized by vLLM and are not guaranteed
         to be restored by actor weight sync after level 2 sleep discards them.
-        lora only update adapter weights, so set sleep level to 1.
+        LoRA defaults to level 1; opt-in level 2 reloads its frozen base on wake.
         vllm_ascend not support sleep_level now. Enabling EP during training may lead to accuracy issues.
         """
         mtp_config = getattr(self.config, "mtp", None)
@@ -1262,12 +1273,38 @@ class vLLMHttpServer:
             and getattr(mtp_config, "enable", False)
             and getattr(mtp_config, "enable_rollout", False)
         )
-        if mtp_rollout_enabled or self.lora_as_adapter or is_torch_npu_available(check_device=False):
+        if mtp_rollout_enabled or is_torch_npu_available(check_device=False):
             return 1
+        if self.lora_as_adapter:
+            return getattr(self.config, "lora_sleep_level", 1)
         return 2
 
+    def _validate_lora_sleep_config(self):
+        if getattr(self.config, "lora_sleep_level", 1) != 2:
+            return
+        if not self.lora_as_adapter or self.rollout_mode != RolloutMode.HYBRID:
+            raise ValueError("LoRA level-2 sleep requires adapter-only HYBRID rollout")
+        if not self.config.enforce_eager:
+            raise ValueError("LoRA level-2 checkpoint reload currently requires enforce_eager=True")
+        if self._resolve_sleep_level() != 2:
+            raise ValueError("LoRA level-2 checkpoint reload does not support MTP or NPU")
+        if self.config.data_parallel_size != 1 or self.config.checkpoint_engine.backend != "naive":
+            # collective_rpc reaches one DP engine; never silently leave peers unrestored.
+            raise ValueError("LoRA level-2 checkpoint reload currently requires DP1 and the naive backend")
+        if self.config.load_format not in ("auto", "safetensors") or self.config.quantization is not None:
+            raise ValueError("LoRA level-2 sleep requires an unquantized auto/safetensors base checkpoint")
+
+    async def _reload_lora_base_after_wake(self):
+        if not getattr(self, "_lora_base_reload_pending", False):
+            return
+        # Full native reload includes frozen state omitted by the actor's LoRA
+        # exporter (e.g. PLE embeddings), and invalidates the old adapter cache.
+        # Keep the pending flag on failure: never expose uninitialized weights.
+        await self.engine.collective_rpc("reload_lora_base_weights")
+        self._lora_base_reload_pending = False
+
     async def _sleep_hybrid(self):
-        """HYBRID sleep: adapters and MTP need level=1; full weights need level=2.
+        """HYBRID sleep, optionally reloading a frozen LoRA base after level 2.
 
         Uses engine.sleep() instead of engine.collective_rpc("sleep") to ensure
         that sleep is properly propagated to all data-parallel worker processes.
@@ -1275,7 +1312,13 @@ class vLLMHttpServer:
         leaving other DP shards' weights unreleased, which causes OOM during
         FSDP training backward when DP > 1.
         """
-        await self.engine.sleep(level=self._resolve_sleep_level())
+        level = self._resolve_sleep_level()
+        if level == 2 and self.lora_as_adapter:
+            if getattr(self, "_lora_base_reload_pending", False):
+                raise RuntimeError("Cannot sleep again before level-2 base reload completes")
+            await self.engine.collective_rpc("prepare_lora_level2_sleep")
+            self._lora_base_reload_pending = True
+        await self.engine.sleep(level=level)
         await self.engine.reset_encoder_cache()
 
 

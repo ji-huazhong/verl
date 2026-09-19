@@ -60,6 +60,10 @@ cudagraph_capture_sizes: null
 # Whether to free engine KVCache after generation.
 free_cache_engine: True
 
+# vLLM adapter-only HYBRID: 2 discards base weights and reloads the original
+# checkpoint before each adapter sync. Default 1 retains the CPU backup.
+lora_sleep_level: 1
+
 # TP size for rollout. Not effective for hf
 tensor_model_parallel_size: 2
 

@@ -238,6 +238,52 @@ class vLLMColocateWorkerExtension:
             # patch weight loader to support MoE model
             patch_vllm_moe_model_weight_loader(model)
 
+    def prepare_lora_level2_sleep(self):
+        """Keep small runner constants, never a full base-weight CPU backup."""
+        from verl.workers.rollout.vllm_rollout.sleep_state import RunnerTensorSnapshot
+
+        if getattr(self, "_lora_runner_sleep_snapshot", None) is not None:
+            raise RuntimeError("Previous level-2 runner snapshot has not been restored")
+        self.synchronize_device()
+        self._lora_runner_sleep_snapshot = RunnerTensorSnapshot.capture(getattr(self.model_runner, "model_state", None))
+        return {"runner_backup_bytes": self._lora_runner_sleep_snapshot.nbytes}
+
+    def reload_lora_base_weights(self):
+        """Restore the immutable checkpoint discarded by opt-in level-2 sleep.
+
+        Use vLLM's native in-place loader (including frozen model-specific state)
+        and adapter-cache reset. The current adapter is supplied by the following
+        normal IPC sync; no architecture names or actor export shortcuts here.
+        """
+        runner = self.model_runner
+        snapshot = getattr(self, "_lora_runner_sleep_snapshot", None)
+        if snapshot is None:
+            raise RuntimeError("Missing level-2 runner snapshot; cannot safely reload")
+        config = runner.vllm_config
+        if config.lora_config is None or config.speculative_config is not None:
+            raise ValueError("Level-2 LoRA reload requires adapters without speculative decoding")
+        if config.model_config.quantization is not None:
+            raise ValueError("Level-2 LoRA reload has not been validated for quantized checkpoints")
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.model_loader import get_model_loader
+        from vllm.model_executor.model_loader.utils import process_weights_after_loading
+
+        loader = get_model_loader(config.load_config)
+        if not callable(getattr(loader, "get_all_weights", None)):
+            raise RuntimeError("This vLLM loader does not support streaming checkpoint reload")
+        model = runner.model
+        # Keep live parameter storage/aliases, matching the existing BF16 IPC
+        # reload path rather than the newer layerwise meta reconstruction path.
+        with set_current_vllm_config(config):
+            patch_vllm_moe_model_weight_loader(model)
+            model.load_weights(loader.get_all_weights(config.model_config, model))
+            process_weights_after_loading(model, config.model_config, self.device)
+        runner.reset_lora_state()
+        runner.reset_encoder_cache()
+        runner.reset_mm_cache()
+        snapshot.restore(getattr(runner, "model_state", None))
+        self._lora_runner_sleep_snapshot = None
+
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Update the weights of the rollout model."""
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver

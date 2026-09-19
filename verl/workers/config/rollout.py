@@ -188,6 +188,8 @@ class RolloutConfig(BaseConfig):
     enforce_eager: bool = False
     cudagraph_capture_sizes: Optional[list] = None
     free_cache_engine: bool = True
+    # Opt-in vLLM adapter-only mode: level 2 reloads the frozen checkpoint on wake.
+    lora_sleep_level: int = 1
     data_parallel_size: int = 1
     expert_parallel_size: int = 1
     tensor_model_parallel_size: int = 2
@@ -277,6 +279,12 @@ class RolloutConfig(BaseConfig):
 
     def __post_init__(self):
         """Validate the rollout config"""
+        if type(self.lora_sleep_level) is not int or self.lora_sleep_level not in (1, 2):
+            raise ValueError("lora_sleep_level must be 1 or 2")
+        if self.lora_sleep_level == 2 and (
+            self.name != "vllm" or not self.free_cache_engine or not self.enable_sleep_mode
+        ):
+            raise ValueError("LoRA level-2 sleep requires vLLM with free_cache_engine and enable_sleep_mode")
         # Deprecation warning for mode field - only async mode is supported
         if self.mode == "sync":
             raise ValueError(

@@ -129,5 +129,7 @@ def test_geo3k_smoke_uses_separate_real_splits(tmp_path):
     assert effective["data.truncation"] == "error"
     assert effective["data.filter_overlong_prompts"] == "True"
     assert effective["actor_rollout_ref.rollout.calculate_log_probs"] == "True"
+    assert effective["actor_rollout_ref.rollout.free_cache_engine"] == "True"
+    assert effective["actor_rollout_ref.rollout.lora_sleep_level"] == "2"
     assert effective["trainer.total_training_steps"] == "2"
     assert effective["trainer.logger"] == "[console,tensorboard]"
