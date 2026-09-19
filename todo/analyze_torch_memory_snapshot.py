@@ -93,7 +93,9 @@ def _tag_matches(allocations: list[Allocation], patterns: list[str]) -> None:
         allocation.matches = frozenset(pattern for pattern, value in lowered.items() if value in stack)
 
 
-def analyze(path: Path, label: str, top: int, matches: list[str], max_entries: int | None) -> None:
+def analyze(
+    path: Path, label: str, top: int, matches: list[str], max_entries: int | None, phase_matches: list[str]
+) -> None:
     with path.open("rb") as stream:
         snapshot = pickle.load(stream)  # noqa: S301 - snapshots are trusted local artifacts
 
@@ -197,7 +199,25 @@ def analyze(path: Path, label: str, top: int, matches: list[str], max_entries: i
     }
     forward_allocated = initial_allocated
     matched_global_max = {pattern: 0 for pattern in matches}
+    # Match the event's own stack, not the stack of the allocation being freed.
+    # The enclosing interval also includes backward-worker events whose stacks
+    # may not contain the original Python caller. With multiple calls/steps it
+    # includes the gaps between them; this is NOT an exact per-call timer.
+    phase_ranges = {}
+    for pattern in phase_matches:
+        indices = [
+            index
+            for index, event in enumerate(trace)
+            if pattern.lower()
+            in "\n".join(
+                f"{frame.get('filename', '')}::{frame.get('name', '')}" for frame in event.get("frames", [])
+            ).lower()
+        ]
+        if indices:
+            phase_ranges[pattern] = (indices[0], indices[-1])
+    phase_max = dict.fromkeys(phase_ranges, 0)
     for index, event in enumerate(trace):
+        before_allocated = forward_allocated
         if event["action"] == "alloc":
             allocation = allocations_by_index[index]
             forward_allocated += allocation.size
@@ -208,6 +228,20 @@ def analyze(path: Path, label: str, top: int, matches: list[str], max_entries: i
             for pattern in allocation.matches:
                 matched_global_max[pattern] = max(matched_global_max[pattern], forward_allocated)
             forward_allocated -= allocation.size
+        for pattern, (first, last) in phase_ranges.items():
+            if first <= index <= last:
+                phase_max[pattern] = max(phase_max[pattern], before_allocated, forward_allocated)
+
+    for pattern in phase_matches:
+        if pattern not in phase_ranges:
+            print(f"phase_stack_match={pattern!r}: no matching event stacks")
+            continue
+        first, last = phase_ranges[pattern]
+        print(
+            f"phase_stack_match={pattern!r}: enclosing_event_interval=[{first},{last}] "
+            f"max_allocated_gib={phase_max[pattern] / GIB:.6f} "
+            "(includes gaps between matching calls; retained trace only)"
+        )
 
     for pattern in matches:
         selected = [allocation for allocation in allocations if pattern in allocation.matches]
@@ -237,10 +271,13 @@ def main() -> None:
     parser.add_argument("--top", type=int, default=15)
     parser.add_argument("--match", action="append", default=[])
     parser.add_argument("--max-entries", type=int)
+    parser.add_argument(
+        "--phase-stack-match", action="append", default=[], help="Report peak between first/last matching event stacks"
+    )
     args = parser.parse_args()
     for index, path in enumerate(args.snapshot):
         label = args.label[index] if index < len(args.label) else path.stem
-        analyze(path, label, args.top, args.match, args.max_entries)
+        analyze(path, label, args.top, args.match, args.max_entries, args.phase_stack_match)
 
 
 if __name__ == "__main__":

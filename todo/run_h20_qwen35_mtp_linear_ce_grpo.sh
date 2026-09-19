@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-step Qwen3.5-35B-A3B MTP + GRPO validation on DAPO-Math-17k.
+# Qwen3.5-35B-A3B MTP + GRPO validation on DAPO-Math-17k.
 #
 # The first run populates SKIP_DUMP_DIR. Later runs with the same project,
 # experiment, batch shape and step load the identical rollout batch, making
@@ -17,9 +17,10 @@ EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen35_mtp_linear_ce_h20_ab}
 PROJECT_NAME=${PROJECT_NAME:-verl_mtp_linear_ce_validation}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-8}
 ROLLOUT_N=${ROLLOUT_N:-2}
-MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-512}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-256}
-MAX_TOKEN_LEN_PER_GPU=${MAX_TOKEN_LEN_PER_GPU:-1024}
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-4096}
+# Keep actor/log-prob and rollout budgets consistent with the sequence limit.
+MAX_TOKEN_LEN_PER_GPU=${MAX_TOKEN_LEN_PER_GPU:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}
 ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.30}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 TP=${TP:-2}
@@ -29,6 +30,16 @@ EP=${EP:-8}
 ETP=${ETP:-1}
 ROLLOUT_TP=${ROLLOUT_TP:-8}
 SEED=${SEED:-42}
+TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-10}
+if [[ ! ${TOTAL_TRAINING_STEPS} =~ ^[1-9][0-9]*$ ]]; then
+    echo "TOTAL_TRAINING_STEPS must be a positive integer" >&2
+    exit 1
+fi
+SKIP_STEPS="[1"
+for ((step = 2; step <= TOTAL_TRAINING_STEPS; step++)); do
+    SKIP_STEPS+=",${step}"
+done
+SKIP_STEPS+="]"
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_USE_V1=1
@@ -37,8 +48,8 @@ export HYDRA_FULL_ERROR=1
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1
 
-# This smoke consumes one batch only. Avoid tokenizing the complete source
-# parquet up front; truncation still bounds every selected prompt.
+# This test consumes a small number of batches. Avoid tokenizing the complete
+# source parquet up front; truncation still bounds every selected prompt.
 python3 -m verl.trainer.main_ppo \
     model_engine=megatron \
     algorithm.adv_estimator=grpo \
@@ -125,7 +136,7 @@ python3 -m verl.trainer.main_ppo \
     +reward.reward_kwargs.max_resp_len="${MAX_RESPONSE_LENGTH}" \
     skip.rollout_tq.enable=True \
     skip.rollout_tq.dump_dir="${SKIP_DUMP_DIR}" \
-    skip.rollout_tq.steps='[1]' \
+    skip.rollout_tq.steps="${SKIP_STEPS}" \
     skip.rollout_tq.action=cache \
     trainer.balance_batch=True \
     trainer.logger='["console"]' \
@@ -137,7 +148,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
     trainer.total_epochs=1 \
-    trainer.total_training_steps=1 \
+    trainer.total_training_steps="${TOTAL_TRAINING_STEPS}" \
     trainer.resume_mode=disable \
     trainer.default_local_dir="${OUTPUT_DIR}" \
     ray_kwargs.ray_init.runtime_env.py_executable=null \

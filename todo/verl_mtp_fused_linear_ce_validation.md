@@ -1,9 +1,14 @@
 # verl MTP 主头 Fused Linear CE：实施与验证记录
 
-Last updated: 09/19/2026
+Last updated: 09/20/2026
 
 > 过程文档：随当前特性分支暂存于 `todo/`，最终 ready 后可移除。
-> 当前状态：实现完成，CPU 回归、H20 单卡/TP2 定向 GPU 验证，以及 Qwen3.5-35B-A3B + DAPO 数据的 8 卡 Megatron GRPO 单步对照均已通过。目标 PyTorch 2.11、PP/CP/Dynamic CP 和多步训练仍待验收。
+> 当前状态：实现完成，CPU 回归、H20 单卡/TP2 定向 GPU 验证，以及 Qwen3.5-35B-A3B + DAPO 数据的 8 卡单步与 2K/4K 十步回放均已完成。后者未观察到训练加速或全程显存峰值下降。目标 PyTorch 2.11、PP/CP/Dynamic CP、非零 GRPO 梯度和多步收敛仍待验收。
+
+新增 2048 prompt / 4096 response、10 步吞吐对照的配置、过程及结果单独记录在
+[2K/4K 十步验证](verl_mtp_linear_ce_2k4k_10step.md)，下方短序列历史数字保持不变。
+长序列独立 rank-0 profile 显示训练区间约省 0.52 GiB、old-logprob 区间约省
+0.96 GiB，局部收益存在但被初始化峰值遮住；不能表述成“完全没有显存节省”。
 
 ## 1. 实施范围与决策
 
@@ -12,7 +17,7 @@ Last updated: 09/19/2026
 - 方案：[更新后的实施方案及历史草案](verl_mtp_fused_linear_cross_entropy.md)。
 - 仅让主头已有 fused Linear CE 与 MTP 共存，复用 `use_fused_kernels`；未增加配置开关或 Triton kernel。
 - 保留原生 MCore 与 legacy 辅助 CE 的梯度、mask、loss scaling 和日志语义；不实现辅助 CE 融合，不强制 detach 输出权重。
-- 优先验证低侵入的主头兼容收益，再决定是否推进辅助头优化。8 卡真实模型 smoke 的稳态 actor update 快 0.93%，整步快 3.18%；未观察到有意义的全局显存峰值降低。因此保留本次主头兼容改造，但不继续投入辅助头 fused CE。
+- 优先验证低侵入的主头兼容收益，再决定是否推进辅助头优化。短序列单步 smoke 的小幅改善不能视为稳定加速；2K/4K 十步回放中，去掉首步后 fused actor update 耗时高 2.06%、整步吞吐低 1.86%，两组耗时范围重叠，未观察到训练加速或全局峰值降低。保留可回退的主头兼容改造，但当前证据不支持为性能收益默认开启或继续投入辅助头 fused CE。
 
 ## 2. 实施经过与代码落点
 
@@ -221,7 +226,7 @@ pytest -q tests/models/test_model_forward_fused.py \
   tests/workers/test_megatron_mtp_fused_gate.py
 ```
 
-H20 已在 PyTorch 2.13 + MCore 0.20 上运行上述四个文件和真实模型 Megatron Engine 单步对照；仓库目标 PyTorch 2.11.0 + 对应 MCore/TE 的同组测试仍待执行。单步对照也不能代替多步收敛、实际长序列峰值或完整并行矩阵的生产验收。
+H20 已在 PyTorch 2.13 + MCore 0.20 上运行上述四个文件和真实模型 Megatron Engine 单步对照，并增加了 2K/4K 十步回放与独立 rank-0 显存快照；仓库目标 PyTorch 2.11.0 + 对应 MCore/TE 的同组测试仍待执行。这些结果不能代替多步收敛、完整 6144-token 最坏形状或完整并行矩阵的生产验收。
 
 ### 目标 GPU 对照与最终 ready 标准
 
@@ -230,7 +235,7 @@ H20 已在 PyTorch 2.13 + MCore 0.20 上运行上述四个文件和真实模型 
 - 记录主 log-probability/entropy、各层 MTP loss、各参数梯度和 optimizer step 后参数差异。预先给定与 dtype 相适应的绝对/相对容差，不只比较 loss 或 grad norm。
 - 特别检查真实 MCore DDP 下主头/辅助头混合梯度，及 pipeline/tied weight 的同步结果。
 - 预热后同步 CUDA，重置峰值计数并测量相同区间；记录 allocated/reserved 峰值、step time、tokens/s、通信及输出头相关分配。保存模型、依赖版本、硬件、序列长度、batch 和并行配置。
-- 主头不再物化完整 logits，但辅助头仍会物化；现有 split-N backward 也保留局部 dLogits buffer。不能按 `(1+K)` 直接估算实际节省，更不能据此宣称加速。当前未截断 trace 已给出辅助路径 max-live 0.582344 GiB 的 shape-specific 上界，但它不能外推到长序列。
+- 主头不再物化完整 logits，但辅助头仍会物化；现有 split-N backward 也保留局部 dLogits buffer。不能按 `(1+K)` 直接估算实际节省，更不能据此宣称加速。未截断 trace 中，辅助路径关联 max-live 从短序列的 0.582344 GiB 增至本次 4K response 的 5.072664 GiB；这些数值依赖具体 shape，不能视为均可通过辅助融合消除的空间。
 - 完成上述数值、梯度和并行矩阵验证并经人工 review 后，才能判定生产 ready。当前实测不支持为“进一步降全局峰值”立即实现 MTP auxiliary fused CE；保留关闭开关的部署选择，若长序列生产 profile 确认 auxiliary logits 是峰值主因，再重新评审辅助头优化。
 
 ## 7. 发现但未纳入本次修改的问题

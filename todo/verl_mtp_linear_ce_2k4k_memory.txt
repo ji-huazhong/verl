@@ -1,0 +1,68 @@
+H20 Qwen3.5-35B-A3B, prompt cap 2048 / response cap 4096.
+Independent step-1 profiling; not used for throughput statistics.
+Analyzer: todo/analyze_torch_memory_snapshot.py
+Options: --max-entries 1000000 --top 6 --match multi_token_prediction.py --match linear_cross_entropy.py --phase-stack-match ::train_batch --phase-stack-match ::infer_batch
+
+[unfused-2k4k] /workspace/mtp-linear-ce-2k4k-unfused-profile-v2-snapshot/step1/torch_memory_rank0_pid1062874.pickle
+events=448035 span=240.209s actions={'segment_alloc': 1000, 'alloc': 148851, 'free_requested': 148567, 'free_completed': 148567, 'segment_free': 993, 'segment_map': 57} trace_cap_reached=no
+retained_window_allocated_gib: min=0.000000 max=39.022610 end=32.392360; end_reserved_gib=41.296875; max_state_before_event=16831
+peak_live_allocations=2711 unknown_pre_trace_gib=0.000000
+top_6_peak_allocation_sites:
+   20.889640 GiB       2 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/distributed/param_and_grad_buffer.py:1236::__init__
+   10.445312 GiB       2 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/distributed/param_and_grad_buffer.py:1230::__init__
+    7.687500 GiB    2624 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/extensions/transformer_engine.py:2606::__init__
+    0.000078 GiB      41 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/transformer/moe/token_dispatcher.py:438::__init__
+    0.000078 GiB      41 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/transformer/moe/token_dispatcher.py:442::__init__
+    0.000000 GiB       1 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/rope.py:131::__init__
+top_6_individual_peak_allocations:
+   15.375000 GiB  addr=140343894867968 origin=snapshot-end  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/distributed/param_and_grad_buffer.py:1236::__init__
+    7.687500 GiB  addr=140360403648512 origin=snapshot-end  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/distributed/param_and_grad_buffer.py:1230::__init__
+    5.514640 GiB  addr=140368658038784 origin=snapshot-end  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/distributed/param_and_grad_buffer.py:1236::__init__
+    2.757812 GiB  addr=140374597173248 origin=snapshot-end  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/distributed/param_and_grad_buffer.py:1230::__init__
+    0.003906 GiB  addr=140392624291840 origin=trace-alloc-4311  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/extensions/transformer_engine.py:2606::__init__
+    0.003906 GiB  addr=140392628486144 origin=trace-alloc-4312  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/extensions/transformer_engine.py:2606::__init__
+phase_stack_match='::train_batch': enclosing_event_interval=[293573,448034] max_allocated_gib=38.827215 (includes gaps between matching calls; retained trace only)
+phase_stack_match='::infer_batch': enclosing_event_interval=[247194,293572] max_allocated_gib=37.867579 (includes gaps between matching calls; retained trace only)
+match='multi_token_prediction.py': alloc_events=1962 churn_gib=52.684192 largest_alloc_gib=2.006464 max_live_gib=5.072664 global_allocated_at_matched_event_max_gib=39.022117
+   15.794671 GiB churn    2.006464 GiB largest      16 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/tensor_parallel/cross_entropy.py:27::calculate_logits_max
+   15.794544 GiB churn    2.006464 GiB largest       8 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/tensor_parallel/cross_entropy.py:62::calculate_predicted_logits
+    7.897272 GiB churn    1.003232 GiB largest       8 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/tensor_parallel/layers.py:524::_linear_forward
+    2.007838 GiB churn    0.110935 GiB largest      36 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/tensor_parallel/mappings.py:448::forward
+    1.837584 GiB churn    0.110935 GiB largest      24 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/extensions/transformer_engine.py:2809::forward
+    1.318926 GiB churn    0.033096 GiB largest      96 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/extensions/transformer_engine.py:1397::forward
+match='linear_cross_entropy.py': alloc_events=0 churn_gib=0.000000 largest_alloc_gib=0.000000 max_live_gib=0.000000 global_allocated_at_matched_event_max_gib=0.000000
+
+[fused-2k4k] /workspace/mtp-linear-ce-2k4k-fused-profile-v1-snapshot/step1/torch_memory_rank0_pid1092909.pickle
+events=447042 span=238.510s actions={'segment_alloc': 1000, 'alloc': 148520, 'free_requested': 148236, 'free_completed': 148236, 'segment_free': 993, 'segment_map': 57} trace_cap_reached=no
+retained_window_allocated_gib: min=0.000000 max=39.022610 end=32.392360; end_reserved_gib=40.398438; max_state_before_event=16831
+peak_live_allocations=2711 unknown_pre_trace_gib=0.000000
+top_6_peak_allocation_sites:
+   20.889640 GiB       2 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/distributed/param_and_grad_buffer.py:1236::__init__
+   10.445312 GiB       2 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/distributed/param_and_grad_buffer.py:1230::__init__
+    7.687500 GiB    2624 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/extensions/transformer_engine.py:2606::__init__
+    0.000078 GiB      41 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/transformer/moe/token_dispatcher.py:438::__init__
+    0.000078 GiB      41 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/transformer/moe/token_dispatcher.py:442::__init__
+    0.000000 GiB       1 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/src/megatron/bridge/models/qwen_vl/modelling_qwen3_vl/rope.py:131::__init__
+top_6_individual_peak_allocations:
+   15.375000 GiB  addr=140342519136256 origin=snapshot-end  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/distributed/param_and_grad_buffer.py:1236::__init__
+    7.687500 GiB  addr=140359027916800 origin=snapshot-end  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/distributed/param_and_grad_buffer.py:1230::__init__
+    5.514640 GiB  addr=140367282307072 origin=snapshot-end  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/distributed/param_and_grad_buffer.py:1236::__init__
+    2.757812 GiB  addr=140373221441536 origin=snapshot-end  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/distributed/param_and_grad_buffer.py:1230::__init__
+    0.003906 GiB  addr=140391248560128 origin=trace-alloc-4311  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/extensions/transformer_engine.py:2606::__init__
+    0.003906 GiB  addr=140391252754432 origin=trace-alloc-4312  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/extensions/transformer_engine.py:2606::__init__
+phase_stack_match='::train_batch': enclosing_event_interval=[292882,447041] max_allocated_gib=38.305870 (includes gaps between matching calls; retained trace only)
+phase_stack_match='::infer_batch': enclosing_event_interval=[247194,292881] max_allocated_gib=36.906889 (includes gaps between matching calls; retained trace only)
+match='multi_token_prediction.py': alloc_events=1962 churn_gib=52.684192 largest_alloc_gib=2.006464 max_live_gib=5.072664 global_allocated_at_matched_event_max_gib=39.022117
+   15.794671 GiB churn    2.006464 GiB largest      16 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/tensor_parallel/cross_entropy.py:27::calculate_logits_max
+   15.794544 GiB churn    2.006464 GiB largest       8 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/tensor_parallel/cross_entropy.py:62::calculate_predicted_logits
+    7.897272 GiB churn    1.003232 GiB largest       8 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/tensor_parallel/layers.py:524::_linear_forward
+    2.007838 GiB churn    0.110935 GiB largest      36 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/tensor_parallel/mappings.py:448::forward
+    1.837584 GiB churn    0.110935 GiB largest      24 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/extensions/transformer_engine.py:2809::forward
+    1.318926 GiB churn    0.033096 GiB largest      96 allocs  /workspace/Megatron-Bridge-qwen3.8-flash-next/3rdparty/Megatron-LM/megatron/core/extensions/transformer_engine.py:1397::forward
+match='linear_cross_entropy.py': alloc_events=197 churn_gib=3.246913 largest_alloc_gib=0.473633 max_live_gib=0.614821 global_allocated_at_matched_event_max_gib=35.414455
+    1.894531 GiB churn    0.473633 GiB largest       4 allocs  /workspace/verl-mtp-fused-linear-ce-current/verl/utils/kernel/kernels.py:1564::efficient_entropy_backward
+    0.846718 GiB churn    0.016548 GiB largest      52 allocs  /workspace/verl-mtp-fused-linear-ce-current/verl/utils/kernel/kernels.py:1716::efficient_entropy_backward
+    0.302254 GiB churn    0.076794 GiB largest       4 allocs  /workspace/verl-mtp-fused-linear-ce-current/verl/utils/kernel/kernels.py:1667::efficient_entropy_backward
+    0.065132 GiB churn    0.016548 GiB largest       4 allocs  /workspace/verl-mtp-fused-linear-ce-current/verl/utils/kernel/kernels.py:1563::efficient_entropy_backward
+    0.031250 GiB churn    0.031250 GiB largest       1 allocs  /workspace/verl-mtp-fused-linear-ce-current/verl/utils/kernel/kernels.py:1712::efficient_entropy_backward
+    0.019336 GiB churn    0.004913 GiB largest       4 allocs  /workspace/verl-mtp-fused-linear-ce-current/verl/utils/kernel/kernels.py:1709::efficient_entropy_backward

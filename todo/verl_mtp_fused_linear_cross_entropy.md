@@ -1,9 +1,10 @@
 # verl Megatron MTP 支持 Fused Linear Cross Entropy 落地方案
 
-Last updated: 09/19/2026
+Last updated: 09/20/2026
 
 > 过程文档：随 `hz/feat/mtp-fused-linear-ce` 分支暂存于 `todo/`，最终 ready 后可移除。
 > 最新验证命令、结果和未完成项见 [验证与实施记录](verl_mtp_fused_linear_ce_validation.md)。
+> 2048 prompt / 4096 response、10 步吞吐对照见 [长序列验证](verl_mtp_linear_ce_2k4k_10step.md)。
 
 ## 2026-09-04 范围调整：先落地主头兼容
 
@@ -18,6 +19,8 @@ Last updated: 09/19/2026
 - 首版支持 GPTModel 及能向内部 GPTModel `language_model` 透传关键字参数的 wrapper、原生 output-processor hook、THD/remove-padding；TP>1 要求 SP。旧版 forward、无 GPTModel language-model contract 的 wrapper、value model、MuP、FP8 output、deferred output wgrad 和 output bias 回退。
 - 已在 8 × H20 上完成 Qwen3.5-35B-A3B + DAPO 数据的 TP2/EP8 GRPO 固定 rollout-cache 单步对照。Triton cache 命中后，fused actor update 快 0.93%、整步快 3.18%；PyTorch actor 峰值完全相同，2 秒外部采样仅低 206 MiB（0.24%），未观察到有意义的全局显存收益。
 - 随后用未截断的 CUDA allocator trace（unfused 444,913 events、fused 443,928 events）完成峰值归因：两组全程 allocated 峰值均为 39.022610 GiB，发生在模型初始化，由 31.334952 GiB Megatron param/grad buffers 和 7.687500 GiB Transformer Engine 初始化分配构成，不在主 CE 或 MTP auxiliary CE 区间。辅助 MTP 路径两组完全相同；与该路径关联的同时存活分配峰值为 0.582344 GiB，单个 logits 和 CE 中间分配最大分别为 0.115170/0.230341 GiB。这说明不是“算子没有节省”，而是当前 shape 下 CE 临时分配没有决定全局 watermark。
+- 2026-09-20 扩展到 2048 prompt / 4096 response、各 10 步固定数据回放：去掉首步后 fused actor update 12.646 s 对比 12.391 s，回放吞吐 385.613 对比 392.902 tokens/s/GPU；两组全程 allocated/reserved 峰值仍为 39.022610/52.048828 GiB。没有观察到训练加速，约 2% 差异不足以单独判定 kernel 稳定退化。全部响应跑满 4096，advantage 全 0，不能作为完整精度验收。
+- 独立长序列 rank-0 单步快照显示局部显存收益：训练区间 38.827215 → 38.305870 GiB，old-logprob 区间 37.867579 → 36.906889 GiB；初始化仍决定全程峰值。MTP 路径关联 max-live 增至 5.072664 GiB，两组相同。实际 prompt 最大仅 303，不能将此结论推广到完整 2048+4096 最坏形状或更大 micro-batch。
 
 **对原方案的关键修正：不能默认把所有 MTP auxiliary weight detach。** 本地 legacy 路径会 detach，但 MCore 0.18 原生路径不保证这一行为，更新的上游还可能由 `mtp_detach_heads` 控制。未来如增加辅助 Linear CE，必须尊重原有梯度需求，只有权重原本不求梯度时才能走 dHidden-only。
 
@@ -43,7 +46,7 @@ actor_rollout_ref:
 
 ### 是否值得继续落地
 
-当前阶段值得保留这个可回退的主头兼容性改造：它恢复 MTP 开启时原本被关闭的 Linear CE 路径，不改辅助 CE 语义，且 8 卡稳态 smoke 无吞吐回退。但当前短序列实测没有显著降低全局峰值，不应将它宣称为已证明的显存优化。
+当前阶段可保留这个可回退的主头兼容性改造：它恢复 MTP 开启时原本被关闭的 Linear CE 路径，不改辅助 CE 语义，并在长序列单步 profile 中减少了训练区间约 0.52 GiB、推理区间约 0.96 GiB。但短序列 smoke 的微小速度改善未在 2K/4K 十步测试中表现为加速，且两类配置都没有降低全程峰值；不能把它作为本配置下的必开性能优化，也不应宣称已降低完整运行的峰值。
 
 当前不建议进一步实现辅助 Linear CE。未截断 trace 显示当前 512+256、micro-batch=1 配置的全程峰值由初始化 buffer 决定；即使把与辅助 MTP 路径关联的 0.582344 GiB 同时存活分配全部消除（实际不可能全部消除），也不会降低 39.022610 GiB 的全程 watermark。辅助头融合还需处理版本间不同的 output-weight 梯度语义。只有长序列/更大 micro-batch 的生产 profile 证明 auxiliary logits 令训练阶段超过初始化 watermark，且收益足以覆盖额外兼容成本时，才重新评审下一阶段。最终 ready 标准和具体待验证矩阵见验证记录。
 
