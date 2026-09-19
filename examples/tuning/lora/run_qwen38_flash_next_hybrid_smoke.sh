@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Real 48-layer checkpoint: TP2/PP2/EP2/CP2/VPP2 -> TP8/EP8/DP1 vLLM.
 # This is a short integration/resume gate, not an accuracy benchmark.
-# Use the validated dependencies/private Bridge overlay documented by the model plugin.
+# Requires the validated qwen3.8-flash-next Megatron-Bridge branch and TE runtime.
 set -euo pipefail
 
 : "${MODEL_PATH:?Set the complete Qwen3.8-Flash-Next checkpoint}"
@@ -20,11 +20,20 @@ import shutil
 from pathlib import Path
 
 import torch
+from megatron.bridge import AutoBridge
+
+import megatron.bridge.models.qwen38_next  # Register the external Bridge implementation.
 
 config = json.loads((Path(os.environ["MODEL_PATH"]) / "config.json").read_text())
 assert config["model_type"] == "qwen4_exp"
 assert config["text_config"]["num_hidden_layers"] == 48, "Never substitute a reduced fixture"
 assert config["text_config"]["hidden_size"] >= 1024
+provider = AutoBridge.from_hf_pretrained(os.environ["MODEL_PATH"], trust_remote_code=False).to_megatron_provider(
+    load_weights=False
+)
+assert type(provider).__module__ == "megatron.bridge.models.qwen38_next.qwen38_next_provider", (
+    "A legacy model plugin shadowed the independently validated Bridge provider"
+)
 index = json.loads((Path(os.environ["MODEL_PATH"]) / "model.safetensors.index.json").read_text())
 assert all(
     (Path(os.environ["MODEL_PATH"]) / name).is_file()

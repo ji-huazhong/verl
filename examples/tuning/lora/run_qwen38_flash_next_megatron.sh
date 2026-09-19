@@ -8,8 +8,9 @@ set -euo pipefail
 : "${VAL_FILE:?Set VAL_FILE to a verl-format validation parquet}"
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-# vLLM subprocesses and Ray workers must see the real HF config registration.
-export VERL_USE_EXTERNAL_MODULES=verl.models.mcore.qwen3_8_next.bridge
+# Use the independently validated Bridge implementation, not the historical
+# verl-local model plugin (which would register a competing provider).
+export VERL_USE_EXTERNAL_MODULES=megatron.bridge.models.qwen38_next
 
 # First target: a single node, TP8/PP1/CP1. Not yet a validated full-model run.
 python3 -m verl.trainer.main_ppo \
@@ -22,7 +23,7 @@ python3 -m verl.trainer.main_ppo \
     data.max_response_length=512 \
     data.truncation=error \
     actor_rollout_ref.model.path="$MODEL_PATH" \
-    actor_rollout_ref.model.external_lib=verl.models.mcore.qwen3_8_next.bridge \
+    actor_rollout_ref.model.external_lib=megatron.bridge.models.qwen38_next \
     actor_rollout_ref.model.lora.rank=16 \
     actor_rollout_ref.model.lora.alpha=32 \
     actor_rollout_ref.model.lora.merge=False \

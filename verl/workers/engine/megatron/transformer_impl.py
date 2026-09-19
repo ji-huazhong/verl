@@ -560,7 +560,7 @@ class MegatronEngine(BaseEngine):
             bf16=self.param_dtype == torch.bfloat16,
         )
         optimizer = get_megatron_optimizer(model=self.module, config=optim_config_megatron)
-        register_megatron_training_hooks(self.module, optimizer)
+        register_megatron_training_hooks(self.module, optimizer, bridge_peft=self.peft_cls is not None)
         return optimizer
 
     def _build_lr_scheduler(self):
