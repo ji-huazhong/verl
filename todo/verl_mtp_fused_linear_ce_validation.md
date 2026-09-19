@@ -162,6 +162,43 @@ fused 首次的 actor update 包含 Triton 首次编译，因此比 unfused 慢 
 
 显存方面，PyTorch actor 峰值完全相同，2 秒外部采样仅差 206 MiB，且 fused 首次采样明显漏掉短暂峰值。本 smoke 只融合主头，MTP auxiliary logits 仍物化；在当前 512+256 短序列、recompute 和 CPU optimizer offload 组合下，主头 logits 不是全局峰值的决定项。因此结论是“未观察到有意义的全局显存降低”，不将 206 MiB 解读为可稳定复现的算子净收益。上述合成 shape 的算子级显存收益仍成立，但不能直接外推到本完整训练峰值。
 
+### CUDA allocator 快照归因
+
+为回答“完全没有显存降低，还是收益被其他峰值遮住”，又在相同 8 卡、相同 rollout cache、相同 batch 上分别运行 `torch_memory` profiler。初始 200,000-entry trace 命中环形上限，只保留最后约 57 秒权重同步，不能用于训练峰值结论；随后将上限提高到 1,000,000，得到未截断结果：
+
+| 指标 | Unfused | Fused | 差异 |
+|---|---:|---:|---:|
+| allocator events | 444,913 | 443,928 | -985 |
+| trace 时间跨度 | 224.247 s | 226.872 s | profiling 开销，不用于吞吐比较 |
+| 全程 max allocated | 39.022610 GiB | 39.022610 GiB | 0 |
+| 快照结束 allocated | 32.126325 GiB | 32.126325 GiB | 0 |
+| 快照结束 reserved | 34.457031 GiB | 34.281250 GiB | -0.175781 GiB |
+| MTP 路径关联的 max live | 0.582344 GiB | 0.582344 GiB | 0 |
+| MTP output-linear 最大单次分配 | 0.115170 GiB | 0.115170 GiB | 0 |
+| MTP CE 最大单次中间分配 | 0.230341 GiB | 0.230341 GiB | 0 |
+
+全程 39.022610 GiB 峰值发生在训练 step 之前的模型初始化，峰值存活对象由以下三组构成：
+
+- Megatron param/grad buffer：20.889640 GiB；
+- Megatron param/grad buffer：10.445312 GiB；
+- Transformer Engine 初始化分配：7.687500 GiB（2624 个 4 MiB 级对象）。
+
+三项合计 39.022452 GiB，余量为小对象。主 CE 和 MTP auxiliary CE 均不在该全程峰值栈上。MTP 关联分配的 0.582344 GiB 是包含辅助 logits、CE 中间张量和同栈其他临时对象的同时存活上界，不是辅助融合可全部回收的承诺值；其中 BF16 TP-local output-linear 单次最大约 117.9 MiB，CE FP32 中间单次最大约 235.9 MiB。fused 组该组数据与 unfused 完全一致，符合“本分支只融合主头，辅助 CE 保持原语义”的实现。
+
+因此准确结论是：算子级显存确有下降，外部采样和快照结束 reserved 也出现约 180--206 MiB 的小幅差异，但当前短序列完整训练的 **allocated/reserved 全程峰值没有下降**。进一步实现 MTP auxiliary fused CE 在当前配置下无法降低 39.022610 GiB watermark；只有更长序列或更大 micro-batch 令训练阶段临时分配超过初始化峰值时，才有明确落地必要性。
+
+快照分析使用分支内 `todo/analyze_torch_memory_snapshot.py`。它从可信 pickle 的快照末态反向回放 allocator ring，避免 trace 截断时错误地把首事件当作零基线；本次最终 trace 未达到 1,000,000 条上限，反向回放回到 0 bytes，且恢复出的 39.022610 GiB 与运行指标完全一致。示例命令：
+
+```bash
+python todo/analyze_torch_memory_snapshot.py \
+  --label unfused --label fused --max-entries 1000000 \
+  --match multi_token_prediction.py \
+  --match model_forward.py \
+  --match model_forward_fused.py \
+  --match linear_cross_entropy.py \
+  /path/to/unfused.pickle /path/to/fused.pickle
+```
+
 所有三次 replay 均记录 `use_fused_kernels` 的期望值，fused 无 capability fallback warning，并以退出码 0 完成 100% 的训练步。Ray 关闭期间有 DataLoader worker 被清理的 atexit 告警，发生在最终 metrics 与 100% progress 之后，未改变进程退出码或该步结果。
 
 ### 排障过程与 4 卡试跑
@@ -193,7 +230,7 @@ H20 已在 PyTorch 2.13 + MCore 0.20 上运行上述四个文件和真实模型 
 - 记录主 log-probability/entropy、各层 MTP loss、各参数梯度和 optimizer step 后参数差异。预先给定与 dtype 相适应的绝对/相对容差，不只比较 loss 或 grad norm。
 - 特别检查真实 MCore DDP 下主头/辅助头混合梯度，及 pipeline/tied weight 的同步结果。
 - 预热后同步 CUDA，重置峰值计数并测量相同区间；记录 allocated/reserved 峰值、step time、tokens/s、通信及输出头相关分配。保存模型、依赖版本、硬件、序列长度、batch 和并行配置。
-- 主头不再物化完整 logits，但辅助头仍会物化；现有 split-N backward 也保留局部 dLogits buffer。不能按 `(1+K)` 直接估算实际节省，更不能据此宣称加速。
+- 主头不再物化完整 logits，但辅助头仍会物化；现有 split-N backward 也保留局部 dLogits buffer。不能按 `(1+K)` 直接估算实际节省，更不能据此宣称加速。当前未截断 trace 已给出辅助路径 max-live 0.582344 GiB 的 shape-specific 上界，但它不能外推到长序列。
 - 完成上述数值、梯度和并行矩阵验证并经人工 review 后，才能判定生产 ready。当前实测不支持为“进一步降全局峰值”立即实现 MTP auxiliary fused CE；保留关闭开关的部署选择，若长序列生产 profile 确认 auxiliary logits 是峰值主因，再重新评审辅助头优化。
 
 ## 7. 发现但未纳入本次修改的问题
