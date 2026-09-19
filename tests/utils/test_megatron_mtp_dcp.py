@@ -101,17 +101,31 @@ def test_detached_embeddings_roll_with_dynamic_group(monkeypatch):
 
     monkeypatch.setattr(mtp_patch, "roll_tensor", fake_roll)
     monkeypatch.setattr(mtp_patch, "_ROLL_TENSOR_HAS_FILL_VALUE", True)
-    layer = SimpleNamespace(cp_group=object(), _get_embeddings_has_padding_mask=True)
-    mtp_patch._patched_get_embeddings_for_detach(
+    layer = SimpleNamespace(
+        cp_group=object(),
+        config=SimpleNamespace(sequence_parallel=False),
+        _get_embeddings_has_padding_mask=True,
+        _get_embeddings_has_mtp_input_mask=True,
+    )
+    mtp_input_mask = torch.tensor([[True, True, False, False]])
+    source_hidden = torch.ones(4, 1, 2, requires_grad=True)
+    outputs = mtp_patch._patched_get_embeddings_for_detach(
         layer,
         input_ids=torch.arange(4).reshape(1, 4),
         position_ids=torch.arange(4).reshape(1, 4),
         embedding=lambda input_ids, position_ids: torch.stack([input_ids, position_ids], dim=-1).float(),
-        hidden_states=torch.ones(4, 1, 2),
+        hidden_states=source_hidden,
         packed_seq_params=SimpleNamespace(cp_group=dynamic_group),
         padding_mask=torch.zeros(1, 4, dtype=torch.bool),
+        mtp_input_mask=mtp_input_mask,
     )
 
+    assert len(outputs) == 6
+    torch.testing.assert_close(outputs[3], mtp_input_mask)
+    assert not outputs[-2].requires_grad
+    assert outputs[-1].requires_grad
+    outputs[-1].sum().backward()
+    assert source_hidden.grad is None
     assert calls == [
         (dynamic_group, None),
         (dynamic_group, None),

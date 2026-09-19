@@ -1,6 +1,6 @@
 # verl Megatron MTP 支持 Fused Linear Cross Entropy 落地方案
 
-Last updated: 09/04/2026
+Last updated: 09/19/2026
 
 > 过程文档：随 `hz/feat/mtp-fused-linear-ce` 分支暂存于 `todo/`，最终 ready 后可移除。
 > 最新验证命令、结果和未完成项见 [验证与实施记录](verl_mtp_fused_linear_ce_validation.md)。
@@ -15,8 +15,8 @@ Last updated: 09/04/2026
 - 主头使用普通 autograd 梯度，而 MCore 辅助头可能直接累加 `main_grad`。输出权重设置 MCore 标准的 `zero_out_wgrad=True`，避免 DDP 因 `grad_added_to_main_grad=True` 跳过主头梯度；此项有跨 microbatch 的回归测试。
 - 主头 labels 放入 output-processor context，model labels 仅控制 MTP 训练，避免仅加载 MTP 就触发辅助 loss。
 - 使用共享 labels/mask 对齐函数，传递 packed position、Dynamic CP group 和 loss normalization 元数据。
-- 首版支持 text GPTModel、原生 output-processor hook、THD/remove-padding；TP>1 要求 SP。旧版 forward、vision wrapper、value model、MuP、FP8 output、deferred output wgrad 和 output bias 回退。
-- 尚未实测 GPU 峰值显存或吞吐；需用目标模型/硬件做 fused off/on 对照后，判断是否继续优化辅助 CE。
+- 首版支持 GPTModel 及能向内部 GPTModel `language_model` 透传关键字参数的 wrapper、原生 output-processor hook、THD/remove-padding；TP>1 要求 SP。旧版 forward、无 GPTModel language-model contract 的 wrapper、value model、MuP、FP8 output、deferred output wgrad 和 output bias 回退。
+- 已在 8 × H20 上完成 Qwen3.5-35B-A3B + DAPO 数据的 TP2/EP8 GRPO 固定 rollout-cache 单步对照。Triton cache 命中后，fused actor update 快 0.93%、整步快 3.18%；PyTorch actor 峰值完全相同，2 秒外部采样仅低 206 MiB（0.24%），未观察到有意义的全局显存收益。
 
 **对原方案的关键修正：不能默认把所有 MTP auxiliary weight detach。** 本地 legacy 路径会 detach，但 MCore 0.18 原生路径不保证这一行为，更新的上游还可能由 `mtp_detach_heads` 控制。未来如增加辅助 Linear CE，必须尊重原有梯度需求，只有权重原本不求梯度时才能走 dHidden-only。
 
@@ -24,7 +24,7 @@ Last updated: 09/04/2026
 
 测试中另发现原有 `preprocess_thd_engine` 的短序列边界：两条 8-token 输入、TP=2、CP=2、FP8 hybrid、zigzag 下，末尾总长度补齐会导致非 fused 路径先报张量 shape 错误。本次未修改这个独立的打包问题；对齐回归使用基线可运行的序列长度。完整 Engine 本来也拒绝 Dynamic CP 与 FP8 组合，底层 packing 测试不能视为放开该运行配置。
 
-本地验证记录（2026-09-04）：`tests/models/test_mtp_fused_main_ce_on_cpu.py` 共 44 项通过；Ruff 0.12.2 lint/format、语法编译及 `git diff --check` 通过。CPU 测试使用临时环境中的 PyTorch 2.14.0，显式 stub MCore collectives、AutoScaler 与 Triton，运行真实的 verl packing/forward/postprocess 及 PyTorch autograd。尚未运行仓库目标 PyTorch 2.11.0 + 完整 MCore 栈、真实分布式通信或 GPU 显存/吞吐测试；不能将本地结果作为这些环境的验收结论。
+最新验证记录（2026-09-19）：H20 的 MCore 0.20 / TE 2.18 环境中 66 项定向合约回归通过；native MTP + 实际 Triton 的非零梯度数值对照通过；8 卡真实模型完成 100% 的单步 GRPO。但固定 batch 的 DAPO reward 全为 -2，主 policy-gradient 为 0；仓库目标 PyTorch 2.11、PP/CP/Dynamic CP 和多步收敛仍待验收。完整数据和限制见验证记录。
 
 ### 当前实施的启用与回退
 
@@ -42,9 +42,9 @@ actor_rollout_ref:
 
 ### 是否值得继续落地
 
-当前阶段值得作为可回退的兼容性改造进行验证：MTP 原先使主头也失去已有的省 logits 显存路径，本次先恢复这部分能力，不改辅助 CE 语义。它是待目标环境验收的实现，不是已证明收益的生产优化。
+当前阶段值得保留这个可回退的主头兼容性改造：它恢复 MTP 开启时原本被关闭的 Linear CE 路径，不改辅助 CE 语义，且 8 卡稳态 smoke 无吞吐回退。但当前短序列实测没有显著降低全局峰值，不应将它宣称为已证明的显存优化。
 
-是否进一步实现辅助 Linear CE，应在同一模型、batch、序列长度和并行配置下完成 fused off/on 对照后决定。若主头融合后辅助 logits 仍是主要显存瓶颈，且预计显存收益值得额外的梯度与版本兼容成本，再评审下一阶段；否则先停在当前范围。最终 ready 标准和具体待验证矩阵见验证记录。
+当前不建议进一步实现辅助 Linear CE。现有 8 卡数据没有显示全局峰值是当前配置的主要问题，而辅助头融合还需处理版本间不同的 output-weight 梯度语义。只有长序列生产 profile 证明 auxiliary logits 是峰值主因，且收益足以覆盖额外兼容成本时，才重新评审下一阶段。最终 ready 标准和具体待验证矩阵见验证记录。
 
 ## 历史草案（辅助 CE 部分待重新评审）
 

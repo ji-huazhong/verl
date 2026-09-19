@@ -22,12 +22,40 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.module import Float16Module
 
 from verl.models.mcore import model_forward_fused as mff
+from verl.utils.megatron_utils import ALL_MODULE_WRAPPER_CLASSNAMES, register_megatron_training_hooks
 
 
 def _new_uninitialized_model(model_cls=GPTModel):
     model = object.__new__(model_cls)
     torch.nn.Module.__init__(model)
     return model
+
+
+def test_unwrap_model_registry_contains_types_only():
+    assert all(isinstance(wrapper, type) for wrapper in ALL_MODULE_WRAPPER_CLASSNAMES)
+
+
+def test_training_hook_registry_uses_concrete_wrapper_types(monkeypatch):
+    from megatron.core import distributed as mcore_distributed
+    from megatron.core import utils as mcore_utils
+
+    wrapper = _new_uninitialized_model(DistributedDataParallel)
+    wrapper.ddp_config = SimpleNamespace(overlap_grad_reduce=True, align_param_gather=False)
+    wrapper.no_sync = lambda: None
+    wrapper.start_grad_sync = lambda: None
+    config = SimpleNamespace(no_sync_func=None, grad_sync_func=None, param_sync_func=None)
+    finalize = object()
+    monkeypatch.setattr(mcore_utils, "get_model_config", lambda _model: config)
+    monkeypatch.setattr(mcore_distributed, "finalize_model_grads", finalize)
+    scale_loss = object()
+    optimizer = SimpleNamespace(scale_loss=scale_loss, config=SimpleNamespace(overlap_param_gather=False))
+
+    register_megatron_training_hooks([wrapper], optimizer)
+
+    assert config.grad_scale_func is scale_loss
+    assert config.finalize_model_grads_func is finalize
+    assert config.no_sync_func == wrapper.no_sync
+    assert config.grad_sync_func == wrapper.start_grad_sync
 
 
 def test_mcore_gpt_forward_has_native_output_processor_contract():
@@ -174,6 +202,8 @@ def test_megatron_bridge_wrapper_chain_reaches_native_hook(monkeypatch):
         mtp_num_layers=0,
         use_mup=False,
         sequence_parallel=False,
+        cuda_graph_impl=None,
+        freeze_base_model_for_mtp=False,
     )
     model.share_embeddings_and_output_weights = False
     model.mtp_process = False
@@ -234,6 +264,22 @@ def test_megatron_bridge_wrapper_chain_reaches_native_hook(monkeypatch):
     assert output.entropy.tolist() == [2.0, 2.0]
     assert seen["temperature"] == pytest.approx(0.7)
     assert seen["weight"] is model.output_layer.weight
+
+
+def test_mtp_capability_accepts_language_model_wrapper():
+    model = _new_uninitialized_model()
+    model.config = SimpleNamespace(
+        use_mup=False,
+        fp8_output=False,
+        defer_embedding_wgrad_compute=False,
+        tensor_model_parallel_size=1,
+        sequence_parallel=False,
+    )
+    model.post_process = True
+    model.output_layer = _OutputLayer()
+    wrapper = SimpleNamespace(language_model=model)
+
+    assert mff.mtp_fused_forward_unavailable_reason(wrapper) is None
 
 
 def test_output_processor_preserves_config_logger_payload(monkeypatch):

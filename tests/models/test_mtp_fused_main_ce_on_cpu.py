@@ -484,14 +484,16 @@ def test_engine_labels_mask_positions_and_main_output_contract(modules, train_mt
 
 
 @pytest.mark.parametrize(
-    "case", ["supported", "legacy", "vision", "mup", "fp8_output", "deferred", "tp_no_sp", "bias", "tp_sp"]
+    "case", ["supported", "legacy", "wrapper", "invalid", "mup", "fp8_output", "deferred", "tp_no_sp", "bias", "tp_sp"]
 )
 def test_capability_gate(modules, case):
     model = _model(modules)
     if case == "legacy":
         model.forward = lambda input_ids: input_ids
-    elif case == "vision":
+    elif case == "wrapper":
         model = SimpleNamespace(language_model=model)
+    elif case == "invalid":
+        model = SimpleNamespace()
     elif case == "mup":
         model.config.use_mup = True
     elif case == "fp8_output":
@@ -504,7 +506,7 @@ def test_capability_gate(modules, case):
     elif case == "bias":
         model.output_layer.bias = torch.nn.Parameter(torch.zeros(7))
     reason = modules.mff.mtp_fused_forward_unavailable_reason(model)
-    assert (reason is None) == (case in ("supported", "tp_sp"))
+    assert (reason is None) == (case in ("supported", "wrapper", "tp_sp"))
 
 
 def test_legacy_forward_cannot_silently_drop_mtp(modules):

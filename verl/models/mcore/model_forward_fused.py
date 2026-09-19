@@ -184,9 +184,9 @@ def patch_fused_forward(model: torch.nn.Module):
 
 def mtp_fused_forward_unavailable_reason(model: torch.nn.Module) -> str | None:
     """Fail closed for MTP combinations not covered by the native-hook integration."""
-    model = unwrap_model(model)
-    if not isinstance(model, GPTModel):
-        return "MTP fused main-head CE currently supports text GPTModel only"
+    model = _get_patching_model(model)
+    if model is None:
+        return "MTP fused main-head CE requires GPTModel or a wrapper with a GPTModel language_model"
     if not _supports_output_processor_hook(model):
         return "MTP fused main-head CE requires Megatron's native output-processor hook"
     config = model.config

@@ -311,6 +311,7 @@ def patch_mtp_layer_get_embeddings(model: torch.nn.Module):
             if hasattr(layer, "_get_embeddings_backup"):
                 continue
             layer._get_embeddings_has_padding_mask = "padding_mask" in signature(layer._get_embeddings).parameters
+            layer._get_embeddings_has_mtp_input_mask = "mtp_input_mask" in signature(layer._get_embeddings).parameters
             layer._get_embeddings_backup = layer._get_embeddings
             layer._get_embeddings = _patched_get_embeddings_for_detach.__get__(layer, layer.__class__)
             patched_count += 1
@@ -396,6 +397,8 @@ def unpatch_mtp_layer_get_embeddings(model: torch.nn.Module):
             delattr(layer, "_get_embeddings_backup")
             if hasattr(layer, "_get_embeddings_has_padding_mask"):
                 delattr(layer, "_get_embeddings_has_padding_mask")
+            if hasattr(layer, "_get_embeddings_has_mtp_input_mask"):
+                delattr(layer, "_get_embeddings_has_mtp_input_mask")
             unpatched_count += 1
 
     if unpatched_count > 0:
@@ -448,6 +451,7 @@ def _patched_get_embeddings_for_detach(
     hidden_states: torch.Tensor,
     packed_seq_params=None,
     padding_mask=None,
+    mtp_input_mask=None,
 ):
     """
     Patched version of _get_embeddings method for MultiTokenPredictionLayer.
@@ -469,13 +473,31 @@ def _patched_get_embeddings_for_detach(
     cp_group = _resolve_cp_group(self, packed_seq_params)
 
     # Calc logits for the current Multi-Token Prediction (MTP) layers.
-    input_ids, _ = roll_tensor(
-        input_ids,
-        shifts=-1,  # You can modify this shift value
-        dims=-1,
-        cp_group=cp_group,
-        packed_seq_params=packed_seq_params,
-    )
+    if mtp_input_mask is None:
+        input_ids, _ = roll_tensor(
+            input_ids,
+            shifts=-1,  # You can modify this shift value
+            dims=-1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+        )
+    else:
+        if mtp_input_mask.shape != input_ids.shape:
+            raise ValueError(
+                f"mtp_input_mask shape {mtp_input_mask.shape} must match input_ids shape {input_ids.shape}"
+            )
+        # Newer MCore versions exchange IDs and their validity bits together
+        # across CP boundaries. Preserve that contract in the detach patch.
+        token_metadata = torch.cat((input_ids, mtp_input_mask.to(dtype=input_ids.dtype)), dim=0)
+        token_metadata, _ = roll_tensor(
+            token_metadata,
+            shifts=-1,
+            dims=-1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+        )
+        input_ids, mtp_input_mask = token_metadata.chunk(2, dim=0)
+        mtp_input_mask = mtp_input_mask.to(dtype=torch.bool)
     position_ids, _ = roll_tensor(
         position_ids,
         shifts=-1,  # You can modify this shift value
@@ -497,13 +519,33 @@ def _patched_get_embeddings_for_detach(
     # embedding computation - you can modify this part
     decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
+    if mtp_input_mask is not None:
+        valid_decoder_input = mtp_input_mask.transpose(0, 1).unsqueeze(-1)
+        decoder_input = torch.where(valid_decoder_input, decoder_input, decoder_input.detach())
+
+    config = getattr(self, "config", None)
+    if getattr(config, "sequence_parallel", False) and not getattr(embedding, "scatter_to_sequence_parallel", True):
+        from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
+
+        scatter_kwargs = {}
+        if "group" in signature(scatter_to_sequence_parallel_region).parameters:
+            scatter_kwargs["group"] = getattr(self, "tp_group", None)
+        decoder_input = scatter_to_sequence_parallel_region(decoder_input, **scatter_kwargs)
+
     # Apply custom transformations if needed
     # For example: decoder_input = some_custom_function(decoder_input)
 
     # Detach token embeddings and main-decoder hidden states for detach_encoder.
     decoder_input = decoder_input.detach()
     hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=False)
+    # make_viewless_tensor is a no-op for non-view tensors in newer MCore, so
+    # detach explicitly. Re-enable gradients on the new leaf so activation
+    # checkpointing can still propagate into MTP parameters without reaching
+    # the encoder graph.
+    hidden_states = hidden_states.detach().requires_grad_(True)
 
+    if getattr(self, "_get_embeddings_has_mtp_input_mask", False):
+        return input_ids, position_ids, padding_mask, mtp_input_mask, decoder_input, hidden_states
     if getattr(self, "_get_embeddings_has_padding_mask", False):
         return input_ids, position_ids, padding_mask, decoder_input, hidden_states
     return input_ids, position_ids, decoder_input, hidden_states

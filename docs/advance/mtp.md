@@ -2,7 +2,7 @@
 
 **Author**: `https://github.com/meituan-search`
 
-Last updated: 09/04/2026
+Last updated: 09/19/2026
 
 ## 1. Scope of Support
 
@@ -55,12 +55,15 @@ actor_rollout_ref:
       enable_train: true  # false: load MTP without computing auxiliary loss
 ```
 
-The integration requires a text GPTModel with the native `output_processor`
-and `output_processor_context` forward contract (MCore 0.18 or a compatible
-build), remove-padding/THD, and sequence parallelism when TP > 1. Value models,
-vision wrappers, legacy forward replacements, output-layer bias, FP8 output
-projection, deferred output-layer weight gradients and MuP logit scaling remain
-unsupported and disable fused execution with a warning. The
+The integration requires a GPTModel, or a model wrapper whose `language_model`
+is a GPTModel and forwards keyword arguments to it, with the native
+`output_processor` and `output_processor_context` forward contract (MCore 0.18
+or a compatible build, including the MCore 0.20 MTP input-mask signature),
+remove-padding/THD, and sequence parallelism when TP >
+1. Value models, wrappers without that language-model contract, legacy forward
+replacements, output-layer bias, FP8 output projection, deferred output-layer
+weight gradients and MuP logit scaling remain unsupported and disable fused
+execution with a warning. The
 existing CUDA/Triton kernel requirements still apply. Nonuniform temperatures,
 top-K distillation and `calculate_sum_pi_squared` are not supported with fused
 execution; disable `use_fused_kernels` for these workloads.
@@ -76,6 +79,14 @@ loss, parameter gradients, peak allocated memory and step time. This first
 stage does **not** eliminate auxiliary-head logits, and memory savings do not
 imply a throughput improvement. Further auxiliary Linear CE optimization should
 be driven by these measurements, not enabled by forcing detached output weights.
+
+An 8 x H20 smoke with Qwen3.5-35B-A3B, TP2/EP8 and a fixed 16-trajectory
+GRPO batch observed matching MTP loss and gradient norm, with a steady-state
+actor update within 1% of the non-fused path. It did not observe a meaningful
+end-to-end memory-peak reduction for that short-sequence configuration because
+the auxiliary MTP logits and other allocations still determined the peak. This
+is a compatibility path, not a guarantee of lower whole-job peak memory; profile
+the target sequence length and parallel layout before production enablement.
 
 Regression commands (run in an environment with the corresponding dependencies):
 

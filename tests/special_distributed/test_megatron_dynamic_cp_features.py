@@ -137,8 +137,13 @@ def test_mtp_roll_and_backward_use_each_microbatch_cp_group():
         fill_value=True,
     )
 
-    layer = SimpleNamespace(cp_group=parallel_state.get_context_parallel_group(), _get_embeddings_has_padding_mask=True)
-    rolled_ids, _, rolled_padding, _, _ = _patched_get_embeddings_for_detach(
+    layer = SimpleNamespace(
+        cp_group=parallel_state.get_context_parallel_group(),
+        config=SimpleNamespace(sequence_parallel=False),
+        _get_embeddings_has_padding_mask=True,
+        _get_embeddings_has_mtp_input_mask=True,
+    )
+    rolled_ids, _, rolled_padding, _, _, _ = _patched_get_embeddings_for_detach(
         layer,
         input_ids=local_ids,
         position_ids=position_ids,
