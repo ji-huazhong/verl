@@ -25,6 +25,23 @@ from omegaconf import MISSING
 
 from verl.base_config import BaseConfig
 
+_ROLE_PROFILER_TOOLS = frozenset({"npu", "nsys", "torch", "torch_memory", "memray", "precision_debugger"})
+
+
+def build_role_profiler_tool_config(profiler_config: Any) -> Optional[Any]:
+    """Instantiate the selected role-level profiler tool configuration."""
+    tool = profiler_config.get("tool", None)
+    if tool not in _ROLE_PROFILER_TOOLS:
+        return None
+
+    raw_tool_config = profiler_config.get("tool_config", {}).get(tool)
+    if raw_tool_config is None:
+        return None
+
+    from verl.utils.config import omega_conf_to_dataclass
+
+    return omega_conf_to_dataclass(raw_tool_config)
+
 
 @dataclass
 class NsightToolConfig(BaseConfig):
