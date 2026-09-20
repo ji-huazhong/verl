@@ -134,9 +134,6 @@ tool_config:
     # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
     _target_: verl.utils.profiler.config.TorchMemoryToolConfig
 
-    # Recorder backend: torch or memray.
-    memory_recorder: ${oc.select:global_profiler.global_tool_config.torch_memory.memory_recorder,torch}
-
     # Maximum number of memory allocation entries to track
     trace_alloc_max_entries: ${oc.select:global_profiler.global_tool_config.torch_memory.trace_alloc_max_entries,100000}
 
@@ -147,6 +144,15 @@ tool_config:
     memory_snapshot_num_steps: ${oc.select:global_profiler.global_tool_config.torch_memory.memory_snapshot_num_steps,1}
 
     name: torch_memory
+
+  memray:
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.utils.profiler.config.MemrayToolConfig
+
+    # Number of profiled RL steps to include in one Memray trace.
+    memory_snapshot_num_steps: ${oc.select:global_profiler.global_tool_config.memray.memory_snapshot_num_steps,1}
+
+    name: memray
 
   precision_debugger:
     # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs

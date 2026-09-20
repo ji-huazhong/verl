@@ -144,19 +144,15 @@ class TorchProfilerToolConfig(BaseConfig):
 
 @dataclass
 class TorchMemoryToolConfig(BaseConfig):
-    """Memory profiler tool config for PyTorch allocator snapshots and Memray traces.
+    """Torch memory profiler tool config. CUDA/NPU OOM snapshots are enabled automatically.
 
     Args:
-        memory_recorder (str): Recorder backend. ``torch`` records CUDA/NPU allocator
-            history and automatic OOM snapshots; ``memray`` records native process
-            allocations.
         trace_alloc_max_entries (int): Maximum number of memory allocation entries to track.
         stack_depth (int): Stack trace depth for memory allocations.
         memory_snapshot_num_steps (int): Number of profiled RL steps to retain before
-            dumping the enabled recorder outputs.
+            dumping a memory snapshot.
     """
 
-    memory_recorder: str = "torch"
     trace_alloc_max_entries: int = 100_000
     stack_depth: int = 32
     memory_snapshot_num_steps: int = 1
@@ -164,10 +160,6 @@ class TorchMemoryToolConfig(BaseConfig):
 
     def __post_init__(self) -> None:
         """config validation logics go here"""
-        assert isinstance(self.memory_recorder, str), f"memory_recorder must be str, got {type(self.memory_recorder)}"
-        assert self.memory_recorder in {"torch", "memray"}, (
-            f"memory_recorder must be one of {{'torch', 'memray'}}, got {self.memory_recorder!r}"
-        )
         assert isinstance(self.trace_alloc_max_entries, int), (
             f"trace_alloc_max_entries must be int, got {type(self.trace_alloc_max_entries)}"
         )
@@ -176,6 +168,28 @@ class TorchMemoryToolConfig(BaseConfig):
             f"trace_alloc_max_entries must be positive, got {self.trace_alloc_max_entries}"
         )
         assert self.stack_depth > 0, f"stack_depth must be positive, got {self.stack_depth}"
+        assert isinstance(self.memory_snapshot_num_steps, int), (
+            f"memory_snapshot_num_steps must be int, got {type(self.memory_snapshot_num_steps)}"
+        )
+        assert self.memory_snapshot_num_steps > 0, (
+            f"memory_snapshot_num_steps must be positive, got {self.memory_snapshot_num_steps}"
+        )
+
+
+@dataclass
+class MemrayToolConfig(BaseConfig):
+    """Memray native process-allocation profiler config.
+
+    Args:
+        memory_snapshot_num_steps (int): Number of profiled RL steps to include in
+            one Memray trace.
+    """
+
+    memory_snapshot_num_steps: int = 1
+    name: str = "memray"
+
+    def __post_init__(self) -> None:
+        """Validate the Memray profile window."""
         assert isinstance(self.memory_snapshot_num_steps, int), (
             f"memory_snapshot_num_steps must be int, got {type(self.memory_snapshot_num_steps)}"
         )
