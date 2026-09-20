@@ -20,7 +20,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from verl.utils.profiler.config import MemrayToolConfig, ProfilerConfig
+from omegaconf import OmegaConf
+
+from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.profiler.config import MemrayToolConfig, ProfilerConfig, build_role_profiler_tool_config
 from verl.utils.profiler.profile import DistProfiler
 
 
@@ -164,6 +167,34 @@ class TestMemrayProfiler(unittest.TestCase):
             self.assertEqual(len(self.trackers), 2)
             recovered_path = Path(out_dir) / "step5" / self.trackers[1].output_path.name
             self.assertEqual(recovered_path.read_bytes(), b"trace-1")
+
+
+class TestMemrayWorkerConfig(unittest.TestCase):
+    def test_role_worker_config_preserves_multi_step_window(self):
+        omega_config = OmegaConf.create(
+            {
+                "_target_": "verl.utils.profiler.ProfilerConfig",
+                "tool": "memray",
+                "enable": True,
+                "all_ranks": False,
+                "ranks": [0],
+                "save_path": "/tmp/test_memray_profile",
+                "tool_config": {
+                    "memray": {
+                        "_target_": "verl.utils.profiler.config.MemrayToolConfig",
+                        "memory_snapshot_num_steps": 3,
+                    },
+                },
+            }
+        )
+
+        profiler_config = omega_conf_to_dataclass(omega_config, dataclass_type=ProfilerConfig)
+        tool_config = build_role_profiler_tool_config(omega_config)
+        profiler = DistProfiler(rank=0, config=profiler_config, tool_config=tool_config)
+
+        self.assertIsInstance(tool_config, MemrayToolConfig)
+        self.assertEqual(tool_config.memory_snapshot_num_steps, 3)
+        self.assertEqual(profiler._impl.memory_snapshot_num_steps, 3)
 
 
 @unittest.skipUnless(importlib.util.find_spec("memray"), "requires the optional memray dependency")

@@ -29,7 +29,7 @@ profiler:
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.utils.profiler.ProfilerConfig
 
-  # choices: nsys, npu, torch, torch_memory
+  # choices: nsys, npu, torch, torch_memory, memray, precision_debugger
   tool: ${oc.select:global_profiler.tool,null}
 
   # whether enable profile on Ref
