@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -80,13 +81,14 @@ class PolicyLossConfig(BaseConfig):
 
     Args:
         loss_mode (str): Registered policy loss name. Options: 'vanilla', 'dppo_tv', 'dppo_kl', 'gspo', 'sapo',
-            'gpg', 'clip_cov', 'kl_cov', 'geo_mean', 'dro', 'cispo', and 'bypass_mode'.
+            'gpg', 'clip_cov', 'kl_cov', 'geo_mean', 'dro', 'cispo', 'flash_reinforce', and 'bypass_mode'.
         clip_cov_ratio (float): Ratio of tokens to be clipped for clip-cov loss.
         clip_cov_lb (float): Lower bound for clip-cov loss.
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
         dro_beta (Optional[float]): Quadratic log-ratio penalty for DRO. Required when loss_mode is 'dro'.
+        flash_reinforce_kl_threshold (float): Mean sampled-action Bernoulli KL threshold for sequence admission.
         rollout_correction (RolloutCorrectionConfig): Configuration for rollout correction.
     """
 
@@ -97,6 +99,7 @@ class PolicyLossConfig(BaseConfig):
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
     dro_beta: Optional[float] = None
+    flash_reinforce_kl_threshold: float = 0.001
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
 
 
@@ -218,8 +221,24 @@ class ActorConfig(BaseConfig):
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
 
+        if self.policy_loss.get("loss_mode", "vanilla") == "flash_reinforce":
+            if self.loss_agg_mode != "seq-mean-token-mean":
+                raise ValueError("FlashREINFORCE requires loss_agg_mode='seq-mean-token-mean'")
+            if self.rollout_n != 1 or self.ppo_epochs != 1:
+                raise ValueError("FlashREINFORCE requires rollout.n=1 and actor.ppo_epochs=1")
+            threshold = self.policy_loss.get("flash_reinforce_kl_threshold", 0.001)
+            if not math.isfinite(threshold) or threshold < 0:
+                raise ValueError("flash_reinforce_kl_threshold must be finite and non-negative")
+
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""
+        if (
+            self.policy_loss.get("loss_mode", "vanilla") == "flash_reinforce"
+            and self.ppo_mini_batch_size != train_batch_size
+        ):
+            raise ValueError(
+                "FlashREINFORCE requires actor.ppo_mini_batch_size=data.train_batch_size for one-pass updates"
+            )
         if not self.use_dynamic_bsz:
             if train_batch_size < self.ppo_mini_batch_size:
                 raise ValueError(

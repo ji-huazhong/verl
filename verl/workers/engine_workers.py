@@ -711,6 +711,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update", scheduled=True)
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
+        if self.config.actor.policy_loss.loss_mode == "flash_reinforce":
+            global_batch_size = len(data) * self.actor.engine.get_data_parallel_size()
+            if tu.get(data, "mini_batch_size") != global_batch_size or tu.get(data, "epochs", default=1) != 1:
+                raise ValueError("FlashREINFORCE requires one full-batch optimizer step on complete trajectories")
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 

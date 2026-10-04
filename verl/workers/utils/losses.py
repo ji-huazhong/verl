@@ -83,7 +83,13 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     metrics = {}
 
     # select fields and convert to padded tensor
-    fields = ["response_mask", "old_log_probs", "advantages"]
+    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
+    # FlashREINFORCE corrects against the probability that actually generated each
+    # action. A recomputed old-policy anchor is not the behavior distribution.
+    behavior_key = "rollout_log_probs" if loss_mode == "flash_reinforce" else "old_log_probs"
+    if behavior_key not in data:
+        raise ValueError(f"{loss_mode} requires {behavior_key} in the actor batch")
+    fields = ["response_mask", behavior_key, "advantages"]
     if "rollout_is_weights" in data:
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
@@ -92,13 +98,11 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     response_mask = data["response_mask"].to(bool)
     # compute policy loss
-    old_log_prob = data["old_log_probs"]
+    old_log_prob = data[behavior_key]
     advantages = data["advantages"]
     rollout_is_weights = data.get("rollout_is_weights", None)
 
     loss_agg_mode = config.loss_agg_mode
-
-    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
     pg_loss, pg_metrics = policy_loss_fn(

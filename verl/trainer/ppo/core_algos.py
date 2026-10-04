@@ -97,6 +97,7 @@ class AdvantageEstimator(str, Enum):
     GAE = "gae"
     GRPO = "grpo"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
+    FLASH_REINFORCE = "flash_reinforce"
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
     REMAX = "remax"
     RLOO = "rloo"
@@ -688,6 +689,34 @@ def compute_opo_outcome_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
+
+
+@register_adv_est(AdvantageEstimator.FLASH_REINFORCE)
+def compute_flash_reinforce_outcome_advantage(
+    token_level_rewards: torch.Tensor, response_mask: torch.Tensor, **kwargs
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Center outcome rewards over the complete fresh batch, without grouping or whitening.
+
+    Each row is one complete trajectory. Compute this before splitting the batch
+    across workers or microbatches. Fully masked padding rows do not affect the
+    baseline. Returns contain the uncentered outcome on each policy token.
+
+    Args:
+        token_level_rewards: Per-token rewards of shape (batch_size, response_length).
+        response_mask: Policy-token mask of the same shape.
+        **kwargs: Unused arguments supplied by the advantage-estimator dispatcher.
+
+    Returns:
+        Masked batch-centered advantages and uncentered outcome returns.
+    """
+    with torch.no_grad():
+        mask = response_mask.bool()
+        valid_sequences = mask.any(dim=-1)
+        scores = token_level_rewards.float().sum(dim=-1).masked_fill(~valid_sequences, 0)
+        baseline = scores.sum() / valid_sequences.sum().clamp_min(1)
+        advantages = (scores - baseline).unsqueeze(-1) * mask
+        returns = scores.unsqueeze(-1) * mask
+    return advantages, returns
 
 
 @register_adv_est(AdvantageEstimator.REINFORCE_PLUS_PLUS)  # or simply: @register_adv_est("reinforce_plus_plus")
@@ -1455,6 +1484,77 @@ def compute_policy_loss_dppo_tv(
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
     return pg_loss, pg_metrics
+
+
+@register_policy_loss("flash_reinforce")
+def compute_policy_loss_flash_reinforce(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "seq-mean-token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Compute the FlashREINFORCE sequence-gated, sample-mean objective.
+
+    See https://yifanzhang-pro.github.io/FlashREINFORCE/FlashREINFORCE.pdf,
+    Eqs. (6)-(10) and Appendix A. The actor loss adapter supplies the actual
+    rollout log probabilities as ``old_log_prob``, never a recomputed anchor.
+    Differentiate through the FP32 ratio with log-ratio clamped to [-30, 30];
+    the baseline, behavior probabilities, and sequence gate are held fixed.
+
+    Args:
+        old_log_prob: Stored behavior log probabilities, (batch_size, response_length).
+        log_prob: Current learner log probabilities, with the same shape.
+        advantages: Batch-centered outcome advantages broadcast to policy tokens.
+        response_mask: Policy-token mask, excluding observations and padding.
+        loss_agg_mode: Must be ``seq-mean-token-mean``.
+        config: Actor configuration containing the gate threshold and global batch info.
+        rollout_is_weights: Must be None; this objective already performs token IS.
+
+    Returns:
+        The scalar policy loss and sequence rejection / divergence diagnostics.
+    """
+    if config is None:
+        raise ValueError("FlashREINFORCE requires an actor config")
+    if loss_agg_mode != "seq-mean-token-mean":
+        raise ValueError("FlashREINFORCE requires loss_agg_mode='seq-mean-token-mean'")
+    if rollout_is_weights is not None:
+        raise ValueError("FlashREINFORCE computes token IS internally; disable external rollout IS weights")
+
+    mask = response_mask.bool()
+    # Mask before arithmetic: padding / observation slots may contain arbitrary values.
+    behavior_log_prob = old_log_prob.detach().float().masked_fill(~mask, 0)
+    current_log_prob = log_prob.float().masked_fill(~mask, 0)
+    ratio = (current_log_prob - behavior_log_prob).clamp(-30.0, 30.0).exp()
+    lengths = mask.sum(dim=-1)
+    valid_sequences = lengths > 0
+
+    with torch.no_grad():
+        # Complement probabilities via expm1 retain precision near probability one.
+        # xlogy handles the p=1 boundary without evaluating 0 * log(0).
+        p = behavior_log_prob.exp()
+        p_complement = -behavior_log_prob.expm1()
+        q_complement = -current_log_prob.expm1()
+        binary_kl = p * (behavior_log_prob - current_log_prob)
+        binary_kl += torch.xlogy(p_complement, p_complement) - torch.xlogy(p_complement, q_complement)
+        binary_kl = binary_kl.clamp_min(0).masked_fill(~mask, 0)
+        sequence_kl = binary_kl.sum(dim=-1) / lengths.clamp_min(1)
+        admitted = valid_sequences & (sequence_kl <= config.policy_loss.get("flash_reinforce_kl_threshold", 0.001))
+
+    pg_losses = -advantages.detach().float().masked_fill(~mask, 0) * ratio * admitted.unsqueeze(-1)
+    # Keep the ORIGINAL response mask: gating must not renormalize B or T_i.
+    batch_info = dict(config.global_batch_info)
+    if batch_info.get("global_batch_size") is None and batch_info.get("dp_size", 1) == 1:
+        batch_info["global_batch_size"] = valid_sequences.sum().clamp_min(1)
+    pg_loss = agg_loss(pg_losses, mask, loss_agg_mode, **batch_info)
+    num_sequences = valid_sequences.sum().clamp_min(1)
+    metrics = {
+        "actor/flash_reinforce_reject_frac": ((valid_sequences & ~admitted).sum() / num_sequences).item(),
+        "actor/flash_reinforce_kl": (sequence_kl.sum() / num_sequences).item(),
+    }
+    return pg_loss, metrics
 
 
 @register_policy_loss("dppo_kl")

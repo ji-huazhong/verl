@@ -72,6 +72,7 @@ verl is fast with:
 
    algo/ppo.md
    algo/grpo.md
+   algo/flash_reinforce.md
    algo/dapo.md
    algo/spin.md
    algo/sppo.md

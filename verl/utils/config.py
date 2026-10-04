@@ -165,6 +165,21 @@ def validate_config(
     actor_config.validate(n_gpus, config.data.train_batch_size, config.actor_rollout_ref.model)
     _validate_router_replay_config(actor_config, config.algorithm.get("rollout_correction", None))
 
+    flash_advantage = config.algorithm.adv_estimator == "flash_reinforce"
+    flash_loss = actor_config.policy_loss.get("loss_mode", "vanilla") == "flash_reinforce"
+    if flash_advantage or flash_loss:
+        if not (flash_advantage and flash_loss):
+            raise ValueError("FlashREINFORCE requires both adv_estimator and policy_loss.loss_mode='flash_reinforce'")
+        if not config.actor_rollout_ref.rollout.get("calculate_log_probs", False):
+            raise ValueError("FlashREINFORCE requires rollout.calculate_log_probs=True")
+        correction = config.algorithm.get("rollout_correction", None)
+        if correction and any(correction.get(key) for key in ("rollout_is", "rollout_rs", "bypass_mode")):
+            raise ValueError(
+                "FlashREINFORCE performs its own IS and sequence gate; disable external rollout correction"
+            )
+        if use_critic or actor_config.use_kl_loss or config.algorithm.get("use_kl_in_reward", False):
+            raise ValueError("The base FlashREINFORCE method requires no critic, KL loss, or KL reward penalty")
+
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
         if use_reference_policy:
             # reference: log_prob_micro_batch_size vs. log_prob_micro_batch_size_per_gpu

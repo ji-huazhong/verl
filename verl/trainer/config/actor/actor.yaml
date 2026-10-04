@@ -79,6 +79,9 @@ policy_loss:
   # Must be set to a positive value when policy_loss.loss_mode is "dro".
   dro_beta: null
 
+  # Maximum mean sampled-action Bernoulli KL for FlashREINFORCE sequence admission.
+  flash_reinforce_kl_threshold: 0.001
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 
