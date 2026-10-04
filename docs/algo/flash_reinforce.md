@@ -1,6 +1,6 @@
 # FlashREINFORCE
 
-Last updated: 10/04/2026.
+Last updated: 10/05/2026.
 
 [FlashREINFORCE](https://yifanzhang-pro.github.io/FlashREINFORCE/FlashREINFORCE.pdf)
 is a critic-free, single-rollout algorithm. This implementation adds its base
@@ -63,6 +63,7 @@ actor_rollout_ref:
     policy_loss:
       loss_mode: flash_reinforce
       flash_reinforce_kl_threshold: 0.001
+      flash_reinforce_neg_topq: 1.0
     loss_agg_mode: seq-mean-token-mean
     ppo_mini_batch_size: ${data.train_batch_size}
     ppo_epochs: 1
@@ -86,7 +87,13 @@ with the existing policy metric pipeline; with uneven microbatches they are not
 exact global sequence means.
 
 This change does not introduce an asynchronous scheduler or experiment recipe.
-It does not implement optional negative-token filtering. Multi-turn trajectories
+For optional negative-token filtering (Appendix C), set
+`policy_loss.flash_reinforce_neg_topq` in `[0, 1)` and `actor.calculate_entropy=true`.
+For binary rewards, trajectories with outcome `R <= 0` retain exactly
+`ceil(q * T_i)` highest-entropy policy tokens (ties follow token order). Successful
+trajectories retain all tokens. This uses the uncentered `returns` from the
+estimator; the original sequence gate and normalization masks are preserved.
+Multi-turn trajectories
 with masked observations within a single row are supported; splitting one rollout
 across multiple training rows requires additional trajectory-level aggregation.
 

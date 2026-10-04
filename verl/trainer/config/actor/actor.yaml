@@ -82,6 +82,9 @@ policy_loss:
   # Maximum mean sampled-action Bernoulli KL for FlashREINFORCE sequence admission.
   flash_reinforce_kl_threshold: 0.001
 
+  # Retain this fraction of highest-entropy policy tokens on failed (R <= 0) trajectories.
+  flash_reinforce_neg_topq: 1.0
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

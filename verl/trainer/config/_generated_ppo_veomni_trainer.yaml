@@ -92,6 +92,7 @@ actor_rollout_ref:
       ppo_kl_coef: 0.1
       dro_beta: null
       flash_reinforce_kl_threshold: 0.001
+      flash_reinforce_neg_topq: 1.0
     clip_ratio_c: 3.0
     loss_agg_mode: token-mean
     loss_scale_factor: null

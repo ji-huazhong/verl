@@ -89,6 +89,7 @@ class PolicyLossConfig(BaseConfig):
         ppo_kl_coef (float): KL divergence penalty coefficient.
         dro_beta (Optional[float]): Quadratic log-ratio penalty for DRO. Required when loss_mode is 'dro'.
         flash_reinforce_kl_threshold (float): Mean sampled-action Bernoulli KL threshold for sequence admission.
+        flash_reinforce_neg_topq (float): Fraction of highest-entropy policy tokens retained on failures.
         rollout_correction (RolloutCorrectionConfig): Configuration for rollout correction.
     """
 
@@ -100,6 +101,7 @@ class PolicyLossConfig(BaseConfig):
     ppo_kl_coef: float = 0.1
     dro_beta: Optional[float] = None
     flash_reinforce_kl_threshold: float = 0.001
+    flash_reinforce_neg_topq: float = 1.0
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
 
 
@@ -229,6 +231,11 @@ class ActorConfig(BaseConfig):
             threshold = self.policy_loss.get("flash_reinforce_kl_threshold", 0.001)
             if not math.isfinite(threshold) or threshold < 0:
                 raise ValueError("flash_reinforce_kl_threshold must be finite and non-negative")
+            topq = self.policy_loss.get("flash_reinforce_neg_topq", 1.0)
+            if not 0.0 <= topq <= 1.0:
+                raise ValueError("flash_reinforce_neg_topq must be in [0, 1]")
+            if topq < 1.0 and not self.calculate_entropy:
+                raise ValueError("FlashREINFORCE negative-token filtering requires actor.calculate_entropy=True")
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

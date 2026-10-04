@@ -278,3 +278,57 @@ def test_invalid_trainer_config(trainer_config, key, value, match):
 def test_invalid_threshold(threshold):
     with pytest.raises(ValueError, match="finite and non-negative"):
         _config(threshold)
+
+
+@pytest.mark.parametrize("topq", [0.0, 0.2, 0.9, 1.0])
+def test_negative_filter_uses_outcomes_and_preserves_denominators(topq):
+    # The middle row is successful but below the batch mean: it must not be filtered.
+    mask = torch.tensor([[1, 1, 1, 0], [1, 1, 1, 1], [1, 0, 0, 0]])
+    advantages = torch.tensor([-2.0, -1.0, 3.0])[:, None] * mask
+    returns = torch.tensor([0.0, 1.0, 5.0])[:, None] * mask
+    learner = torch.full((3, 4), -1.0, requires_grad=True)
+    entropy = torch.tensor([[1.0, 3.0, 3.0, 100.0], [4.0, 3.0, 2.0, 1.0], [1.0, 0.0, 0.0, 0.0]], requires_grad=True)
+    data = TensorDict(
+        {
+            "prompts": torch.zeros(3, 1, dtype=torch.long),
+            "responses": torch.zeros(3, 4, dtype=torch.long),
+            "attention_mask": torch.ones(3, 5, dtype=torch.long),
+            "response_mask": mask,
+            "rollout_log_probs": learner.detach(),
+            "advantages": advantages,
+            "returns": returns,
+        },
+        batch_size=[3],
+    )
+    tu.assign_non_tensor(data, dp_size=1, global_batch_size=3, batch_num_tokens=8)
+    config = ActorConfig(
+        strategy="fsdp2",
+        rollout_n=1,
+        use_dynamic_bsz=True,
+        loss_agg_mode="seq-mean-token-mean",
+        calculate_entropy=True,
+        policy_loss=PolicyLossConfig(loss_mode="flash_reinforce", flash_reinforce_neg_topq=topq),
+    )
+    pack = lambda x: torch.cat([torch.cat([row, row.new_zeros(1)]) for row in x])
+    loss, _ = ppo_loss(config, {"log_probs": pack(learner), "entropy": pack(entropy)}, data)
+    loss.backward()
+    expected = -advantages / mask.sum(-1, keepdim=True) / 3
+    n = int(torch.ceil(torch.tensor(topq * 3)))
+    keep = torch.zeros(4, dtype=torch.bool)
+    keep[torch.tensor([1, 2, 0])[:n]] = True
+    expected[0] *= keep
+    torch.testing.assert_close(learner.grad, expected)
+    torch.testing.assert_close(entropy.grad, torch.zeros_like(entropy))
+
+
+@pytest.mark.parametrize("topq", [-0.1, 1.1, float("nan")])
+def test_invalid_negative_filter(topq):
+    with pytest.raises(ValueError, match="must be in"):
+        ActorConfig(
+            strategy="fsdp2",
+            rollout_n=1,
+            use_dynamic_bsz=True,
+            loss_agg_mode="seq-mean-token-mean",
+            calculate_entropy=True,
+            policy_loss=PolicyLossConfig(loss_mode="flash_reinforce", flash_reinforce_neg_topq=topq),
+        )

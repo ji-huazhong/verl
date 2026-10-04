@@ -90,6 +90,10 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     if behavior_key not in data:
         raise ValueError(f"{loss_mode} requires {behavior_key} in the actor batch")
     fields = ["response_mask", behavior_key, "advantages"]
+    negative_topq = config.policy_loss.get("flash_reinforce_neg_topq", 1.0)
+    filter_negative = loss_mode == "flash_reinforce" and negative_topq < 1.0
+    if filter_negative:
+        fields.append("returns")
     if "rollout_is_weights" in data:
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
@@ -101,6 +105,23 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     old_log_prob = data[behavior_key]
     advantages = data["advantages"]
     rollout_is_weights = data.get("rollout_is_weights", None)
+
+    if filter_negative:
+        if entropy is None:
+            raise ValueError("FlashREINFORCE negative-token filtering requires learner entropy")
+        # Appendix C: failures are R <= 0, not A < 0. Keep exactly ceil(q * T_i)
+        # policy tokens, resolving entropy ties by token order. Preserve the mask
+        # used by the sequence gate and agg_loss, including its original T_i.
+        with torch.no_grad():
+            failed = data["returns"].masked_fill(~response_mask, 0).sum(dim=-1) <= 0
+            order = (
+                entropy.float().masked_fill(~response_mask, -torch.inf).argsort(dim=-1, descending=True, stable=True)
+            )
+            count = (negative_topq * response_mask.sum(dim=-1)).ceil().long()
+            positions = torch.arange(response_mask.shape[-1], device=response_mask.device)
+            keep = torch.zeros_like(response_mask).scatter(1, order, positions.unsqueeze(0) < count.unsqueeze(-1))
+            keep = keep | ~failed.unsqueeze(-1)
+        advantages = advantages * keep
 
     loss_agg_mode = config.loss_agg_mode
 
