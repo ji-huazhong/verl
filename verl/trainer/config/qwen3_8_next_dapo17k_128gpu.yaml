@@ -1,0 +1,35 @@
+# DAPO-Math-17k on 16 x 8 H100/L20Z; retain the 128 x 8, 2K/8K objective.
+# Dense DP = 128 / (TP4 * PP2) = 16; expert DP = 128 / (EP8 * ETP1 * PP2) = 8.
+# Keep full recomputation and CPU parameter/optimizer offload from the base.
+defaults:
+  - qwen3_8_next_dapo17k
+  - _self_
+
+actor_rollout_ref:
+  actor:
+    megatron:
+      tensor_model_parallel_size: 4
+      pipeline_model_parallel_size: 2
+      context_parallel_size: 1
+      expert_model_parallel_size: 8
+      expert_tensor_parallel_size: 1
+  ref:
+    megatron:
+      tensor_model_parallel_size: 4
+      pipeline_model_parallel_size: 2
+      context_parallel_size: 1
+      expert_model_parallel_size: 8
+      expert_tensor_parallel_size: 1
+  rollout:
+    # Sixteen independent replicas, each confined to one eight-GPU node.
+    # Preserve the validated vLLM TP kernels and avoid adding cross-node EP.
+    tensor_model_parallel_size: 8
+    pipeline_model_parallel_size: 1
+    data_parallel_size: 1
+    expert_parallel_size: 1
+
+trainer:
+  nnodes: 16
+  n_gpus_per_node: 8
+  experiment_name: grpo_dapo17k_128gpu_tp4_pp2_ep8_128x8_8k_100steps
+  default_local_dir: ${oc.env:QWEN38_OUTPUT_DIR,outputs/qwen3_8_next_dapo17k_128gpu_frozen_ple}

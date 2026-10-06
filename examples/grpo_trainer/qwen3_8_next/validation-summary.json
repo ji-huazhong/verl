@@ -1,0 +1,73 @@
+{
+  "recorded_on": "2026-10-06",
+  "completed_steps": 100,
+  "contiguous": true,
+  "training_head_exit_code": 0,
+  "platform_status": "failed",
+  "platform_failure": "Post-training worker log I/O and shutdown failures",
+  "final_checkpoint_saved_in_logs": true,
+  "final_checkpoint_independently_restored": false,
+  "strict_fixed_token_gate_passed": false,
+  "metrics": {
+    "critic/score/mean": {
+      "first": 0.091796875,
+      "last": 0.728515625,
+      "last10": 0.7849609375,
+      "minimum": 0.080078125,
+      "maximum": 0.8515625
+    },
+    "training/train_rollout_logprob_abs_diff": {
+      "first": 0.010753541253507137,
+      "last": 0.00865684449672699,
+      "last10": 0.008385555539280175,
+      "minimum": 0.0072870319709181786,
+      "maximum": 0.010917793959379196
+    },
+    "actor/kl_loss": {
+      "first": 0.0014965198779464117,
+      "last": 0.036930817859683884,
+      "last10": 0.0336443737764057,
+      "minimum": 0.001380512089781405,
+      "maximum": 0.036930817859683884
+    },
+    "actor/entropy": {
+      "first": 1.0280364751815796,
+      "last": 0.7252687811851501,
+      "last10": 0.7102361738681793,
+      "minimum": 0.6075003743171692,
+      "maximum": 1.0280364751815796
+    },
+    "actor/grad_norm": {
+      "first": 0.058112003856491005,
+      "last": 0.09727290252668341,
+      "last10": 0.08837685437288738,
+      "minimum": 0.05083152913670999,
+      "maximum": 0.10977542755367953
+    }
+  },
+  "nonfinite_tokens": 0.0,
+  "max_token_gap": 7.314248561859131,
+  "validation_dataset": "30 unique AIME-2024 prompts; n=4",
+  "final_validation": {
+    "val-core/math_dapo/acc/mean@4": 0.925,
+    "val-core/math_dapo/acc/best@4/mean": 0.9551333333333333,
+    "val-core/math_dapo/acc/best@4/std": 0.01970596017603705,
+    "val-core/math_dapo/acc/maj@4/mean": 0.9292666666666666,
+    "val-core/math_dapo/acc/maj@4/std": 0.036410873621089745
+  },
+  "historical_gpu_evidence": {
+    "public_qk_norm": "10 passed, 17.09 seconds",
+    "public_frozen_ple_small_model": "2 passed, 10 deselected, 116.89 seconds",
+    "dp2_resume": "1 case passed on each of 8 ranks; TP2/PP2/EP2/DP2",
+    "native_cumem_lifecycle": "6 cases passed",
+    "tp8_fixed_schedule": "32 requests, 4096 token logprobs per phase, six phases bitwise equal"
+  },
+  "local_validation": {
+    "cpu": "130 passed, 6 optional-engine/deprecation warnings, 7.60 s; actual V1 trainer import exercised",
+    "v1_trainer": "4 passed as part of the 130-test suite; no AST-only substitution",
+    "patch_application": "Complete ordered patches passed on pinned clean vLLM and Bridge; all 10 patched vLLM implementation/test files byte-identical to previously tested source",
+    "cuda": "Historical archived runs; not rerun during documentation/commit cleanup",
+    "pre_commit": "All 14 repository hooks passed, including ruff, mypy, config generation, license, device API and compileall",
+    "html": "Desktop 1440 px and mobile 390 px rendered; embedded image loaded, filter passed, no JavaScript errors or page overflow"
+  }
+}

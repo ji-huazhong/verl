@@ -86,6 +86,13 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+@torch.no_grad()
+def _iter_detached_export_weights(weights):
+    """Disable autograd while advancing lazy Bridge exports, without leaking it to callers."""
+    for name, weight in weights:
+        yield name, weight.detach()
+
+
 def _resolve_fused_temperature(temperature: float | torch.Tensor) -> float:
     """Return the scalar temperature required by fused linear cross entropy."""
     values = torch.as_tensor(temperature).detach().flatten()
@@ -449,7 +456,9 @@ class MegatronEngine(BaseEngine):
         self.tf_config = updated_tf_config
         print(f"module: {len(module)}")
 
-        if self.engine_config.use_dist_checkpointing:
+        # The save format can be distributed while the initial weights come
+        # from HF. Only use the distributed loader when a source path is set.
+        if self.engine_config.use_dist_checkpointing and self.engine_config.dist_checkpointing_path:
             load_mcore_dist_weights(
                 module, self.engine_config.dist_checkpointing_path, is_value_model=self.is_value_model
             )
@@ -1006,7 +1015,7 @@ class MegatronEngine(BaseEngine):
 
             per_tensor_param = export_qat_weights(per_tensor_param, self.module, self._qat_config.mode, self.bridge)
 
-        return per_tensor_param, peft_config
+        return _iter_detached_export_weights(per_tensor_param), peft_config
 
     def _mcore_export_index(self):
         """Build (once) the per-parameter delta export index: geometry specs and
@@ -1338,6 +1347,12 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 if batch_num_tokens > 0:
                     mtp_loss_normalization_factor = routed_num_tokens / batch_num_tokens
 
+            if os.environ.get("VERL_QWEN38_LAYER_TRACE_PLAN"):
+                from verl.models.mcore.qwen3_8_next.production_trace import wrap_megatron_production_forward
+
+                forward_fn = wrap_megatron_production_forward(
+                    forward_fn, unwrapped_model, input_ids, enabled=calculate_entropy
+                )
             output = forward_fn(
                 model,
                 input_ids,

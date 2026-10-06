@@ -88,6 +88,19 @@ def import_external_libs(external_libs=None):
         importlib.import_module(external_lib)
 
 
+def validate_external_model_rollout_config(model_config, rollout_config):
+    """Run optional rollout checks exposed by explicitly configured model plugins."""
+    libraries = model_config.external_lib
+    if libraries is None:
+        return
+    if isinstance(libraries, str):
+        libraries = [libraries]
+    for library in libraries:
+        validate = getattr(importlib.import_module(library), "validate_verl_rollout", None)
+        if validate is not None:
+            validate(model_config, rollout_config)
+
+
 def resolve_config_path(config_path: str) -> str:
     """Resolve agent loop configuration file path.
 

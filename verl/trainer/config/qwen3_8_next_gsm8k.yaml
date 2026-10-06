@@ -1,0 +1,144 @@
+# Qwen3.8-Flash-Next full-parameter GRPO: initial 8 x 8 H100/L20Z configuration.
+# Run conversion, logprob and memory gates before a long training run.
+defaults:
+  - ppo_trainer
+  - override model_engine: megatron
+  - _self_
+
+data:
+  train_files: ${oc.env:QWEN38_TRAIN_FILE}
+  val_files: ${oc.env:QWEN38_VAL_FILE}
+  train_batch_size: 64
+  val_batch_size: 128
+  # Avoid forking DataLoader processes from the Ray task runner.
+  dataloader_num_workers: 0
+  max_prompt_length: 1024
+  max_response_length: 2048
+  truncation: error
+  filter_overlong_prompts: true
+  shuffle: true
+  validation_shuffle: false
+
+actor_rollout_ref:
+  model:
+    path: ${oc.env:QWEN38_MODEL_PATH}
+    external_lib: verl.models.mcore.qwen3_8_next.bridge
+    trust_remote_code: false
+    use_remove_padding: true
+    lora_rank: 0
+    lora:
+      rank: 0
+    mtp:
+      enable: false
+      enable_train: false
+      enable_rollout: false
+  actor:
+    ppo_mini_batch_size: 64
+    ppo_micro_batch_size_per_gpu: 1
+    ppo_max_token_len_per_gpu: 4096
+    use_dynamic_bsz: true
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0.0
+    optim:
+      lr: 1.0e-6
+      override_optimizer_config:
+        optimizer_offload_fraction: 1.0
+        optimizer_cpu_offload: true
+        use_precision_aware_optimizer: true
+        overlap_cpu_optimizer_d2h_h2d: true
+    megatron:
+      use_mbridge: true
+      # Start from HF, then save model/optimizer shards for training resume.
+      # PLE hash metadata is retained in the original complete HF checkpoint.
+      use_dist_checkpointing: true
+      use_remove_padding: true
+      tensor_model_parallel_size: 8
+      pipeline_model_parallel_size: 4
+      context_parallel_size: 1
+      expert_model_parallel_size: 8
+      expert_tensor_parallel_size: 1
+      sequence_parallel: true
+      param_offload: true
+      optimizer_offload: true
+      dtype: bfloat16
+      override_transformer_config:
+        # Freeze the n-gram table in pinned CPU memory, matching the Miles baseline.
+        # PLE projections, gates, norms and convolution remain trainable.
+        qwen3_8_next_train_ple: false
+        variable_seq_lengths: true
+        attention_backend: auto
+        recompute_method: uniform
+        recompute_granularity: full
+        recompute_num_layers: 1
+        moe_permute_fusion: true
+        moe_grouped_gemm: true
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+    log_prob_use_dynamic_bsz: true
+    log_prob_max_token_len_per_gpu: 4096
+    megatron:
+      param_offload: true
+  rollout:
+    name: vllm
+    dtype: bfloat16
+    tensor_model_parallel_size: 8
+    load_format: safetensors
+    gpu_memory_utilization: 0.55
+    n: 4
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    enforce_eager: true
+    calculate_log_probs: true
+    log_prob_micro_batch_size_per_gpu: 1
+    log_prob_use_dynamic_bsz: true
+    log_prob_max_token_len_per_gpu: 4096
+    engine_kwargs:
+      vllm:
+        engram_config:
+          cpu_offload: true
+          dp_shared_memory: false
+    val_kwargs:
+      n: 1
+      do_sample: false
+
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+  rollout_correction:
+    bypass_mode: false
+    # Correct the measured BF16 training/rollout distribution mismatch.
+    rollout_is: token
+    rollout_is_threshold: 2.0
+
+trainer:
+  project_name: qwen3_8_next_gsm8k
+  experiment_name: full_parameter_tp8_pp4_ep8_frozen_ple
+  logger: [console, tensorboard, file]
+  nnodes: 8
+  n_gpus_per_node: 8
+  critic_warmup: 0
+  total_epochs: 10
+  total_training_steps: 100
+  val_before_train: false
+  test_freq: 10
+  save_freq: 10
+  max_actor_ckpt_to_keep: 2
+  default_local_dir: ${oc.env:QWEN38_OUTPUT_DIR,outputs/qwen3_8_next_gsm8k_frozen_ple}
+  resume_mode: auto
+
+ray_kwargs:
+  ray_init:
+    runtime_env:
+      env_vars:
+        # Keep step metrics on the shared output mount so they remain readable
+        # when the Nebula browser/log service is unavailable.
+        # Launchers pass concrete, unique log paths to Ray. Hydra's `now`
+        # resolver is not registered in the TaskRunner process.
+        VERL_FILE_LOGGER_ROOT: ${oc.env:VERL_FILE_LOGGER_ROOT,${trainer.default_local_dir}/metrics}
+        TENSORBOARD_DIR: ${oc.env:TENSORBOARD_DIR,${trainer.default_local_dir}/tensorboard}
+        # Logical context length of the query that predicted each sampled token.
+        # With budget 2048 and compression 4, truncation first occurs at 2052.
+        VERL_LOGPROB_CONTEXT_BUCKETS: "2048:2051"

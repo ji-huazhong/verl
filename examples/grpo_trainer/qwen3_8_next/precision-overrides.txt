@@ -1,0 +1,4 @@
+# Apply with uv pip install --override precision-overrides.txt -r requirements.txt.
+# The frozen-table GRPO recipe uses the approved HC/GDN precision wheel.
+# requirements.txt retains the native wheel for reproducible diagnostic builds.
+vllm==0.30.1.dev0+g6e517b15.torch210.cu131.hcgdnfp32

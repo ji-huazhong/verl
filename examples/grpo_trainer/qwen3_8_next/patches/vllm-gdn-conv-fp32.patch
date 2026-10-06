@@ -1,0 +1,130 @@
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -93,6 +93,7 @@
+     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
+     VLLM_BATCH_INVARIANT: bool = False
+     VLLM_QWEN4_EXP_HC_FP32: bool = False
++    VLLM_QWEN4_EXP_GDN_CONV_FP32: bool = False
+     VLLM_TRITON_USE_TD: bool | None = None
+     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
+     MAX_JOBS: str | None = None
+@@ -634,6 +635,10 @@
+     "VLLM_QWEN4_EXP_HC_FP32": lambda: bool(
+         int(os.getenv("VLLM_QWEN4_EXP_HC_FP32", "0"))
+     ),
++    # Preserve FP32 products in Qwen4Exp's BF16 GDN convolution.
++    "VLLM_QWEN4_EXP_GDN_CONV_FP32": lambda: bool(
++        int(os.getenv("VLLM_QWEN4_EXP_GDN_CONV_FP32", "0"))
++    ),
+     "VLLM_REPLICATE_EMBED": lambda: (
+         os.getenv("VLLM_REPLICATE_EMBED", "0").strip().lower() in ("1", "true")
+     ),
+--- a/vllm/models/qwen4_exp/nvidia/model.py
++++ b/vllm/models/qwen4_exp/nvidia/model.py
+@@ -16,9 +16,6 @@
+ )
+ from vllm.model_executor.layers.fusion.mm_input_norm import build_mm_input_norm
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+-from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+-    QwenGatedDeltaNetAttention,
+-)
+ from vllm.model_executor.layers.mamba.mamba_utils import (
+     MambaStateCopyFunc,
+     MambaStateCopyFuncCalculator,
+@@ -66,6 +63,7 @@
+     maybe_fuse_shared_experts,
+     maybe_prefix,
+ )
++from vllm.models.qwen4_exp.nvidia.gdn import Qwen4ExpGatedDeltaNetAttention
+ from vllm.multimodal import MULTIMODAL_REGISTRY
+ from vllm.multimodal.inputs import MultiModalFeatureSpec
+ from vllm.sequence import IntermediateTensors
+@@ -203,7 +201,7 @@
+             )
+ 
+         if layer_type == "linear_attention":
+-            self.linear_attn = QwenGatedDeltaNetAttention(
++            self.linear_attn = Qwen4ExpGatedDeltaNetAttention(
+                 config,
+                 vllm_config=vllm_config,
+                 prefix=f"{prefix}.linear_attn",
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/gdn.py
+@@ -0,0 +1,17 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Qwen4Exp GDN convolution precision controls."""
++
++from vllm import envs
++from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
++    QwenGatedDeltaNetAttention,
++)
++
++
++class Qwen4ExpGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        if envs.VLLM_QWEN4_EXP_GDN_CONV_FP32:
++            # FP32 weights promote prefill/decode convolution products before
++            # accumulation. Keep the Parameter so its TP loader survives refits.
++            self.conv1d.weight.data = self.conv1d.weight.data.float()
+--- a/tests/kernels/mamba/test_causal_conv1d.py
++++ b/tests/kernels/mamba/test_causal_conv1d.py
+@@ -120,6 +120,57 @@
+     return (out if activation is None else F.silu(out)).to(dtype=dtype_in)
+ 
+ 
++@pytest.mark.parametrize("activation", [None, "silu"])
++def test_fp32_weights_preserve_bf16_prefill_decode_and_refit(activation):
++    """FP32 convolution products track FP64 while cache/output stay BF16."""
++    set_random_seed(73)
++    dim, width, length = 1280, 4, 198
++    x = torch.randn(length + 3, dim, device=DEVICE, dtype=torch.bfloat16)
++    weight = torch.randn(dim, width, device=DEVICE, dtype=torch.bfloat16).float()
++    states = torch.zeros(2, dim, width - 1, device=DEVICE, dtype=x.dtype)
++    slot = torch.ones(1, device=DEVICE, dtype=torch.int32)
++    cu = torch.tensor([0, length], device=DEVICE, dtype=torch.int32)
++    for refit in (False, True):
++        if refit:
++            # Equivalent to loading a new BF16 checkpoint into FP32 storage.
++            weight.copy_((weight + 0.125).bfloat16())
++        states.zero_()
++        expected, _ = causal_conv1d_ref(
++            x.T[None].double(), weight.double(), activation=activation
++        )
++        expected = expected[0].T.to(x.dtype)
++        prefill = causal_conv1d_fn(
++            x[:length].T,
++            weight,
++            None,
++            conv_states=states,
++            query_start_loc=cu,
++            cache_indices=slot,
++            has_initial_state=torch.zeros(1, device=DEVICE, dtype=torch.bool),
++            activation=activation,
++            validate_data=True,
++        ).T
++        outputs = [prefill]
++        for index in range(length, length + 3):
++            outputs.append(
++                causal_conv1d_update(
++                    x[index : index + 1].clone(),
++                    states,
++                    weight,
++                    activation=activation,
++                    conv_state_indices=slot,
++                )
++            )
++        actual = torch.cat(outputs)
++        assert actual.dtype == states.dtype == torch.bfloat16
++        assert weight.dtype == torch.float32
++        torch.testing.assert_close(states[1], x[-3:].T, rtol=0, atol=0)
++        assert torch.count_nonzero(states[0]) == 0
++        relative_error = (actual.double() - expected.double()).norm()
++        relative_error /= expected.double().norm()
++        assert relative_error < 5e-5
++
++
+ @pytest.mark.parametrize("itype", [torch.bfloat16])
+ @pytest.mark.parametrize("silu_activation", [False, True])
+ @pytest.mark.parametrize("has_bias", [False, True])

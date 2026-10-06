@@ -12,6 +12,7 @@
 # limitations under the License.
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -20,6 +21,59 @@ from verl.utils.debug.metrics import calculate_debug_metrics
 
 
 class TestMetrics(unittest.TestCase):
+    def test_context_buckets_use_preceding_query_and_exclude_padding(self):
+        data = DataProto.from_dict(
+            {
+                "old_log_probs": torch.tensor([[1.0, 2.0, 3.0, 4.0, float("nan")]]),
+                "rollout_log_probs": torch.zeros(1, 5),
+                "response_mask": torch.tensor([[1, 1, 1, 1, 0]]),
+                # Three left-padding positions plus 2048 prompt tokens.
+                "attention_mask": torch.tensor([[0] * 3 + [1] * 2048 + [1, 1, 1, 1, 0]]),
+                "responses": torch.zeros(1, 5),
+            }
+        )
+        with patch.dict("os.environ", {"VERL_LOGPROB_CONTEXT_BUCKETS": "2048:2051"}):
+            metrics = calculate_debug_metrics(data)
+        self.assertEqual(metrics["training/train_rollout_logprob_ctx_le2048_tokens"], 1)
+        self.assertEqual(metrics["training/train_rollout_logprob_ctx_le2048_abs_diff"], 1.0)
+        self.assertEqual(metrics["training/train_rollout_logprob_ctx_gt2048_le2051_tokens"], 3)
+        self.assertEqual(metrics["training/train_rollout_logprob_ctx_gt2048_le2051_abs_diff"], 3.0)
+        self.assertEqual(metrics["training/train_rollout_logprob_ctx_gt2051_tokens"], 0)
+
+    def test_context_buckets_count_valid_context_excluded_from_response_loss(self):
+        data = DataProto.from_dict(
+            {
+                "old_log_probs": torch.tensor([[1.0, float("nan"), 7.0]]),
+                "rollout_log_probs": torch.zeros(1, 3),
+                "response_mask": torch.tensor([[1, 0, 1]]),
+                "attention_mask": torch.tensor([[1] * 2050 + [1, 1, 1]]),
+                "responses": torch.zeros(1, 3),
+            }
+        )
+        with patch.dict("os.environ", {"VERL_LOGPROB_CONTEXT_BUCKETS": "2048:2051"}):
+            metrics = calculate_debug_metrics(data)
+        self.assertEqual(metrics["training/train_rollout_logprob_ctx_gt2048_le2051_abs_diff"], 1.0)
+        self.assertEqual(metrics["training/train_rollout_logprob_ctx_gt2051_abs_diff"], 7.0)
+        self.assertEqual(metrics["training/train_rollout_logprob_ctx_gt2051_nonfinite_tokens"], 0)
+
+    def test_response_mean_logprob_diff_is_not_token_mean_or_probability_diff(self):
+        data = DataProto.from_dict(
+            {
+                "old_log_probs": torch.tensor([[-5.0, float("nan"), float("nan")], [-1.0, -2.0, -3.0]]),
+                "rollout_log_probs": torch.tensor([[-1.0, float("nan"), float("nan")], [-1.0, -2.0, -3.0]]),
+                "response_mask": torch.tensor([[1, 0, 0], [1, 1, 1]]),
+                "responses": torch.zeros(2, 3),
+            }
+        )
+        metrics = calculate_debug_metrics(data)
+        self.assertEqual(metrics["training/train_rollout_logprob_abs_diff"], 2.0)
+        self.assertEqual(metrics["training/train_rollout_logprob_token_abs_diff"], 1.0)
+        self.assertEqual(metrics["training/train_rollout_logprob_max_abs_diff"], 4.0)
+        self.assertEqual(metrics["training/train_rollout_logprob_nonfinite_tokens"], 0)
+        self.assertLess(metrics["training/rollout_probs_diff_mean"], 0.1)
+        data.batch["old_log_probs"][1, 0] = float("nan")
+        self.assertEqual(calculate_debug_metrics(data)["training/train_rollout_logprob_nonfinite_tokens"], 1)
+
     def test_calculate_debug_metrics(self):
         data = DataProto.from_dict(
             {

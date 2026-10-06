@@ -12,6 +12,7 @@
 # limitations under the License.
 
 import logging
+import os
 
 import torch
 
@@ -58,6 +59,47 @@ def pearson_correlation_coefficient(tensor1: torch.Tensor, tensor2: torch.Tensor
 def calculate_log_prob_diff(log_probs1: torch.Tensor, log_probs2: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     full_diff = torch.abs(log_probs1 - log_probs2)
     return torch.masked_select(full_diff, mask)
+
+
+def calculate_logprob_context_metrics(data, logprob_diff, response_mask, boundaries):
+    """Bucket sampled-token error by the logical context that predicted it.
+
+    A response token is scored by the preceding query. Use the full attention
+    mask for context length, including tokens excluded by a response loss mask.
+    Left prompt padding and right response padding never count as context.
+    """
+    if not boundaries or any(value < 1 for value in boundaries) or sorted(set(boundaries)) != list(boundaries):
+        raise ValueError("Logprob context boundaries must be positive and strictly increasing")
+    attention = data.batch.get("attention_mask")
+    response_width = data.batch["responses"].shape[1]
+    if attention is None or attention.shape[1] <= response_width:
+        return {}
+    attention = attention.to(device=logprob_diff.device).bool()
+    context = attention[:, :-response_width].sum(-1, keepdim=True)
+    context = context + attention[:, -response_width:].cumsum(-1) - 1
+    metrics = {}
+    lower = None
+    for upper in [*boundaries, None]:
+        selected = response_mask & attention[:, -response_width:]
+        if lower is not None:
+            selected &= context > lower
+        if upper is not None:
+            selected &= context <= upper
+        label = f"le{upper}" if lower is None else (f"gt{lower}" if upper is None else f"gt{lower}_le{upper}")
+        prefix = f"training/train_rollout_logprob_ctx_{label}"
+        counts = selected.sum(-1)
+        samples = counts > 0
+        values = logprob_diff[selected]
+        metrics[prefix + "_tokens"] = values.numel()
+        metrics[prefix + "_samples"] = samples.sum().item()
+        if values.numel():
+            response_sums = torch.where(selected, logprob_diff, 0.0).sum(-1)
+            metrics[prefix + "_abs_diff"] = (response_sums[samples] / counts[samples]).mean().item()
+            metrics[prefix + "_token_abs_diff"] = values.mean().item()
+            metrics[prefix + "_max_abs_diff"] = values.max().item()
+            metrics[prefix + "_nonfinite_tokens"] = (~values.isfinite()).sum().item()
+        lower = upper
+    return metrics
 
 
 def calculate_debug_metrics(data: DataProto) -> dict:
@@ -108,11 +150,37 @@ def calculate_debug_metrics(data: DataProto) -> dict:
             "training/rollout_probs_diff_mean": float("nan"),
             "training/rollout_probs_diff_std": float("nan"),
             "training/rollout_actor_probs_pearson_corr": float("nan"),
+            "training/train_rollout_logprob_abs_diff": float("nan"),
+            "training/train_rollout_logprob_token_abs_diff": float("nan"),
+            "training/train_rollout_logprob_max_abs_diff": float("nan"),
+            "training/train_rollout_logprob_nonfinite_tokens": 0,
         }
 
+    # Independent actor scoring before the PPO update, on sampled response tokens.
+    # Average within each response, then over the batch, matching Miles' sample
+    # weighting. Keep this separate from the historical exp(logprob) metrics.
+    logprob_diff = torch.where(
+        response_mask_bool, (actor_old_log_probs.float() - rollout_old_log_probs.float()).abs(), 0.0
+    )
+    response_counts = response_mask_bool.sum(dim=-1).clamp_min(1)
+    valid_logprob_diff = logprob_diff[response_mask_bool]
+    logprob_metrics = {
+        "training/train_rollout_logprob_abs_diff": (logprob_diff.sum(dim=-1) / response_counts).mean().item(),
+        "training/train_rollout_logprob_token_abs_diff": valid_logprob_diff.mean().item(),
+        "training/train_rollout_logprob_max_abs_diff": valid_logprob_diff.max().item(),
+        "training/train_rollout_logprob_nonfinite_tokens": (~valid_logprob_diff.isfinite()).sum().item(),
+    }
+    context_boundaries = os.environ.get("VERL_LOGPROB_CONTEXT_BUCKETS")
+    if context_boundaries:
+        logprob_metrics.update(
+            calculate_logprob_context_metrics(
+                data, logprob_diff, response_mask_bool, [int(value) for value in context_boundaries.split(":")]
+            )
+        )
     pearson_corrcoef = pearson_correlation_coefficient(actor_probs, rollout_probs, response_mask_bool)
     rollout_probs_diff = calculate_log_prob_diff(actor_probs, rollout_probs, response_mask_bool)
     return {
+        **logprob_metrics,
         "training/rollout_probs_diff_valid": 1,
         "training/rollout_probs_diff_max": torch.max(rollout_probs_diff).detach().item(),
         "training/rollout_probs_diff_mean": torch.mean(rollout_probs_diff).detach().item(),

@@ -1659,9 +1659,19 @@ class PPOTrainer(ABC):
         assert len(output) == len(batch)
 
         fields = ["entropy", "log_probs", "response_mask"]
+        context_buckets = bool(os.environ.get("VERL_LOGPROB_CONTEXT_BUCKETS"))
+        capture_root = os.environ.get("VERL_LOGPROB_CAPTURE_DIR")
+        capture_step = bool(capture_root) and self.global_steps == int(os.environ.get("VERL_LOGPROB_CAPTURE_STEP", "1"))
+        if capture_step and not self.config.actor_rollout_ref.rollout.calculate_log_probs:
+            raise ValueError("Production logprob capture requires rollout.calculate_log_probs=True")
         if self.config.actor_rollout_ref.rollout.calculate_log_probs:
             fields.extend(["responses", "rollout_log_probs"])
+            if context_buckets or capture_step:
+                fields.append("prompts")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        if self.config.actor_rollout_ref.rollout.calculate_log_probs and context_buckets:
+            prompt_lengths = data["prompts"].offsets().diff()
+            response_lengths = data["responses"].offsets().diff()
 
         # 2. write old_log_probs and entropy back to TransferQueue
         data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
@@ -1670,7 +1680,40 @@ class PPOTrainer(ABC):
             keys=batch.keys, partition_id=batch.partition_id, fields=data.select("old_log_probs", "entropy")
         )
 
+        if capture_step:
+            from verl.utils.debug.logprob_capture import capture_logprob_batch, select_capture_indices
+
+            indices = select_capture_indices(data, count=int(os.environ.get("VERL_LOGPROB_CAPTURE_COUNT", "16")))
+            selected_keys = [batch.keys[index] for index in indices]
+            routed = tq.kv_batch_get(
+                keys=selected_keys, partition_id=batch.partition_id, select_fields=["routed_experts"]
+            )
+            capture_logprob_batch(
+                capture_root,
+                self.global_steps,
+                batch.keys,
+                data,
+                indices,
+                list(routed["routed_experts"].unbind()),
+                metadata={
+                    "temperature": float(self.config.actor_rollout_ref.rollout.temperature),
+                    "experiment_name": self.config.trainer.experiment_name,
+                    "model_path": self.config.actor_rollout_ref.model.path,
+                    "before_policy_update": True,
+                },
+            )
+
         data = DataProto(batch=data.to_padded_tensor())
+        if self.config.actor_rollout_ref.rollout.calculate_log_probs and context_buckets:
+            # TransferQueue stores unpadded jagged rows, not a full attention mask.
+            # Count every context token, including response tokens excluded from loss.
+            data.batch["attention_mask"] = torch.cat(
+                [
+                    self._lengths_to_mask(prompt_lengths, data.batch["prompts"].size(1)),
+                    self._lengths_to_mask(response_lengths, data.batch["responses"].size(1)),
+                ],
+                dim=1,
+            )
 
         # 3. calculate actor entroy metrics
         actor_config = self.config.actor_rollout_ref.actor

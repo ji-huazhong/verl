@@ -1,0 +1,55 @@
+# DAPO-Math-17k: 128 prompts x 8 responses, 100 GRPO updates on 64 GPUs.
+# Use the validated hc-gdn-fp32-ple-state runtime profile for this run.
+defaults:
+  - qwen3_8_next_gsm8k
+  - _self_
+
+data:
+  seed: 42
+  train_batch_size: 128
+  max_prompt_length: 2048
+  max_response_length: 8192
+  val_batch_size: 30
+
+actor_rollout_ref:
+  actor:
+    ppo_mini_batch_size: 128
+    ppo_max_token_len_per_gpu: 10240
+    megatron:
+      router_replay:
+        mode: R3
+  ref:
+    log_prob_max_token_len_per_gpu: 10240
+  rollout:
+    n: 8
+    max_model_len: 10240
+    log_prob_max_token_len_per_gpu: 10240
+    enable_rollout_routing_replay: true
+    engine_kwargs:
+      vllm:
+        worker_extension_cls: verl.models.mcore.qwen3_8_next.vllm_worker_extension.Qwen38QsaCanonicalOrderWorkerExtension
+    val_kwargs:
+      n: 4
+      do_sample: true
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+
+trainer:
+  project_name: qwen3_8_next_dapo17k
+  experiment_name: grpo_dapo17k_128x8_8k_100steps_frozen_ple
+  total_training_steps: 100
+  val_before_train: false
+  test_freq: 50
+  save_freq: 50
+  resume_mode: auto
+  default_local_dir: ${oc.env:QWEN38_OUTPUT_DIR,outputs/qwen3_8_next_dapo17k_frozen_ple}
+
+ray_kwargs:
+  ray_init:
+    runtime_env:
+      env_vars:
+        VERL_LOGPROB_CONTEXT_BUCKETS: "2048:2051:4096:8192"
+        # Optional bounded first-step capture; the launcher supplies its directory.
+        VERL_LOGPROB_CAPTURE_STEP: "1"
+        VERL_LOGPROB_CAPTURE_COUNT: "32"

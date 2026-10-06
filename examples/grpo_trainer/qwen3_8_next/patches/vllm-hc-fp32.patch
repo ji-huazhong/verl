@@ -1,0 +1,305 @@
+diff --git a/tests/models/qwen4_exp/test_hc_ops.py b/tests/models/qwen4_exp/test_hc_ops.py
+index cdad1cec1..62c110430 100644
+--- a/tests/models/qwen4_exp/test_hc_ops.py
++++ b/tests/models/qwen4_exp/test_hc_ops.py
+@@ -33,6 +33,48 @@ requires_sm90 = pytest.mark.skipif(
+ )
+ 
+ 
++@pytest.mark.parametrize("num_tokens", [0, 1, 17, 198])
++@pytest.mark.parametrize("use_combine", [False, True])
++def test_hc_fp32_preserves_intermediates(num_tokens, use_combine):
++    """Mix and delayed combine follow an FP32 oracle, including final mixers."""
++    from vllm.models.qwen4_exp.nvidia.ops.hc_fp32 import (
++        hc_combine_fp32,
++        hc_mix_fp32,
++    )
++
++    torch.manual_seed(34)
++    hidden, rank = 128, 16
++    wide = HC * hidden
++    kwargs = dict(device="cuda", dtype=torch.bfloat16)
++    x = torch.randn(num_tokens, wide, **kwargs)
++    norm = torch.randn(wide, **kwargs) * 0.1
++    down = torch.randn(rank, wide, **kwargs) * 0.1
++    up = torch.randn(wide, rank, **kwargs) * 0.1
++    inject = torch.randn(HC, wide, **kwargs) * 0.1 if use_combine else None
++    actual, logits = hc_mix_fp32(x, norm, down, up, inject, HC, EPS)
++    grouped = x.float().reshape(num_tokens, HC, hidden)
++    normed = grouped / (grouped.square().mean(-1, keepdim=True) + EPS).sqrt()
++    normed = normed.reshape(num_tokens, wide) * (1.0 + norm.float())
++    low = torch.nn.functional.silu(
++        torch.nn.functional.linear(normed, down.float()) / HC
++    )
++    gate = torch.sigmoid(torch.nn.functional.linear(low, up.float()))
++    expected = (normed * gate).reshape(num_tokens, HC, hidden).mean(1)
++    torch.testing.assert_close(actual, expected.to(x.dtype))
++    if use_combine:
++        expected_logits = torch.nn.functional.linear(normed, inject.float())
++        assert logits.dtype == torch.float32
++        torch.testing.assert_close(logits, expected_logits, atol=2e-5, rtol=2e-5)
++        coefficient = 2.0 * torch.sigmoid(expected_logits / HC)
++    else:
++        assert logits is None
++        coefficient = torch.ones(num_tokens, HC, device="cuda")
++    block = torch.randn(num_tokens, hidden, **kwargs)
++    combined = hc_combine_fp32(x, block, logits, HC)
++    expected = grouped + coefficient[..., None] * block.float()[:, None]
++    torch.testing.assert_close(combined, expected.reshape(num_tokens, wide).to(x.dtype))
++
++
+ def test_grouped_gemma_rmsnorm() -> None:
+     torch.manual_seed(0)
+     x = torch.randn(2, HYPER_HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+diff --git a/vllm/envs.py b/vllm/envs.py
+index f51100fe8..c0301a7b5 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -92,6 +92,7 @@ if TYPE_CHECKING:
+     VLLM_MAIN_CUDA_VERSION: str = "13.0"
+     VLLM_FLOAT32_MATMUL_PRECISION: Literal["highest", "high", "medium"] = "highest"
+     VLLM_BATCH_INVARIANT: bool = False
++    VLLM_QWEN4_EXP_HC_FP32: bool = False
+     VLLM_TRITON_USE_TD: bool | None = None
+     VLLM_GPU_SYNC_CHECK: Literal["warn", "error"] | None = None
+     MAX_JOBS: str | None = None
+@@ -629,6 +630,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # Enable batch-invariant mode: deterministic results regardless of
+     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
+     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
++    # Align Qwen4Exp HC intermediates with the FP32 Megatron training path.
++    "VLLM_QWEN4_EXP_HC_FP32": lambda: bool(
++        int(os.getenv("VLLM_QWEN4_EXP_HC_FP32", "0"))
++    ),
+     "VLLM_REPLICATE_EMBED": lambda: (
+         os.getenv("VLLM_REPLICATE_EMBED", "0").strip().lower() in ("1", "true")
+     ),
+diff --git a/vllm/models/qwen4_exp/nvidia/hyperconnection.py b/vllm/models/qwen4_exp/nvidia/hyperconnection.py
+index dcf8daa95..d9fb18321 100644
+--- a/vllm/models/qwen4_exp/nvidia/hyperconnection.py
++++ b/vllm/models/qwen4_exp/nvidia/hyperconnection.py
+@@ -45,6 +45,7 @@ from .ops.hc import (
+     hc_gate_mix,
+     hc_silu,
+ )
++from .ops.hc_fp32 import hc_combine_fp32, hc_mix_fp32
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -78,6 +79,7 @@ class GatedResidual(nn.Module):
+         self.hc_count = config.hc_count
+         self.hidden_size = config.hidden_size
+         self.use_combine = use_combine
++        self.use_fp32 = envs.VLLM_QWEN4_EXP_HC_FP32
+ 
+         norm_size = (
+             self.hyper_hidden_size if config.hc_per_branch_norm else config.hidden_size
+@@ -158,9 +160,31 @@ class GatedResidual(nn.Module):
+         lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
+         return hc_silu(lora, self.hc_count), injection
+ 
++    def _mix_fp32(
++        self, hidden_states: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
++        if self.use_combine:
++            weight = self.input_mix_weight_down_block_inject.weight
++            down = weight[: self.lora_rank]
++            inject = weight[self.lora_rank : self.lora_rank + self.hc_count]
++        else:
++            down, inject = self.input_mix_weight_down.weight, None
++        block_input, injection = hc_mix_fp32(
++            hidden_states,
++            self.hc_norm.weight,
++            down,
++            self.input_mix_weight_up.weight,
++            inject,
++            self.hc_count,
++            self.config.rms_norm_eps,
++        )
++        return hidden_states, block_input, injection
++
+     def mix(
+         self, hidden_states: torch.Tensor
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
++        if self.use_fp32:
++            return self._mix_fp32(hidden_states)
+         xn = grouped_gemma_rmsnorm(
+             hidden_states,
+             self.hc_norm.weight,
+@@ -187,6 +211,11 @@ class GatedResidual(nn.Module):
+         module's input RMSNorm. A missing injection applies the block output
+         to every stream with unit weight.
+         """
++        if self.use_fp32:
++            hidden_states = self.combine(
++                hidden_states, prev_block_output, prev_injection
++            )
++            return self._mix_fp32(hidden_states)
+         hidden_states, xn = hc_combine_norm(
+             hidden_states,
+             prev_block_output,
+@@ -208,6 +237,10 @@ class GatedResidual(nn.Module):
+         block_output: torch.Tensor,
+         injection: torch.Tensor | None,
+     ) -> torch.Tensor:
++        if self.use_fp32:
++            return hc_combine_fp32(
++                hidden_states, block_output, injection, self.hc_count
++            )
+         return hc_combine(hidden_states, block_output, injection, self.hc_count)
+ 
+     @property
+diff --git a/vllm/models/qwen4_exp/nvidia/ops/hc_fp32.py b/vllm/models/qwen4_exp/nvidia/ops/hc_fp32.py
+new file mode 100644
+index 000000000..d54bf1000
+--- /dev/null
++++ b/vllm/models/qwen4_exp/nvidia/ops/hc_fp32.py
+@@ -0,0 +1,148 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# Forward kernels adapted from verl's Qwen3.8-Next HC, originally from
++# radixark/miles PR #2777, revision 6aea72c18bd92c35e53e7d02699a01e02de8993f.
++"""HC with FP32 intermediates, matching the Megatron training adapter."""
++
++import torch
++import torch.nn.functional as F
++
++from vllm.triton_utils import tl, triton
++
++
++@triton.jit(do_not_specialize=["T"])
++def _norm_kernel(
++    X,
++    W,
++    Y,
++    T,
++    N: tl.constexpr,
++    C: tl.constexpr,
++    EPS: tl.constexpr,
++    SHARED: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0) // N
++    stream = tl.program_id(0) % N
++    i = tl.arange(0, BLOCK)
++    offset = row * N * C + stream * C + i
++    x = tl.load(X + offset, i < C, other=0).to(tl.float32)
++    w_offset = i if SHARED else stream * C + i
++    w = tl.load(W + w_offset, i < C, other=0).to(tl.float32)
++    rstd = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / C + EPS)
++    tl.store(Y + offset, x * rstd * (1.0 + w), i < C)
++
++
++@triton.jit(do_not_specialize=["T"])
++def _mix_kernel(X, G, Y, T, N: tl.constexpr, C: tl.constexpr, BLOCK: tl.constexpr):
++    row = tl.program_id(0)
++    i = tl.arange(0, BLOCK)
++    acc = tl.zeros([BLOCK], dtype=tl.float32)
++    for stream in tl.static_range(N):
++        offset = row * N * C + stream * C + i
++        x = tl.load(X + offset, i < C, other=0)
++        gate = tl.load(G + offset, i < C, other=0)
++        acc += gate * x
++    tl.store(Y + row * C + i, (acc / N).to(Y.dtype.element_ty), i < C)
++
++
++@triton.jit(do_not_specialize=["T"])
++def _combine_kernel(
++    R,
++    Y,
++    A,
++    OUT,
++    T,
++    N: tl.constexpr,
++    C: tl.constexpr,
++    UNIT: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    row = tl.program_id(0) // N
++    stream = tl.program_id(0) % N
++    i = tl.arange(0, BLOCK)
++    offset = row * N * C + stream * C + i
++    r = tl.load(R + offset, i < C, other=0).to(tl.float32)
++    y = tl.load(Y + row * C + i, i < C, other=0).to(tl.float32)
++    a = 1.0 if UNIT else tl.load(A + row * N + stream)
++    tl.store(OUT + offset, (r + a * y).to(OUT.dtype.element_ty), i < C)
++
++
++def hc_mix_fp32(
++    x: torch.Tensor,
++    norm_weight: torch.Tensor,
++    down_weight: torch.Tensor,
++    up_weight: torch.Tensor,
++    inject_weight: torch.Tensor | None,
++    hc_count: int,
++    eps: float,
++) -> tuple[torch.Tensor, torch.Tensor | None]:
++    """Return model-dtype block input and FP32, unscaled injection logits.
++
++    Parameters retain their checkpoint dtype. Casting them on each invocation
++    also observes weights replaced by RL updates without a stale FP32 cache.
++    """
++    x = x.contiguous()
++    tokens, wide = x.shape
++    hidden = wide // hc_count
++    normed = torch.empty_like(x, dtype=torch.float32)
++    mixed = torch.empty(tokens, hidden, dtype=x.dtype, device=x.device)
++    if tokens:
++        _norm_kernel[(tokens * hc_count,)](
++            x,
++            norm_weight,
++            normed,
++            tokens,
++            hc_count,
++            hidden,
++            eps,
++            norm_weight.numel() == hidden,
++            triton.next_power_of_2(hidden),
++        )
++    down = F.linear(normed, down_weight.float()) / hc_count
++    gate = torch.sigmoid(F.linear(F.silu(down), up_weight.float()))
++    if tokens:
++        _mix_kernel[(tokens,)](
++            normed,
++            gate,
++            mixed,
++            tokens,
++            hc_count,
++            hidden,
++            triton.next_power_of_2(hidden),
++        )
++    injection = (
++        F.linear(normed, inject_weight.float()) if inject_weight is not None else None
++    )
++    return mixed, injection
++
++
++def hc_combine_fp32(
++    residual: torch.Tensor,
++    block_output: torch.Tensor,
++    injection: torch.Tensor | None,
++    hc_count: int,
++) -> torch.Tensor:
++    """Consume unscaled logits and round the updated residual to its dtype."""
++    residual, block_output = residual.contiguous(), block_output.contiguous()
++    tokens, wide = residual.shape
++    hidden = wide // hc_count
++    out = torch.empty_like(residual)
++    coefficient = (
++        2.0 * torch.sigmoid(injection.float() / hc_count)
++        if injection is not None
++        else None
++    )
++    if tokens:
++        _combine_kernel[(tokens * hc_count,)](
++            residual,
++            block_output,
++            coefficient,
++            out,
++            tokens,
++            hc_count,
++            hidden,
++            coefficient is None,
++            triton.next_power_of_2(hidden),
++        )
++    return out

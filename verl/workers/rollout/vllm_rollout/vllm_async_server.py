@@ -725,7 +725,25 @@ class vLLMHttpServer:
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
 
+        if os.environ.get("VERL_QWEN38_PRODUCTION_AUDIT_DIR") or os.environ.get("VERL_QWEN38_RESPONSE_AUDIT_DIR"):
+            from verl.models.mcore.qwen3_8_next.runtime_audit import audit_server_response
+
+            audit_server_response(
+                replica=self.replica_rank,
+                request_id=request_id,
+                prompt_ids=prompt_ids,
+                final_res=final_res,
+                sampling_params=sampling_params,
+                global_steps=self.global_steps,
+            )
+
         routed_experts = None
+        if os.environ.get("VERL_QWEN38_LAYER_TRACE_PLAN"):
+            from verl.models.mcore.qwen3_8_next.production_trace import audit_selected_response
+
+            audit_selected_response(
+                replica=self.replica_rank, request_id=request_id, prompt_ids=prompt_ids, final_res=final_res
+            )
         if self.config.enable_rollout_routing_replay:
             routed_experts = final_res.outputs[0].routed_experts
 
@@ -1215,6 +1233,9 @@ class vLLMHttpServer:
 
     def _validate_configs(self) -> None:
         """Validate config/model_config after initialisation."""
+        from verl.utils.import_utils import validate_external_model_rollout_config
+
+        validate_external_model_rollout_config(self.model_config, self.config)
         max_position_embeddings = get_max_position_embeddings(self.model_config.hf_config)
         if self.config.max_model_len is None:
             self.config.max_model_len = max_position_embeddings

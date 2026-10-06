@@ -1,0 +1,35 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index be45bc8c6..65ff350e6 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -29,7 +29,7 @@ description = "Megatron Bridge: Training Recipes for Megatron-based LLM and VLM
+ readme = "README.md"
+ dynamic = ["version"]
+ license = {file = "LICENSE"}
+-requires-python = ">=3.12,<3.13"
++requires-python = ">=3.12,<3.14"
+ authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
+ maintainers = [
+     { name = "Ananth Subramaniam", email = "ansubramania@nvidia.com" },
+diff --git a/src/megatron/bridge/package_info.py b/src/megatron/bridge/package_info.py
+index b4b20cb8a..89b881d57 100644
+--- a/src/megatron/bridge/package_info.py
++++ b/src/megatron/bridge/package_info.py
+@@ -16,7 +16,7 @@
+ MAJOR = 0
+ MINOR = 6
+ PATCH = 2
+-PRE_RELEASE = ""
++PRE_RELEASE = "+nebula1"
+ 
+ # Use the following formatting: (major, minor, patch, pre-release)
+ VERSION = (MAJOR, MINOR, PATCH, PRE_RELEASE)
+@@ -40,7 +40,7 @@ if not int(_os.getenv("NO_VCS_VERSION", "0")):
+     except (_subprocess.CalledProcessError, OSError):
+         pass
+     else:
+-        __version__ += f"+{_git.stdout.strip()}"
++        __version__ += f".{_git.stdout.strip()}"
+ 
+ __package_name__ = "megatron_bridge"
+ __contact_names__ = "NVIDIA"

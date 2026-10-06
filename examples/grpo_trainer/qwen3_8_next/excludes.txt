@@ -1,0 +1,11 @@
+# Pass to uv pip install --excludes when inheriting the verified Nebula image.
+# Its CUDA 13.1 builds are visible to Python through the image site-packages,
+# which uv does not discover through the child environment's .pth file.
+# Validate these versions before/after installation; never substitute PyPI ABI builds.
+torch
+torchvision
+torchaudio
+triton
+# Core's optional FA4 package shares the flash_attn namespace and expects an
+# older CUTLASS API than vLLM main. Use the ABI-matched FA2 wheel for training.
+flash-attn-4

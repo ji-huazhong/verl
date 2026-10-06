@@ -11,11 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
+import pickle
 import random
+from types import SimpleNamespace
 
+import pytest
 import torch
 from tensordict import TensorDict
 
+from verl.utils import tensordict_utils as tu
+from verl.utils import transferqueue_utils as tqu
 from verl.workers.utils.padding import (
     build_attention_mask_from_nested,
     embeds_padding_2_no_padding,
@@ -24,6 +30,58 @@ from verl.workers.utils.padding import (
     response_from_nested,
     response_to_nested,
 )
+
+
+@pytest.mark.parametrize("lengths", [(22,) * 8, (22, 19, 17)])
+def test_mrope_padding_preserves_sequence_axis_after_transfer(lengths):
+    """Equal-length rollouts must retain the (batch, 4, sequence) MRoPE layout."""
+    batch_size, width = len(lengths), max(lengths)
+    positions = torch.arange(batch_size * 4 * width).reshape(batch_size, 4, width)
+    mask = torch.arange(width)[None, :] < torch.tensor(lengths)[:, None]
+    data = TensorDict(
+        {
+            "input_ids": torch.arange(width).expand(batch_size, -1),
+            "attention_mask": mask,
+            "response_mask": mask[:, -4:],
+            "position_ids": positions,
+        },
+        batch_size=[batch_size],
+    )
+    data = left_right_2_no_padding(data)
+    # This matches the consolidated TensorDict transport between Ray workers.
+    data = pickle.loads(pickle.dumps(data.consolidate()))
+    tu.maybe_fix_3d_position_ids(data)
+    assert data["position_ids"].size(1) == 4
+    indices = [batch_size - 1, 0, batch_size - 1]
+    selected = tu.index_select_tensor_dict(data, indices)
+    nested = selected["position_ids"]
+    assert nested.size(1) == 4
+    assert nested.values().shape == (4, sum(lengths[i] for i in indices))
+    for actual, index in zip(nested.unbind(), indices, strict=True):
+        torch.testing.assert_close(actual, positions[index, :, : lengths[index]])
+    combined = tu.concat_nested_tensors([nested, nested])
+    assert combined.size(1) == 4
+    for actual, index in zip(combined.unbind(), indices * 2, strict=True):
+        torch.testing.assert_close(actual, positions[index, :, : lengths[index]])
+
+
+@pytest.mark.parametrize("lengths", [(22,) * 8, (32,) * 8, (22, 19, 17)])
+def test_mrope_transferqueue_receive_preserves_sequence_axis(monkeypatch, lengths):
+    rows = [torch.arange(4 * length).reshape(4, length) + i * 1000 for i, length in enumerate(lengths)]
+    # TransferQueue's serializer reconstructs from rows, without a jagged axis.
+    received = TensorDict(
+        {"position_ids": torch.nested.as_nested_tensor(rows, layout=torch.jagged)}, batch_size=[len(rows)]
+    )
+
+    async def get_data(meta):
+        return received
+
+    monkeypatch.setattr(tqu, "tq", SimpleNamespace(get_client=lambda: SimpleNamespace(async_get_data=get_data)))
+    data = asyncio.run(tqu._async_meta_to_realdata(SimpleNamespace(size=len(rows), extra_info={})))
+    assert data["position_ids"].size(1) == 4
+    selected = tu.index_select_tensor_dict(data, [len(rows) - 1, 0])
+    for actual, expected in zip(selected["position_ids"].unbind(), [rows[-1], rows[0]], strict=True):
+        torch.testing.assert_close(actual, expected)
 
 
 def test_padding_conversion_with_log_probs():

@@ -177,9 +177,10 @@ def nested_tensor_from_tensor_list(tensors: list[torch.Tensor], ragged_idx: int 
     offsets = torch.zeros(len(tensors) + 1, dtype=torch.long, device=values.device)
     torch.cumsum(lengths, dim=0, out=offsets[1:])
 
-    nested_tensor = torch.nested.nested_tensor_from_jagged(values=values, offsets=offsets)
-    nested_tensor._ragged_idx = ragged_idx
-    return nested_tensor
+    # Specify the ragged dimension during construction so shape/stride metadata
+    # agrees with the values layout. Mutating _ragged_idx afterward leaves the
+    # symbolic shape on the wrong axis, notably for MRoPE (batch, 4, sequence).
+    return torch.nested.nested_tensor_from_jagged(values=values, offsets=offsets, jagged_dim=ragged_idx)
 
 
 def concat_nested_tensors(tensors: list[torch.Tensor]) -> torch.Tensor:
@@ -908,11 +909,14 @@ def contiguous(data: TensorDict) -> TensorDict:
 
 
 def maybe_fix_3d_position_ids(data: TensorDict):
-    # note for tensordict with pickle/unpickle. nested tensor in tensordict after consolidate and pickle/unpickle
-    # will incur indexing error for ragged tensor. This only happens when using 3D position ids in VLMs.
-    # This is likely a bug in tensordict. As a workaround, we manually set _ragged_index.
+    # TensorDict consolidation can reconstruct (batch, channels, sequence) with
+    # the default ragged axis. Rebuild the view so both the ragged index and its
+    # symbolic shape agree; changing _ragged_idx alone leaves stale metadata.
     if "position_ids" in data.keys() and data["position_ids"].dim() == 3 and data["position_ids"].is_nested:
-        data["position_ids"]._ragged_idx = 2
+        positions = data["position_ids"]
+        data["position_ids"] = torch.nested.nested_tensor_from_jagged(
+            values=positions.values(), offsets=positions.offsets(), lengths=positions.lengths(), jagged_dim=2
+        )
 
 
 def list_of_dict_to_tensordict(list_of_dicts: list[dict[str, Any]]) -> TensorDict:

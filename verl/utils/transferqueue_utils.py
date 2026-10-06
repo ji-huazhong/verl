@@ -168,6 +168,12 @@ async def _async_meta_to_realdata(meta: BatchMeta | KVBatchMeta) -> TensorDict:
 
     tq_client = tq.get_client()
     tensordict = await tq_client.async_get_data(meta)
+    positions = tensordict.get("position_ids")
+    if isinstance(positions, torch.Tensor) and positions.is_nested and positions.dim() == 3:
+        # TransferQueue rebuilds rows with as_nested_tensor, which chooses the
+        # channel axis for equal-length MRoPE rows. Canonicalize at the receive
+        # boundary before inference or training can split the batch.
+        tensordict["position_ids"] = tu.nested_tensor_from_tensor_list(list(positions.unbind()), ragged_idx=2)
 
     for key, val in meta_info.items():
         if isinstance(val, (NonTensorData | NonTensorStack)):

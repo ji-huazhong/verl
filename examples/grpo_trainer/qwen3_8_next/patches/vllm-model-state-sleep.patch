@@ -1,0 +1,127 @@
+diff --git a/tests/basic_correctness/memory/cumem/test_cumem.py b/tests/basic_correctness/memory/cumem/test_cumem.py
+index fa06facf2..135722669 100644
+--- a/tests/basic_correctness/memory/cumem/test_cumem.py
++++ b/tests/basic_correctness/memory/cumem/test_cumem.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import gc
++from types import SimpleNamespace
+ 
+ import pytest
+ import torch
+@@ -16,6 +17,30 @@ from ....utils import create_new_process_for_each_test
+ DEVICE_TYPE = current_platform.device_type
+ 
+ 
++@create_new_process_for_each_test("fork" if current_platform.is_cuda() else "spawn")
++def test_model_state_survives_level_two_sleep_and_selective_wake():
++    """State constructed while loading weights must retain constants after sleep."""
++    from vllm.v1.worker.gpu.model_states import init_model_state
++
++    class State:
++        def __init__(self, config, model, encoder_cache, device):
++            self.offsets = torch.arange(-2, 0, dtype=torch.int64, device=device)
++
++    allocator = get_mem_allocator_instance()
++    config = SimpleNamespace(
++        model_config=SimpleNamespace(enable_sleep_mode=True, enable_prompt_embeds=False)
++    )
++    model = SimpleNamespace(get_model_state_cls=lambda: State)
++    with allocator.use_memory_pool("weights"):
++        state = init_model_state(config, model, None, torch.device(DEVICE_TYPE))
++    pointer = state.offsets.data_ptr()
++    for tags in (["weights"], ["kv_cache"], None):
++        allocator.sleep(offload_tags=("runtime",))
++        allocator.wake_up(tags=tags)
++        assert state.offsets.data_ptr() == pointer
++        assert state.offsets.tolist() == [-2, -1]
++
++
+ def mapped_usage(allocator) -> int:
+     """Bytes the allocator still has mapped on the device.
+ 
+diff --git a/tests/v1/worker/test_sleep_mode_backend.py b/tests/v1/worker/test_sleep_mode_backend.py
+index a8b8d61ae..ffabce72f 100644
+--- a/tests/v1/worker/test_sleep_mode_backend.py
++++ b/tests/v1/worker/test_sleep_mode_backend.py
+@@ -38,6 +38,45 @@ def test_new_backend_starts_in_running_state():
+     assert CuMemBackend().state() == "RUNNING"
+ 
+ 
++@pytest.mark.parametrize("sleep_enabled", [False, True])
++def test_model_state_initialization_keeps_runtime_ownership(monkeypatch, sleep_enabled):
++    """State uses retained memory; disabled sleep leaves the allocator idle."""
++    from contextlib import contextmanager
++    from types import SimpleNamespace
++
++    from vllm.v1.worker.gpu import model_states
++
++    active = ["weights"]
++
++    @contextmanager
++    def use_pool(*, tag):
++        active.append(tag)
++        try:
++            yield
++        finally:
++            active.pop()
++
++    class State:
++        def __init__(self, config, model, encoder_cache, device):
++            self.tag = active[-1]
++
++    def allocator():
++        assert sleep_enabled, "Disabled sleep must not initialize the allocator"
++        return SimpleNamespace(use_memory_pool=use_pool)
++
++    monkeypatch.setattr(model_states, "get_mem_allocator_instance", allocator)
++    config = SimpleNamespace(
++        model_config=SimpleNamespace(
++            enable_sleep_mode=sleep_enabled, enable_prompt_embeds=False
++        )
++    )
++    state = model_states.init_model_state(
++        config, SimpleNamespace(get_model_state_cls=lambda: State), None, None
++    )
++    assert state.tag == ("runtime" if sleep_enabled else "weights")
++    assert active == ["weights"]
++
++
+ @pytest.mark.parametrize("enable_nccl_comm_suspend", [True, False])
+ def test_worker_drives_communicator_suspension(monkeypatch, enable_nccl_comm_suspend):
+     """Comm walkers run around sleep/wake only when explicitly enabled."""
+diff --git a/vllm/v1/worker/gpu/model_states/__init__.py b/vllm/v1/worker/gpu/model_states/__init__.py
+index ceb1facb4..a73a23909 100644
+--- a/vllm/v1/worker/gpu/model_states/__init__.py
++++ b/vllm/v1/worker/gpu/model_states/__init__.py
+@@ -1,9 +1,12 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from contextlib import nullcontext
++
+ import torch
+ import torch.nn as nn
+ 
+ from vllm.config import VllmConfig, get_layers_from_vllm_config
++from vllm.device_allocator import get_mem_allocator_instance
+ from vllm.model_executor.layers.attention import Attention, CrossAttention
+ from vllm.v1.attention.backend import AttentionType
+ from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
+@@ -22,7 +25,15 @@ def init_model_state(
+     if vllm_config.model_config.enable_prompt_embeds and not cls.supports_prompt_embeds:
+         raise ValueError(f"--enable-prompt-embeds not supported with {cls.__name__}.")
+ 
+-    return cls(vllm_config, model, encoder_cache, device)
++    # Construction runs inside load_model's weights pool. These tensors are
++    # runtime state, not weights restored by a checkpoint/refit after sleep.
++    pool = (
++        get_mem_allocator_instance().use_memory_pool(tag="runtime")
++        if vllm_config.model_config.enable_sleep_mode
++        else nullcontext()
++    )
++    with pool:
++        return cls(vllm_config, model, encoder_cache, device)
+ 
+ 
+ def resolve_model_state_cls(

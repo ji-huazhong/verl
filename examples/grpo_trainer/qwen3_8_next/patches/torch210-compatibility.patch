@@ -1,0 +1,72 @@
+--- a/requirements/cuda.txt
++++ b/requirements/cuda.txt
+@@ -5,7 +5,7 @@
+ 
+ # Dependencies for NVIDIA GPUs
+ # These must be updated alongside torch
+-torchcodec >= 0.14
++
+ PyNvVideoCodec==2.0.4
+ # FlashInfer should be updated together with the Dockerfile
+ # flashinfer-cubin is not on PyPI since 0.6.14; setup.py excludes it from
+@@ -31,3 +31,9 @@
+ 
+ # Humming kernels for quantization gemm
+ humming-kernels[cu13]==0.1.16
++
++# Nebula Torch 2.10 ABI profile
++torch==2.10.0
++torchvision==0.25.0
++torchaudio==2.10.0
++torchcodec==0.10.0
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1234,7 +1234,7 @@
+   # _C_stable_libtorch is abi compatible with PyTorch >= TORCH_TARGET_VERSION
+   # which is currently set to 2.11.
+   target_compile_definitions(_C_stable_libtorch PRIVATE
+-    TORCH_TARGET_VERSION=0x020B000000000000ULL)
++    TORCH_TARGET_VERSION=0x020A000000000000ULL)
+ 
+   # Needed to use cuda/hip APIs from C-shim
+   if(VLLM_GPU_LANG STREQUAL "CUDA")
+@@ -1460,7 +1460,7 @@
+ # _moe_C_stable_libtorch is abi compatible with PyTorch >= TORCH_TARGET_VERSION
+ # which is currently set to 2.11.
+ target_compile_definitions(_moe_C_stable_libtorch PRIVATE
+-  TORCH_TARGET_VERSION=0x020B000000000000ULL)
++  TORCH_TARGET_VERSION=0x020A000000000000ULL)
+ 
+ # Needed to use cuda/hip APIs from C-shim
+ if(VLLM_GPU_LANG STREQUAL "CUDA")
+--- a/cmake/external_projects/flashkda.cmake
++++ b/cmake/external_projects/flashkda.cmake
+@@ -64,7 +64,7 @@
+     WITH_SOABI)
+ 
+   target_compile_definitions(_flashkda_C PRIVATE
+-    TORCH_TARGET_VERSION=0x020B000000000000ULL)
++    TORCH_TARGET_VERSION=0x020A000000000000ULL)
+   if(VLLM_GPU_LANG STREQUAL "CUDA")
+     target_compile_definitions(_flashkda_C PRIVATE USE_CUDA)
+   endif()
+--- a/cmake/external_projects/flashmla.cmake
++++ b/cmake/external_projects/flashmla.cmake
+@@ -197,7 +197,7 @@
+ 
+     # _flashmla_C is now ABI-stable torch 2.11+
+     target_compile_definitions(_flashmla_C PRIVATE
+-        TORCH_TARGET_VERSION=0x020B000000000000ULL)
++        TORCH_TARGET_VERSION=0x020A000000000000ULL)
+     if(VLLM_GPU_LANG STREQUAL "CUDA")
+         target_compile_definitions(_flashmla_C PRIVATE USE_CUDA)
+     endif()
+@@ -215,7 +215,7 @@
+ 
+     # _flashmla_extension_C is now ABI-stable w/ torch 2.11+
+     target_compile_definitions(_flashmla_extension_C PRIVATE
+-        TORCH_TARGET_VERSION=0x020B000000000000ULL)
++        TORCH_TARGET_VERSION=0x020A000000000000ULL)
+     if(VLLM_GPU_LANG STREQUAL "CUDA")
+         target_compile_definitions(_flashmla_extension_C PRIVATE USE_CUDA)
+     endif()

@@ -1,0 +1,25 @@
+{
+  "base_commits": {
+    "vllm": "6e517b15c1833cf72a7f557ee32524d98682e617",
+    "megatron_bridge": "c0e164ed2aedac4ad1c877780e2564a19d5d54ec"
+  },
+  "vllm_model_patch_order": [
+    "vllm-hc-fp32.patch",
+    "vllm-gdn-conv-fp32.patch",
+    "vllm-model-state-sleep.patch"
+  ],
+  "build_compatibility": "Run patch_torch210.py then patch_cuda_view_torch210.py BEFORE the vLLM model patches. The two torch210-*.patch files are audit snapshots, not extra application steps.",
+  "files": {
+    "patches/torch210-uva-ownership.patch": "a1088aa936b870e51d7ffc476bd123335810d4d7bf5139377537f32b32a08b00",
+    "patches/bridge-python313.patch": "419ed5b1fd4a63ac4130894973ceb5d5261967036ff1916d2ec73303cbc80396",
+    "patches/vllm-hc-fp32.patch": "fee0a01250ff2b3e539382838a098b9065717e7b5942f745bbe6b8c37247e4d8",
+    "patches/vllm-gdn-conv-fp32.patch": "497da9eb97396d2e68e705f8b76da5aa5911f1250e46d2c458bce78073b432a0",
+    "patches/torch210-compatibility.patch": "3ca11fdbd21b75ce06f0833fc4488ade4401a193acf720fe27ceb740359e83e1",
+    "patches/vllm-model-state-sleep.patch": "66dfcb62dc2868473a69ddc97e6241fb4907bf89e13aef5dcc32cc1c23d525e5",
+    "dependency_build/package_hc_fp32_wheel.py": "a511f052ffea59e5f0f54b78288aa3610b53101ee6f4d87514c55dfb5baf1792",
+    "dependency_build/build_vllm.py": "07efcb95bfb088aefc25cdaf4781fe115e394344423d2f032f8d04d794e36b57",
+    "dependency_build/prepare_sources.py": "c2acf23c0d68dacd01e6f43230f8778823376a660db58826f2b7442ed614006e",
+    "dependency_build/patch_torch210.py": "f5e42878d358d151847fedbf47f7e5c0be41afedaa0d14ff70d6b46178ad0c2b",
+    "dependency_build/patch_cuda_view_torch210.py": "a8fa632b186bfee38895bb68b795a7bd0a6fb0c65c4f0c42f4ebb68695c63872"
+  }
+}

@@ -1,0 +1,8 @@
+# Keep JIT compiler/runtime packages on the image's CUDA 13.1 minor release.
+# CUTLASS also ships newer header/disassembly tools; those do not replace the
+# image's CUDA runtime, compiler or driver.
+nvidia-cuda-crt>=13.1,<13.2
+nvidia-cuda-nvcc>=13.1,<13.2
+nvidia-cuda-nvrtc>=13.1,<13.2
+nvidia-cuda-runtime>=13.1,<13.2
+nvidia-nvvm>=13.1,<13.2
